@@ -77,7 +77,7 @@ exits 0.
 
 ### Registration
 
-`.mcp.json` at the plugin root:
+`mcpServers` inline in `.claude-plugin/plugin.json` (0.6.1; 0.6.0 shipped a root `.mcp.json`, which Claude Code also reads as *project-scope* config inside a checkout of this repo, where `${CLAUDE_PLUGIN_ROOT}` is undefined — a phantom server that fails to connect):
 
 ```json
 {

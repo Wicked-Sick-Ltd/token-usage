@@ -6,6 +6,18 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.1] — 2026-09-07
+
+### Fixed
+
+- **MCP server registration moved inline into `.claude-plugin/plugin.json`**
+  (was a root `.mcp.json`). Claude Code reads a repository's `.mcp.json` as
+  project-scope MCP config too, so anyone working inside a checkout of this
+  repo got a phantom `token-usage` server that failed to connect
+  (`${CLAUDE_PLUGIN_ROOT}` is undefined outside the plugin loader). The
+  plugin's own server is unaffected: same command, args and env, now read from
+  the manifest's `mcpServers` field.
+
 ## [0.6.0] — 2026-09-04
 
 ### Added
@@ -407,7 +419,8 @@ Initial release.
 - Standalone CLI: `python3 scripts/token_usage.py report|json [transcript]`.
 - Optional statusline example (`examples/statusline.sh`, requires `jq`).
 
-[Unreleased]: https://github.com/Wicked-Sick-Ltd/token-usage/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/Wicked-Sick-Ltd/token-usage/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/Wicked-Sick-Ltd/token-usage/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/Wicked-Sick-Ltd/token-usage/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/Wicked-Sick-Ltd/token-usage/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/Wicked-Sick-Ltd/token-usage/compare/v0.3.0...v0.4.0

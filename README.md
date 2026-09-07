@@ -143,7 +143,7 @@ When the session's estimated cost crosses the threshold the Stop hook emits a `s
 
 ### MCP server
 
-The plugin ships a stdio MCP server (`.mcp.json` → `scripts/mcp_server.py`, stdlib only,
+The plugin ships a stdio MCP server (registered in `.claude-plugin/plugin.json` → `scripts/mcp_server.py`, stdlib only,
 no install). When the plugin is enabled, Claude Code starts it and the tools appear as
 `mcp__plugin_token-usage_token-usage__<tool>`:
 
@@ -167,7 +167,7 @@ the server guessed at.
 (searched across every project) → `TOKEN_USAGE_TRANSCRIPT` → auto-discovery. What
 auto-discovery does depends on whether there is a project dir to anchor on:
 
-- **With `TOKEN_USAGE_PROJECT_DIR`** — the plugin's `.mcp.json` passes
+- **With `TOKEN_USAGE_PROJECT_DIR`** — the plugin manifest passes
   `${CLAUDE_PROJECT_DIR}`, which reaches stdio MCP servers from Claude Code 2.1.139;
   older builds (and other hosts) leave it unexpanded or empty, which the server treats as
   unset and falls back to discovery. When it *is* set, the session is the newest
