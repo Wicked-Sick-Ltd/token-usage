@@ -21,7 +21,7 @@ welcome.
 ## Dev setup
 
 ```bash
-git clone https://github.com/WizzoUK2/token-usage.git
+git clone https://github.com/Wicked-Sick-Ltd/token-usage.git
 claude --plugin-dir /path/to/token-usage   # run Claude Code with the plugin
 ```
 

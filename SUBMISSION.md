@@ -18,7 +18,7 @@ https://discovery.wickedsick.com/token-usage-claude-code-plugin-documentation
 ```
 
 (Kept current for v0.4.0. Fallback if a repo URL is preferred:
-`https://github.com/WizzoUK2/token-usage`.)
+`https://github.com/Wicked-Sick-Ltd/token-usage`.)
 
 ### Plugin name
 
@@ -85,16 +85,16 @@ ready whatever it asks.
   "category": "productivity",
   "source": {
     "source": "url",
-    "url": "https://github.com/WizzoUK2/token-usage.git",
+    "url": "https://github.com/Wicked-Sick-Ltd/token-usage.git",
     "sha": "ee04f6245ce264cb752d328e6d34b72425ff90e9"
   },
-  "homepage": "https://github.com/WizzoUK2/token-usage"
+  "homepage": "https://github.com/Wicked-Sick-Ltd/token-usage"
 }
 ```
 
 ### Repository
 
-https://github.com/WizzoUK2/token-usage
+https://github.com/Wicked-Sick-Ltd/token-usage
 
 ### Author / contact
 
@@ -167,7 +167,7 @@ MIT (LICENSE file in repo)
 ### Documentation link
 
 https://discovery.wickedsick.com/token-usage-claude-code-plugin-documentation
-(The GitHub README https://github.com/WizzoUK2/token-usage#readme is the
+(The GitHub README https://github.com/Wicked-Sick-Ltd/token-usage#readme is the
 canonical fallback.)
 
 ### Example use cases (long-form originals)

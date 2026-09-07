@@ -407,11 +407,11 @@ Initial release.
 - Standalone CLI: `python3 scripts/token_usage.py report|json [transcript]`.
 - Optional statusline example (`examples/statusline.sh`, requires `jq`).
 
-[Unreleased]: https://github.com/WizzoUK2/token-usage/compare/v0.6.0...HEAD
-[0.6.0]: https://github.com/WizzoUK2/token-usage/compare/v0.5.0...v0.6.0
-[0.5.0]: https://github.com/WizzoUK2/token-usage/compare/v0.4.0...v0.5.0
-[0.4.0]: https://github.com/WizzoUK2/token-usage/compare/v0.3.0...v0.4.0
-[0.3.0]: https://github.com/WizzoUK2/token-usage/compare/v0.2.0...v0.3.0
-[0.2.0]: https://github.com/WizzoUK2/token-usage/compare/v0.1.1...v0.2.0
-[0.1.1]: https://github.com/WizzoUK2/token-usage/compare/v0.1.0...v0.1.1
-[0.1.0]: https://github.com/WizzoUK2/token-usage/releases/tag/v0.1.0
+[Unreleased]: https://github.com/Wicked-Sick-Ltd/token-usage/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/Wicked-Sick-Ltd/token-usage/compare/v0.5.0...v0.6.0
+[0.5.0]: https://github.com/Wicked-Sick-Ltd/token-usage/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/Wicked-Sick-Ltd/token-usage/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/Wicked-Sick-Ltd/token-usage/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/Wicked-Sick-Ltd/token-usage/compare/v0.1.1...v0.2.0
+[0.1.1]: https://github.com/Wicked-Sick-Ltd/token-usage/compare/v0.1.0...v0.1.1
+[0.1.0]: https://github.com/Wicked-Sick-Ltd/token-usage/releases/tag/v0.1.0
