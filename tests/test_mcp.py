@@ -439,8 +439,13 @@ def test_insights_session_mode_falls_back_to_budget_env_var(mcp, tu, tmp_path, m
     assert any(f["rule"] == "budget-pace" for f in data["findings"])
 
 
-def test_mcp_json_registers_server_with_plugin_root_paths():
-    cfg = json.loads((PLUGIN_ROOT / ".mcp.json").read_text())
+def test_plugin_manifest_registers_server_inline_not_via_mcp_json():
+    # Registration lives in plugin.json, not a root .mcp.json: Claude Code also
+    # reads a repo's .mcp.json as *project-scope* config, and there
+    # ${CLAUDE_PLUGIN_ROOT} is undefined — every developer working inside this
+    # checkout would get a phantom "token-usage" server that fails to connect.
+    assert not (PLUGIN_ROOT / ".mcp.json").exists()
+    cfg = json.loads((PLUGIN_ROOT / ".claude-plugin" / "plugin.json").read_text())
     srv = cfg["mcpServers"]["token-usage"]
     assert srv["command"] == "python3"
     assert srv["args"] == ["${CLAUDE_PLUGIN_ROOT}/scripts/mcp_server.py"]
