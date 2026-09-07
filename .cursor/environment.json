@@ -1,0 +1,4 @@
+{
+  "name": "token-usage",
+  "install": "pip3 install --user pytest 'ruff==0.16.6'"
+}
