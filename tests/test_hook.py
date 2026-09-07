@@ -171,6 +171,22 @@ def test_subagent_stop_reaggregates_full_session(tmp_path):
     assert ledger["total"]["usage"]["output"] == 140       # main 100 + agent 40
 
 
+def test_subagent_stop_workflow_agent_reaggregates_full_session(tmp_path):
+    proj = tmp_path / "proj"
+    _main = write_jsonl(proj / "sess-wf.jsonl", [
+        user("2026-06-12T10:00:00Z", command="/wf"),
+        assistant("2026-06-12T10:00:01Z", usage(out=100), request_id="r1"),
+    ])
+    wf_agent = write_jsonl(proj / "sess-wf" / "subagents" / "workflows" / "run-1" / "agent-001.jsonl", [
+        assistant("2026-06-12T10:00:30Z", usage(out=75), request_id="a1"),
+    ])
+    r = run_hook({"session_id": "sess-wf", "transcript_path": str(wf_agent),
+                  "hook_event_name": "SubagentStop"}, tmp_path)
+    assert r.returncode == 0
+    ledger = json.loads((tmp_path / "ledger" / "sess-wf.json").read_text())
+    assert ledger["total"]["usage"]["output"] == 175       # main 100 + wf agent 75
+
+
 def test_subagent_stop_without_main_transcript_bails(tmp_path):
     # If the owning session transcript can't be found, never write a ledger
     # from sidechain-only data.

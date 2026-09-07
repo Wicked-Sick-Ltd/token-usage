@@ -63,3 +63,51 @@ def test_agent_spawned_in_followup_turn_rolls_into_command(tu, tmp_path):
     agg = data["by_label"]["/code-review"]
     assert agg["usage"]["output"] == 55
     assert agg["agents"][0]["type"] == "Explore"
+
+
+def test_workflow_subagents_roll_into_spawning_segment(tu, tmp_path):
+    t = write_jsonl(tmp_path / "sess.jsonl", [
+        user("2026-06-12T10:00:00Z", command="/pr-review-toolkit:review-pr"),
+        assistant("2026-06-12T10:00:01Z", usage(out=100), request_id="r1"),
+        user("2026-06-12T10:10:00Z", command="/other"),
+        assistant("2026-06-12T10:10:01Z", usage(out=10), request_id="r2"),
+    ])
+    wf_dir = tmp_path / "sess" / "subagents" / "workflows" / "run-101"
+    write_jsonl(wf_dir / "agent-001.jsonl",
+                [assistant("2026-06-12T10:02:00Z", usage(out=40), request_id="wa1")])
+    (wf_dir / "agent-001.meta.json").write_text('{"agentType": "general-purpose", "description": "wf agent 1"}')
+    write_jsonl(wf_dir / "agent-002.jsonl",
+                [assistant("2026-06-12T10:03:00Z", usage(out=60), request_id="wa2")])
+    (wf_dir / "agent-002.meta.json").write_text('{"agentType": "general-purpose", "description": "wf agent 2"}')
+
+    data = tu.aggregate(tu.parse_session(t), tu.load_pricing())
+    agg = data["by_label"]["/pr-review-toolkit:review-pr"]
+    assert agg["usage"]["output"] == 200      # 100 main + 40 + 60 workflow agents
+    assert agg["subagents"] == 2
+    assert agg["agents"] == [
+        {"type": "general-purpose", "count": 2,
+         "usage": agg["agents"][0]["usage"], "cost_usd": agg["agents"][0]["cost_usd"]},
+    ]
+    detailed = tu.render_report(data, show_agents=True)
+    assert "(+2 agents)" in detailed
+    assert "↳ general-purpose ×2" in detailed
+
+
+def test_workflow_subagents_timestamp_fallback_from_journal_and_meta(tu, tmp_path):
+    t = write_jsonl(tmp_path / "sess.jsonl", [
+        user("2026-06-12T10:00:00Z", command="/workflow-cmd"),
+        assistant("2026-06-12T10:00:01Z", usage(out=10), request_id="r1"),
+        user("2026-06-12T10:10:00Z", command="/other"),
+        assistant("2026-06-12T10:10:01Z", usage(out=10), request_id="r2"),
+    ])
+    wf_dir = tmp_path / "sess" / "subagents" / "workflows" / "run-202"
+    # Agent transcript without timestamps
+    write_jsonl(wf_dir / "agent-001.jsonl",
+                [assistant(None, usage(out=50), request_id="wa1")])
+    (wf_dir / "journal.jsonl").write_text('{"timestamp": "2026-06-12T10:05:00Z", "event": "start"}\n')
+
+    data = tu.aggregate(tu.parse_session(t), tu.load_pricing())
+    agg = data["by_label"]["/workflow-cmd"]
+    assert agg["usage"]["output"] == 60       # 10 main + 50 agent
+    assert agg["subagents"] == 1
+

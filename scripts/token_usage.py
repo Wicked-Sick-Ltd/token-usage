@@ -379,6 +379,8 @@ def sum_by_day(path):
             pending[req] = (day, model, flat)
         else:
             add_flat(by_day.setdefault(day, {}).setdefault(model, empty_usage()), flat)
+    if first_ts is None:
+        first_ts = _resolve_agent_ts(path)
     fallback = _local_day(first_ts)
     out = {}
     for day, models in by_day.items():
@@ -386,6 +388,56 @@ def sum_by_day(path):
     for day, model, flat in pending.values():
         add_flat(out.setdefault(day or fallback, {}).setdefault(model, empty_usage()), flat)
     return out
+
+
+def _resolve_agent_ts(path, ts=None, meta=None):
+    """Resolve an agent's start timestamp if missing from its transcript.
+
+    Checks meta dict/file and journal.jsonl in the agent's parent directory."""
+    if ts:
+        return ts
+    path = Path(path)
+    ts_keys = ("timestamp", "started_at", "start_ts", "created_at", "start_time", "time", "ts")
+    if meta and isinstance(meta, dict):
+        for k in ts_keys:
+            v = meta.get(k)
+            if v:
+                if isinstance(v, (int, float)):
+                    if v > 1e11:
+                        v /= 1000.0
+                    from datetime import datetime, timezone
+                    return datetime.fromtimestamp(v, tz=timezone.utc).isoformat()
+                return str(v)
+    meta_path = path.parent / (path.stem + ".meta.json")
+    if meta_path.is_file():
+        try:
+            m = json.loads(meta_path.read_text(encoding="utf-8", errors="replace"))
+            if isinstance(m, dict):
+                for k in ts_keys:
+                    v = m.get(k)
+                    if v:
+                        if isinstance(v, (int, float)):
+                            if v > 1e11:
+                                v /= 1000.0
+                            from datetime import datetime, timezone
+                            return datetime.fromtimestamp(v, tz=timezone.utc).isoformat()
+                        return str(v)
+        except (ValueError, OSError):
+            pass
+    journal_path = path.parent / "journal.jsonl"
+    if journal_path.is_file():
+        for entry in iter_jsonl(journal_path):
+            if isinstance(entry, dict):
+                for k in ts_keys:
+                    v = entry.get(k)
+                    if v:
+                        if isinstance(v, (int, float)):
+                            if v > 1e11:
+                                v /= 1000.0
+                            from datetime import datetime, timezone
+                            return datetime.fromtimestamp(v, tz=timezone.utc).isoformat()
+                        return str(v)
+    return None
 
 
 def parse_session(transcript_path):
@@ -456,7 +508,7 @@ def parse_session(transcript_path):
     if subagents_dir.is_dir():
         starts = [(s["start_ts"], i) for i, s in enumerate(segments) if s["start_ts"]]
         starts.sort()
-        for agent_file in sorted(subagents_dir.glob("agent-*.jsonl")):
+        for agent_file in sorted(subagents_dir.rglob("agent-*.jsonl")):
             a_by_model, a_ts = sum_transcript(agent_file)
             if not a_by_model:
                 continue
@@ -468,6 +520,7 @@ def parse_session(transcript_path):
                                                           errors="replace"))
                 except (ValueError, OSError):   # ValueError: malformed JSON
                     pass
+            a_ts = _resolve_agent_ts(agent_file, a_ts, meta)
             idx = None
             if a_ts:
                 for ts, i in starts:
@@ -720,7 +773,7 @@ def summarize_transcript(path, pricing, st=None):
     day_models = sum_by_day(path)
     subagents_dir = path.parent / path.stem / "subagents"
     if subagents_dir.is_dir():
-        for agent_file in sorted(subagents_dir.glob("agent-*.jsonl")):
+        for agent_file in sorted(subagents_dir.rglob("agent-*.jsonl")):
             for day, models in sum_by_day(agent_file).items():
                 merge_by_model(day_models.setdefault(day, {}), models)
     return {
@@ -1734,7 +1787,7 @@ def _run_hook(payload):
     if not isinstance(transcript, str) or not transcript or not Path(transcript).exists():
         return 0
     transcript = Path(transcript)
-    if transcript.parent.name == "subagents":
+    if "subagents" in transcript.parts and transcript.name != f"{session_id}.jsonl":
         # SubagentStop delivers the subagent's own sidechain transcript; find
         # the owning session transcript and re-aggregate the whole session.
         main = next((p / f"{session_id}.jsonl" for p in transcript.parents

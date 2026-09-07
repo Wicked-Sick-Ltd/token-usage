@@ -222,8 +222,11 @@ def test_summarize_by_day_includes_subagents(tu, monkeypatch, tmp_path):
     write_jsonl(tmp_path / "projects" / "p" / "s" / "subagents" / "agent-1.jsonl", [
         assistant("2026-07-01T10:01:00Z", usage(out=40), request_id="a1"),
     ])
+    write_jsonl(tmp_path / "projects" / "p" / "s" / "subagents" / "workflows" / "wf1" / "agent-2.jsonl", [
+        assistant("2026-07-01T10:02:00Z", usage(out=60), request_id="a2"),
+    ])
     s = tu.summarize_transcript(t, tu.load_pricing())
-    assert sum(d["usage"]["output"] for d in s["by_day"].values()) == 140
+    assert sum(d["usage"]["output"] for d in s["by_day"].values()) == 200
 
 
 def test_v2_index_entry_reparses_once(tu, monkeypatch, tmp_path):
