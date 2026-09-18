@@ -98,7 +98,7 @@ https://github.com/Wicked-Sick-Ltd/token-usage
 
 ### Author / contact
 
-Craig Fletcher — craigfletcheruk@gmail.com
+Craig Fletcher — craig@wickedsick.com
 
 ### Category
 
