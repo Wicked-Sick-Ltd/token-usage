@@ -4,5 +4,5 @@ This project follows the [Contributor Covenant, version 2.1](https://www.contrib
 
 In short: be respectful, assume good faith, no harassment of any kind.
 
-Enforcement contact: **craigfletcheruk@gmail.com** (`[token-usage conduct]`
+Enforcement contact: **craig@wickedsick.com** (`[token-usage conduct]`
 in the subject). Reports are handled confidentially.

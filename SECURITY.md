@@ -22,7 +22,7 @@ Only the latest release on `main` is supported with fixes.
 Please **do not** open a public issue for security problems. Instead use
 GitHub's private vulnerability reporting on this repository
 (Security → Report a vulnerability), or email
-**craigfletcheruk@gmail.com** with `[token-usage security]` in the subject.
+**craig@wickedsick.com** with `[token-usage security]` in the subject.
 
 You can expect an acknowledgement within a few days. Please include
 reproduction steps and your environment (OS, Claude Code version, Python
