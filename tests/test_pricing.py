@@ -6,7 +6,6 @@ import subprocess
 import sys
 
 import pytest
-
 from conftest import SCRIPT, assistant, usage, user, write_jsonl
 
 # Isolated bundled table for load_pricing tests — not the live file, and not an
