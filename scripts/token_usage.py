@@ -36,29 +36,11 @@ COMMAND_RE = re.compile(r"<command-name>([^<]+)</command-name>")
 OTHER_LABEL = "(no command)"
 LEDGER_DIR = Path(os.environ.get("TOKEN_USAGE_LEDGER_DIR", Path.home() / ".cache" / "token-usage"))
 
-# Per-MTok USD rates. Cache read = 0.1x input unless the entry carries an explicit
-# "cache_read" rate (Fable/Mythos 5.1 bill hits at $0.25/MTok, i.e. 0.025x);
-# cache write = 1.25x (5m TTL) / 2x (1h TTL).
-# Keys are matched by longest prefix against the model ID, so dated IDs resolve too.
-DEFAULT_PRICING = {
-    "claude-fable-5-1": {"input": 10.0, "output": 50.0, "cache_read": 0.25},
-    "claude-mythos-5-1": {"input": 10.0, "output": 50.0, "cache_read": 0.25},
-    "claude-fable-5": {"input": 10.0, "output": 50.0},
-    "claude-mythos-5": {"input": 10.0, "output": 50.0},
-    "claude-opus-5": {"input": 5.0, "output": 25.0},
-    "claude-sonnet-5": {"input": 2.0, "output": 10.0},
-    "claude-opus-4-8": {"input": 5.0, "output": 25.0},
-    "claude-opus-4-7": {"input": 5.0, "output": 25.0},
-    "claude-opus-4-6": {"input": 5.0, "output": 25.0},
-    "claude-opus-4-5": {"input": 5.0, "output": 25.0},
-    "claude-opus-4-1": {"input": 15.0, "output": 75.0},
-    "claude-opus-4": {"input": 15.0, "output": 75.0},
-    "claude-sonnet-4-6": {"input": 3.0, "output": 15.0},
-    "claude-sonnet-4-5": {"input": 3.0, "output": 15.0},
-    "claude-sonnet-4": {"input": 3.0, "output": 15.0},
-    "claude-haiku-4-5": {"input": 1.0, "output": 5.0},
-    "claude-3-5-haiku": {"input": 0.8, "output": 4.0},
-}
+# Per-MTok USD rates live in data/pricing.json (the bundled table is canonical).
+# Cache read = 0.1x input unless the entry carries an explicit "cache_read" rate
+# (Fable/Mythos 5.1 bill hits at $0.25/MTok, i.e. 0.025x); cache write = 1.25x
+# (5m TTL) / 2x (1h TTL). Keys are matched by longest prefix against the model
+# ID, so dated IDs resolve too.
 CACHE_READ_MULT = 0.1
 CACHE_5M_MULT = 1.25
 CACHE_1H_MULT = 2.0
@@ -68,6 +50,11 @@ def user_pricing_path():
     """User pricing overlay location ($XDG_CONFIG_HOME/token-usage/pricing.json)."""
     base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
     return Path(base) / "token-usage" / "pricing.json"
+
+
+def bundled_pricing_path():
+    """Canonical bundled rates: <plugin-root>/data/pricing.json."""
+    return Path(__file__).resolve().parent.parent / "data" / "pricing.json"
 
 
 def _is_rate(x):
@@ -101,30 +88,42 @@ def warn(message, warnings=None):
         warnings.append(message)
 
 
-def load_pricing(warnings=None):
-    """Three-layer per-model-key merge: defaults <- bundled <- user overlay.
+def _merge_pricing_file(pricing, path, warnings):
+    """Merge one JSON pricing file into `pricing`. Returns False if the file
+    itself is unusable (malformed / not a dict); invalid entries are skipped."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except (ValueError, OSError):
+        warn(f"ignoring malformed pricing file {path}", warnings)
+        return False
+    if not isinstance(data, dict):
+        warn(f"ignoring malformed pricing file {path}", warnings)
+        return False
+    for key, rates in data.items():
+        if _valid_rates(rates):
+            pricing[key] = rates
+        else:
+            warn(f"ignoring invalid rates for {key} in {path}", warnings)
+    return True
 
-    A malformed layer (or a single invalid entry) is warned about once on
-    stderr and skipped — never fatal, because the Stop hook calls this. Pass a
-    list as `warnings` to collect the same messages (the MCP server does)."""
-    pricing = dict(DEFAULT_PRICING)
-    bundled = Path(__file__).resolve().parent.parent / "data" / "pricing.json"
-    for layer in (bundled, user_pricing_path()):
-        if not layer.exists():
-            continue
-        try:
-            data = json.loads(layer.read_text(encoding="utf-8", errors="replace"))
-        except (ValueError, OSError):
-            warn(f"ignoring malformed pricing file {layer}", warnings)
-            continue
-        if not isinstance(data, dict):
-            warn(f"ignoring malformed pricing file {layer}", warnings)
-            continue
-        for key, rates in data.items():
-            if _valid_rates(rates):
-                pricing[key] = rates
-            else:
-                warn(f"ignoring invalid rates for {key} in {layer}", warnings)
+
+def load_pricing(warnings=None):
+    """Two-layer per-model-key merge: bundled data/pricing.json <- user overlay.
+
+    Missing or malformed bundled table: warn once and start empty so models
+    stay explicitly unpriced rather than falling back to an in-code copy. A
+    malformed overlay (or a single invalid entry) is warned about and skipped.
+    Never raises — the Stop hook calls this. Pass a list as `warnings` to
+    collect the same messages (the MCP server does)."""
+    pricing = {}
+    bundled = bundled_pricing_path()
+    if not bundled.exists():
+        warn(f"bundled pricing table missing: {bundled}", warnings)
+    else:
+        _merge_pricing_file(pricing, bundled, warnings)
+    overlay = user_pricing_path()
+    if overlay.exists():
+        _merge_pricing_file(pricing, overlay, warnings)
     return pricing
 
 

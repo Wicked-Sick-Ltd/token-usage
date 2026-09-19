@@ -1,6 +1,10 @@
 """Insights engine: baseline, rules, rendering."""
 from conftest import assistant, usage, user, write_jsonl
 
+# Isolated table for helpers that take a pricing dict — not the bundled file
+# and not an in-code DEFAULT_PRICING copy.
+PRICING = {"claude-fable-5": {"input": 10.0, "output": 50.0}}
+
 
 def _agg(tu, entries, tmp_path, name="x"):
     t = write_jsonl(tmp_path / f"{name}.jsonl", entries)
@@ -171,11 +175,11 @@ CUTOFF, NOW = "2026-07-01T00:00:00Z", "2026-07-11T00:00:00Z"  # midpoint 07-06
 def test_spend_trend_warn_and_direction(tu):
     ss = [_summary("2026-07-02T10:00:00Z", 10.0),
           _summary("2026-07-08T10:00:00Z", 20.0)]
-    f = {f["rule"]: f for f in tu.window_insights(ss, CUTOFF, tu.DEFAULT_PRICING, now=NOW)}
+    f = {f["rule"]: f for f in tu.window_insights(ss, CUTOFF, PRICING, now=NOW)}
     assert f["spend-trend"]["severity"] == "warn" and "up" in f["spend-trend"]["message"]
     down = [_summary("2026-07-02T10:00:00Z", 20.0),
             _summary("2026-07-08T10:00:00Z", 14.0)]   # -30% -> info
-    f = {f["rule"]: f for f in tu.window_insights(down, CUTOFF, tu.DEFAULT_PRICING, now=NOW)}
+    f = {f["rule"]: f for f in tu.window_insights(down, CUTOFF, PRICING, now=NOW)}
     assert f["spend-trend"]["severity"] == "info" and "down" in f["spend-trend"]["message"]
 
 
@@ -183,36 +187,36 @@ def test_spend_trend_quiet_when_flat_or_empty_first_half(tu):
     flat = [_summary("2026-07-02T10:00:00Z", 10.0),
             _summary("2026-07-08T10:00:00Z", 11.0)]
     assert "spend-trend" not in {f["rule"] for f in
-                                 tu.window_insights(flat, CUTOFF, tu.DEFAULT_PRICING, now=NOW)}
+                                 tu.window_insights(flat, CUTOFF, PRICING, now=NOW)}
     empty = [_summary("2026-07-08T10:00:00Z", 11.0)]
-    assert tu.window_insights(empty, CUTOFF, tu.DEFAULT_PRICING, now=NOW) == []
+    assert tu.window_insights(empty, CUTOFF, PRICING, now=NOW) == []
 
 
 def test_top_mover(tu):
     ss = [_summary("2026-07-02T10:00:00Z", 10.0, {"/review": 1.0}),
           _summary("2026-07-08T10:00:00Z", 22.0, {"/review": 11.0})]
-    f = {f["rule"]: f for f in tu.window_insights(ss, CUTOFF, tu.DEFAULT_PRICING, now=NOW)}
+    f = {f["rule"]: f for f in tu.window_insights(ss, CUTOFF, PRICING, now=NOW)}
     assert "/review" in f["top-mover"]["message"]
 
 
 def test_window_unpriced(tu):
     ss = [_summary("2026-07-02T10:00:00Z", 1.0,
                    by_model={"claude-mystery-9": dict(tu.empty_usage(), output=100)})]
-    f = {f["rule"]: f for f in tu.window_insights(ss, CUTOFF, tu.DEFAULT_PRICING, now=NOW)}
+    f = {f["rule"]: f for f in tu.window_insights(ss, CUTOFF, PRICING, now=NOW)}
     assert "claude-mystery-9" in f["unpriced-models"]["message"]
 
 
 def test_window_insights_bare_date_cutoff_default_now(tu):
     # since_cutoff passes bare YYYY-MM-DD through; must not crash with now=None
     ss = [_summary("2026-07-02T10:00:00Z", 10.0)]
-    assert isinstance(tu.window_insights(ss, "2026-07-01", tu.DEFAULT_PRICING), list)
+    assert isinstance(tu.window_insights(ss, "2026-07-01", PRICING), list)
 
 
 def test_window_insights_timestampless_sessions_excluded_from_halves(tu):
     ss = [_summary(None, 100.0),                       # must not inflate either half
           _summary("2026-07-02T10:00:00Z", 10.0),
           _summary("2026-07-08T10:00:00Z", 20.0)]      # +100% -> warn still fires
-    f = {f["rule"]: f for f in tu.window_insights(ss, CUTOFF, tu.DEFAULT_PRICING, now=NOW)}
+    f = {f["rule"]: f for f in tu.window_insights(ss, CUTOFF, PRICING, now=NOW)}
     assert f["spend-trend"]["severity"] == "warn"
     assert f["spend-trend"]["data"]["first_half"] == 10.0
 
