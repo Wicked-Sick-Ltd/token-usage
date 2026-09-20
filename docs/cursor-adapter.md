@@ -183,13 +183,17 @@ exporter can map this stable schema without breaking JSONL consumers.
 
 ### Statusline vs live (Cursor)
 
-Claude Code Stop hooks write per-session JSON ledgers plus an aggregate
-`latest.json` symlink under `TOKEN_USAGE_LEDGER_DIR` or `~/.cache/token-usage/`.
-`examples/statusline.ps1` is **Windows parity for that Claude layout** (reads
-`latest.json`; dependency-free PowerShell).
+Claude Code Stop hooks write per-session JSON ledgers under
+`TOKEN_USAGE_LEDGER_DIR` or `~/.cache/token-usage/`, plus a best-effort
+`latest.json` symlink pointing at the most recent one.
+`examples/statusline.ps1` is **Windows parity for that Claude layout**
+(dependency-free PowerShell 7+): it reads the statusline JSON from stdin and
+resolves `<session_id>.json` first, falling back to `latest.json` only when
+there is no usable session id or that session has no ledger yet. Windows often
+refuses symlink creation, so the fallback pointer cannot be relied on.
 
 Cursor hooks append JSONL under `~/.cache/token-usage/cursor/` (override directory
-with `TOKEN_USAGE_LEDGER_DIR`). They do **not** maintain `latest.json`, so the
-PowerShell statusline example does not apply. Use
+with `TOKEN_USAGE_LEDGER_DIR`). They write no per-session JSON and no
+`latest.json`, so the PowerShell statusline example does not apply. Use
 `python3 scripts/token_usage.py live --runtime cursor` when you want a refreshing
 terminal view of the current Cursor session.

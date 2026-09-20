@@ -19,10 +19,11 @@ adheres to [Semantic Versioning](https://semver.org/).
 - **MCP `runtime` argument** on `session_cost`, `history`, `insights`, `diff`
   and `top_consumers`, with `runtime`, `measurement` and `warnings` in the
   results and the same disclosures in markdown.
-- **`token-usage cursor-hook`** — a fail-open Cursor hook command
-  (`hooks/hooks-cursor.json`) for `beforeSubmitPrompt`, `stop`,
-  `afterAgentResponse`, `subagentStart` and `subagentStop`. It always exits 0,
-  prints `{}`, and never blocks the agent.
+- **`token-usage cursor-hook`** — a fail-open Cursor hook command. It always
+  exits 0, prints `{}`, and never blocks the agent. `hooks/hooks-cursor.json`
+  registers it for `beforeSubmitPrompt`, `stop`, `subagentStart` and
+  `subagentStop`; `afterAgentResponse` payloads are also recognised as
+  completion events, but that event is not registered.
 - **Cursor hook ledger** — append-only JSONL under
   `~/.cache/token-usage/cursor/` (override with `TOKEN_USAGE_LEDGER_DIR`)
   holding the raw conversation id, UTC timestamps, workspace roots, truncated
@@ -47,10 +48,13 @@ adheres to [Semantic Versioning](https://semver.org/).
 - **`export` CLI** — RFC-8259 JSONL with schema `token-usage.aggregate.v1` and
   OTel-style metric names (local interchange, not OTLP wire format); session and
   history scopes with atomic file output.
-- **`examples/statusline.ps1`** — dependency-free PowerShell statusline for
-  **Claude Code on Windows**: reads aggregate `TOKEN_USAGE_LEDGER_DIR/latest.json`
-  or `~/.cache/token-usage/latest.json` (Stop-hook JSON ledger); silent on missing
-  or malformed files. Not for Cursor (JSONL hooks, no `latest.json`).
+- **`examples/statusline.ps1`** — dependency-free **PowerShell 7+** statusline for
+  **Claude Code on Windows**: reads the statusline JSON from stdin and resolves
+  `TOKEN_USAGE_LEDGER_DIR/<session_id>.json` (or `~/.cache/token-usage/<session_id>.json`),
+  falling back to `latest.json` — a best-effort symlink pointing at the latest
+  session aggregate — only when there is no usable session id or that session has
+  no ledger yet. Silent (exit 0, no output) on missing or malformed input and
+  ledgers. Not for Cursor (JSONL hooks, no per-session JSON or `latest.json`).
 - **README (0.7 surfaces)** — dashboard/live/export usage, privacy/redaction notes,
   Windows statusline setup, and MCP scope (dashboard/export remain CLI-only).
 - **Roadmap disclosures** — HTTP/SSE MCP transport and true OTLP mapping deferred
@@ -60,9 +64,10 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- **Statusline docs** — clarify `statusline.ps1` targets Claude Code's aggregate
-  `latest.json` ledger on Windows; Cursor users should use `live --runtime cursor`
-  because hook storage is JSONL without `latest.json`.
+- **Statusline docs** — clarify `statusline.ps1` targets Claude Code's ledger
+  layout on Windows, needs PowerShell 7+, and reads `session_id` from stdin;
+  Cursor users should use `live --runtime cursor` because hook storage is JSONL
+  with no per-session JSON or `latest.json`.
 - **`skills/report/SKILL.md`** — Cursor runtime and MCP guidance without a single
   hardcoded tool prefix.
 - **SECURITY.md** — scope now includes Cursor hook commands, read-only Cursor Desktop

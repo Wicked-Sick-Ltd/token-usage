@@ -1,18 +1,29 @@
-# token-usage statusline example (Windows / PowerShell) — Claude Code session cost + top activity.
+# token-usage statusline example (Windows / PowerShell 7+) — Claude Code session
+# cost + top activity.
+#
+# Requires PowerShell 7 or newer (`pwsh`). Windows PowerShell 5.1 is not supported.
 #
 # Setup (Claude Code on Windows): point /statusline at this script (dependency-free):
 #   "command": "pwsh -NoProfile -File C:/path/to/token-usage/examples/statusline.ps1"
 #
-# Reads the aggregate ledger pointer maintained by Claude Code Stop/SubagentStop hooks:
-#   $env:TOKEN_USAGE_LEDGER_DIR/latest.json  (override directory)
-#   or ~/.cache/token-usage/latest.json
+# Claude Code pipes its statusline JSON on stdin. This script reads `session_id`
+# from it and resolves the ledger the Stop/SubagentStop hooks write, in order:
+#   1. <ledger dir>/<session_id>.json — the current session's own aggregate.
+#   2. <ledger dir>/latest.json — a pointer to the most recent session aggregate.
+#      Used only as a fall back, when stdin carried no usable session id or that
+#      session has no ledger yet. The hook creates it as a symlink on a
+#      best-effort basis and Windows commonly refuses, so it is often absent;
+#      the per-session path above is the reliable one.
 #
-# That file is a symlink to the current session's JSON ledger (same shape as statusline.sh).
-# Cursor hook storage is append-only JSONL and does not write latest.json — use
+# <ledger dir> is $env:TOKEN_USAGE_LEDGER_DIR when set, else ~/.cache/token-usage.
+#
+# Cursor hook storage is append-only JSONL and writes no per-session JSON or
+# latest.json, so this is not a Cursor statusline. For a refreshing Cursor view
+# in the terminal use:
 #   python3 scripts/token_usage.py live --runtime cursor
-# for a refreshing terminal view instead of wiring this script.
 #
-# Missing or malformed ledgers exit 0 with no stdout/stderr (never blocks the editor).
+# Missing or malformed input and ledgers exit 0 with no stdout/stderr, so a
+# broken statusline never blocks the editor.
 
 $ErrorActionPreference = 'Stop'
 
@@ -22,11 +33,39 @@ function Get-UserHome {
     return [Environment]::GetFolderPath('UserProfile')
 }
 
-function Get-LedgerPath {
-    if ($env:TOKEN_USAGE_LEDGER_DIR) {
-        return Join-Path $env:TOKEN_USAGE_LEDGER_DIR 'latest.json'
+function Get-LedgerDir {
+    if ($env:TOKEN_USAGE_LEDGER_DIR) { return $env:TOKEN_USAGE_LEDGER_DIR }
+    return (Join-Path (Join-Path (Get-UserHome) '.cache') 'token-usage')
+}
+
+function Get-StdinSessionId($raw) {
+    # The hook names the ledger after the session id stripped to
+    # [A-Za-z0-9_-]; applying the same filter here is what makes the two agree,
+    # and it also keeps a hostile id from addressing a file outside the ledger
+    # directory. An unusable id is $null, which falls through to latest.json.
+    if ([string]::IsNullOrWhiteSpace($raw)) { return $null }
+    try {
+        $payload = $raw | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        return $null
     }
-    return Join-Path (Join-Path (Get-UserHome) '.cache\token-usage') 'latest.json'
+    if ($null -eq $payload) { return $null }
+    $id = $payload.session_id
+    if ($null -eq $id) { return $null }
+    $clean = ([string]$id) -replace '[^A-Za-z0-9_-]', ''
+    if ([string]::IsNullOrEmpty($clean)) { return $null }
+    return $clean
+}
+
+function Resolve-LedgerPath($sessionId) {
+    $dir = Get-LedgerDir
+    if ($sessionId) {
+        $session = Join-Path $dir "$sessionId.json"
+        if (Test-Path -LiteralPath $session -PathType Leaf) { return $session }
+    }
+    $latest = Join-Path $dir 'latest.json'
+    if (Test-Path -LiteralPath $latest -PathType Leaf) { return $latest }
+    return $null
 }
 
 function Format-TokenCount([double]$n) {
@@ -54,13 +93,16 @@ function Format-Cost($cost) {
 }
 
 try {
-    $ledgerPath = Get-LedgerPath
-    if (-not (Test-Path -LiteralPath $ledgerPath)) { exit 0 }
+    $raw = ''
+    try { $raw = [Console]::In.ReadToEnd() } catch { $raw = '' }
 
-    $raw = Get-Content -LiteralPath $ledgerPath -Raw -ErrorAction Stop
-    if ([string]::IsNullOrWhiteSpace($raw)) { exit 0 }
+    $ledgerPath = Resolve-LedgerPath (Get-StdinSessionId $raw)
+    if (-not $ledgerPath) { exit 0 }
 
-    $data = $raw | ConvertFrom-Json -ErrorAction Stop
+    $body = Get-Content -LiteralPath $ledgerPath -Raw -ErrorAction Stop
+    if ([string]::IsNullOrWhiteSpace($body)) { exit 0 }
+
+    $data = $body | ConvertFrom-Json -ErrorAction Stop
     if ($null -eq $data -or $null -eq $data.total) { exit 0 }
 
     $outTokens = 0
