@@ -165,7 +165,7 @@ telemetry — and are intentionally **not** exposed through the stdio MCP server
 | --- | --- | --- |
 | `dashboard` | Static HTML archive of indexed history | Activity-only or `partial` corpora disclose unmeasured cost/token cards |
 | `live` | Polling refresh of one session report | Same session discovery and measurement warnings as `report`; preferred terminal refresh for Cursor (no `latest.json` statusline) |
-| `export` | JSONL aggregates (`token-usage.aggregate.v1`) | `measurement` and `warnings` preserved; redact labels before sharing |
+| `export` | JSONL aggregates (`token-usage.aggregate.v1`) | `measurement` and `warnings` preserved; history records add the `measurement_counts` scan tally; redact labels before sharing |
 
 Export uses OTel-style **metric names**, not OTLP protobuf/HTTP. A future OTLP
 exporter can map this stable schema without breaking JSONL consumers.

@@ -333,6 +333,73 @@ def test_history_export_empty_filtered_history(tu, tmp_path, monkeypatch):
     assert records[0]["metrics"]["gen_ai.usage.output_tokens"] == 0
 
 
+def test_history_scan_measurement_takes_only_the_tally(tu):
+    # `has_rows` was accepted and never read, so two call sites passed a value
+    # that changed nothing and read as though it did.
+    import inspect
+
+    assert list(inspect.signature(tu.history_scan_measurement).parameters) == ["counts"]
+    with pytest.raises(TypeError):
+        tu.history_scan_measurement({}, has_rows=False)
+
+
+def test_history_scan_measurement_reports_the_worst_tallied_level(tu):
+    assert tu.history_scan_measurement({}) == "exact"
+    assert tu.history_scan_measurement({"exact": 3}) == "exact"
+    assert tu.history_scan_measurement({"exact": 3, "partial": 1}) == "partial"
+    assert tu.history_scan_measurement({"partial": 2, "activity_only": 1}) == "activity_only"
+
+
+def test_history_export_records_carry_the_measurement_counts(tu, tmp_path, monkeypatch):
+    # "partial" alone cannot tell one weak session in a hundred from a corpus
+    # nobody measured. The tally can, so ship it beside the worst-case level.
+    seed_history(tmp_path, monkeypatch)
+    export_data, counts = tu.history_export_data(by="project", since="36500d")
+    records = tu.history_export_records(
+        export_data, generated_at=GENERATED_AT, measurement_counts=counts)
+    assert records
+    assert all(r["measurement_counts"] == counts for r in records)
+
+
+def test_history_export_counts_separate_one_weak_session_from_none_measured(tu):
+    data = {"by": "project", "rows": [], "runtime": "claude", "warnings": []}
+    weak = tu.history_export_records(
+        data, generated_at=GENERATED_AT,
+        measurement_counts={"exact": 99, "activity_only": 1})
+    none_measured = tu.history_export_records(
+        data, generated_at=GENERATED_AT, measurement_counts={"activity_only": 1})
+    assert weak[0]["measurement"] == none_measured[0]["measurement"] == "activity_only"
+    assert weak[0]["measurement_counts"] == {"exact": 99, "activity_only": 1}
+    assert none_measured[0]["measurement_counts"] == {"activity_only": 1}
+
+
+def test_empty_history_export_counts_nothing_rather_than_measuring_zero(tu, tmp_path,
+                                                                        monkeypatch):
+    seed_history(tmp_path, monkeypatch)
+    export_data, counts = tu.history_export_data(by="project", since="0d")
+    records = tu.history_export_records(
+        export_data, generated_at=GENERATED_AT, measurement_counts=counts)
+    # An empty tally is how a consumer tells "scanned nothing" from
+    # "scanned sessions and they were all exact".
+    assert records[0]["measurement_counts"] == {}
+
+
+def test_session_export_records_carry_no_scan_counts(tu, tmp_path, monkeypatch):
+    path = seed_session(tmp_path, monkeypatch)
+    records = tu.session_export_records(_session_data(tu, path),
+                                        generated_at=GENERATED_AT)
+    assert records
+    assert all("measurement_counts" not in r for r in records)
+
+
+def test_history_export_records_counts_default_to_the_scan_data(tu, tmp_path,
+                                                                monkeypatch):
+    seed_history(tmp_path, monkeypatch)
+    hist = tu.run_history(by="project", since="36500d")
+    records = tu.history_export_records(hist, generated_at=GENERATED_AT)
+    assert all(r["measurement_counts"] == {} for r in records)
+
+
 def test_render_jsonl_strict_trailing_newline(tu):
     assert tu.render_jsonl([]) == ""
     one = tu.render_jsonl([{"schema": "token-usage.aggregate.v1", "metrics": {}}])

@@ -1137,8 +1137,15 @@ def _run_history_core(by="project", since=None, project=None, warnings=None, run
     return data, measurements, runtime_name
 
 
-def history_scan_measurement(counts, *, has_rows=True):
-    """Worst measurement level for a corpus scan tally (dashboard + export)."""
+def history_scan_measurement(counts):
+    """Worst measurement level for a corpus scan tally (dashboard + export).
+
+    An empty tally means no session reported a level of its own, which is the
+    Claude corpus (exact by construction) and also a scan that matched nothing
+    at all. Both come out "exact", and neither is a claim about spend: the
+    reader is told the scan was empty by the empty-state banner and the
+    missing-root footnote, and a consumer tells the two apart by the tally
+    itself, which export ships as `measurement_counts`."""
     if counts:
         return worst_measurement(*counts.keys())
     return "exact"
@@ -1315,8 +1322,7 @@ def dashboard_data(runtime="claude", since=None, project=None, project_dir=None,
     by_command, _, _ = _run_history_core(by="command", **scan)
     by_model, _, _ = _run_history_core(by="model", **scan)
     usage_total, cost_total, sessions = _sum_history_rows(by_project["rows"])
-    measurement = history_scan_measurement(
-        scan_measurements, has_rows=bool(by_project["rows"]))
+    measurement = history_scan_measurement(scan_measurements)
     out = {
         "since": since,
         "project": project,
@@ -1683,15 +1689,15 @@ def _export_metrics(usage, cost_usd):
     }
 
 
-def _export_history_measurement(data, measurement_counts=None):
-    counts = measurement_counts
-    if counts is None:
-        counts = data.get("measurements") or {}
-    return history_scan_measurement(counts, has_rows=bool(data.get("rows")))
+def _export_history_counts(data, measurement_counts=None):
+    """The scan's per-session measurement tally, defaulting to the scan data."""
+    if measurement_counts is not None:
+        return dict(measurement_counts)
+    return dict(data.get("measurements") or {})
 
 
 def _export_record(*, runtime, scope, key, dimensions, usage, cost_usd, measurement,
-                   warnings, timestamp, group_by=None):
+                   warnings, timestamp, group_by=None, measurement_counts=None):
     rec = {
         "schema": EXPORT_SCHEMA,
         "runtime": runtime,
@@ -1705,6 +1711,13 @@ def _export_record(*, runtime, scope, key, dimensions, usage, cost_usd, measurem
     }
     if group_by is not None:
         rec["group_by"] = group_by
+    # History scope only: `measurement` is the worst level any session in the
+    # scan reported, which cannot distinguish one weak session in a hundred
+    # from a corpus nobody measured — or either from a scan that matched
+    # nothing. The tally can. A session record has one session, so it has
+    # nothing to count.
+    if measurement_counts is not None:
+        rec["measurement_counts"] = measurement_counts
     return rec
 
 
@@ -1749,7 +1762,8 @@ def history_export_records(data, generated_at=None, *, measurement_counts=None):
     ts = _export_timestamp(generated_at)
     runtime = data.get("runtime") or "claude"
     group_by = data["by"]
-    measurement = _export_history_measurement(data, measurement_counts)
+    counts = _export_history_counts(data, measurement_counts)
+    measurement = history_scan_measurement(counts)
     warnings = data.get("warnings") or []
     records = []
     for row in data["rows"]:
@@ -1764,6 +1778,7 @@ def history_export_records(data, generated_at=None, *, measurement_counts=None):
             warnings=warnings,
             timestamp=ts,
             group_by=group_by,
+            measurement_counts=counts,
         ))
     usage_total, cost_total, _sessions = _sum_history_rows(data["rows"])
     records.append(_export_record(
@@ -1777,6 +1792,7 @@ def history_export_records(data, generated_at=None, *, measurement_counts=None):
         warnings=warnings,
         timestamp=ts,
         group_by=group_by,
+        measurement_counts=counts,
     ))
     return records
 

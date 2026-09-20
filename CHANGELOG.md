@@ -47,7 +47,10 @@ adheres to [Semantic Versioning](https://semver.org/).
   `--interval`, `--iterations`, `--agents`, `--models`; Ctrl-C exits 0.
 - **`export` CLI** — RFC-8259 JSONL with schema `token-usage.aggregate.v1` and
   OTel-style metric names (local interchange, not OTLP wire format); session and
-  history scopes with atomic file output.
+  history scopes with atomic file output. History records carry
+  `measurement_counts`, the scan's per-session measurement tally, so a consumer
+  can tell one weak session from an entirely unmeasured corpus (and an empty
+  tally from either).
 - **`examples/statusline.ps1`** — dependency-free **PowerShell 7+** statusline for
   **Claude Code on Windows**: reads the statusline JSON from stdin and resolves
   `TOKEN_USAGE_LEDGER_DIR/<session_id>.json` (or `~/.cache/token-usage/<session_id>.json`),

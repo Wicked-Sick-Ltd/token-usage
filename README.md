@@ -212,6 +212,8 @@ Polls every `--interval` seconds (default 2), re-rendering the session report ea
 
 Emits one RFC-8259 JSON object per line with schema `token-usage.aggregate.v1` and OTel-style metric names (for example `gen_ai.usage.output_tokens`, `gen_ai.estimated_cost.usd`). This is a stable local interchange format — **not** OTLP protobuf/HTTP. Default scope is `history` (grouped by project); `--scope session` emits one `total` row plus one row per activity label. `gen_ai.estimated_cost.usd` is JSON `null` when unpriced or unmeasured. Lines include project slugs, command labels, and model IDs — redact before sharing. File output uses atomic replace; stdout streams directly.
 
+History-scope records also carry `measurement_counts`, the scan's per-session tally (for example `{"exact": 99, "activity_only": 1}`). `measurement` alone is the worst level any session reported, so it cannot tell one weak session from a corpus nobody measured, nor either from a scan that matched nothing — an empty tally is how you spot the last case. Session-scope records cover one session and carry no tally.
+
 ### Budget nudges
 
 Set `TOKEN_USAGE_BUDGET_USD` (a number greater than zero — anything else is ignored
