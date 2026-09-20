@@ -1042,6 +1042,65 @@ def test_cursor_session_id_not_in_the_database_fails_closed(mcp, tmp_path, monke
     assert "Refactor token parser" not in text
 
 
+def two_cursor_composers(tmp_path, monkeypatch):
+    """A Cursor corpus with a partial composer and an activity-only one."""
+    from test_cursor_adapter import build_cursor_tree
+
+    cursor_root = tmp_path / "cursor-user"
+    build_cursor_tree(cursor_root, composer_id="comp-partial")
+    build_cursor_tree(
+        cursor_root, composer_id="comp-zero",
+        bubble_headers=[{"bubbleId": "zero-user", "type": 1},
+                        {"bubbleId": "zero-asst", "type": 2}])
+    monkeypatch.setenv("TOKEN_USAGE_CURSOR_DIR", str(cursor_root))
+    monkeypatch.setenv("TOKEN_USAGE_LEDGER_DIR", str(tmp_path / "cache"))
+    return cursor_root
+
+
+def test_diff_cursor_json_reports_the_worst_side_measurement(mcp, tmp_path, monkeypatch):
+    # A diff is only as trustworthy as its least-measured side, and the JSON
+    # said nothing at all: a Δ against an unmeasured session is not a Δ of $0.
+    two_cursor_composers(tmp_path, monkeypatch)
+    data = json.loads(call(mcp, "diff", runtime="cursor",
+                           old="comp-partial", new="comp-zero")[0])
+    assert data["runtime"] == "cursor"
+    assert data["measurement"] == "activity_only"
+
+
+def test_diff_cursor_json_is_partial_when_both_sides_are(mcp, tmp_path, monkeypatch):
+    two_cursor_composers(tmp_path, monkeypatch)
+    data = json.loads(call(mcp, "diff", runtime="cursor",
+                           old="comp-partial", new="comp-partial")[0])
+    assert data["measurement"] == "partial"
+
+
+def test_diff_cursor_markdown_discloses_activity_only(mcp, tmp_path, monkeypatch):
+    two_cursor_composers(tmp_path, monkeypatch)
+    text, err = call(mcp, "diff", runtime="cursor", old="comp-partial",
+                     new="comp-zero", format="markdown")
+    assert not err, text
+    assert "activity-only" in text
+    assert "unmeasured" in text
+
+
+def test_diff_cursor_markdown_discloses_partial(mcp, tmp_path, monkeypatch):
+    two_cursor_composers(tmp_path, monkeypatch)
+    text, err = call(mcp, "diff", runtime="cursor", old="comp-partial",
+                     new="comp-partial", format="markdown")
+    assert not err, text
+    assert "Measurement: partial" in text
+
+
+def test_diff_default_claude_keeps_its_pre_runtime_shape(mcp, tmp_path, monkeypatch):
+    _proj, s1, s2 = seed(tmp_path, monkeypatch)
+    data = json.loads(call(mcp, "diff", old=str(s1), new=str(s2))[0])
+    assert "runtime" not in data
+    assert "measurement" not in data
+    text, err = call(mcp, "diff", old=str(s1), new=str(s2), format="markdown")
+    assert not err, text
+    assert "Measurement:" not in text
+
+
 def test_serve_exits_cleanly_when_stdin_is_none(mcp, monkeypatch):
     # A process started with stdin closed (`python mcp_server.py 0<&-`) gets
     # sys.stdin is None; both _resilient_stdin fallbacks handed that straight

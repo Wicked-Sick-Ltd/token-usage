@@ -242,19 +242,40 @@ def unpriced_footnote(models):
 
 MEASUREMENT_NAMES = {"partial": "partial", "activity_only": "activity-only"}
 
+# Least confident last: worst_measurement ranks on this order.
+MEASUREMENT_CONFIDENCE = ("exact", "partial", "activity_only")
 
-def measurement_note(measurement):
-    """Disclosure line for one session's non-exact measurement, else None.
+
+def worst_measurement(*levels):
+    """The least confident of several measurements.
+
+    A comparison is only as trustworthy as its weakest side, so a diff of an
+    exact session against an unmeasured one is an unmeasured diff — not an
+    exact one that happens to contain zeroes. An unrecognised level is ignored
+    rather than guessed at."""
+    worst = "exact"
+    for level in levels:
+        if level in MEASUREMENT_CONFIDENCE and (
+                MEASUREMENT_CONFIDENCE.index(level)
+                > MEASUREMENT_CONFIDENCE.index(worst)):
+            worst = level
+    return worst
+
+
+def measurement_note(measurement, subject="this session"):
+    """Disclosure line for a non-exact measurement, else None.
 
     A runtime that reports no token counts produces zero buckets and (for
     activity-only data) a suppressed cost column — typographically identical
-    to a session that genuinely cost nothing. Markdown has to say which."""
+    to a session that genuinely cost nothing. Markdown has to say which.
+    `subject` names what was measured: a diff spans two sessions, and calling
+    that "this session" would point the reader at the wrong thing."""
     if measurement == "partial":
         return ("Measurement: partial — this runtime reported only some token "
-                "buckets for this session, so totals and costs are lower bounds.")
+                f"buckets for {subject}, so totals and costs are lower bounds.")
     if measurement == "activity_only":
         return ("Measurement: activity-only — this runtime reported no token counts "
-                "for this session, so zero usage means unmeasured, not free.")
+                f"for {subject}, so zero usage means unmeasured, not free.")
     return None
 
 
@@ -770,6 +791,16 @@ def render_diff(d):
     sign = "+" if do >= 0 else "-"
     lines.append(f"| **Total** | **{fmt_cost(ta['cost_usd'])}** | **{fmt_cost(tb['cost_usd'])}** "
                  f"| **{fmt_cost_delta(dt)}** | **{sign}{fmt_tokens(abs(do))}** |")
+    # Reported for the worst of the two sides (see worst_measurement): a Δ
+    # against an unmeasured session is not a Δ of $0, and the table alone
+    # cannot say so. Claude diffs carry no measurement and print nothing.
+    note = measurement_note(d.get("measurement"),
+                            subject="at least one side of this comparison")
+    if note:
+        lines += ["", note]
+        named = warnings_note(d.get("warnings"))
+        if named:
+            lines.append(named)
     return "\n".join(lines)
 
 

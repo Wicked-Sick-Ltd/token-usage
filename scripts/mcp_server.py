@@ -558,15 +558,16 @@ def _resolve_diff_side(value, runtime, warnings=None):
 
 
 def _diff_aggregate(adapter, source, pricing, warnings):
+    """(aggregate, measurement) for one side of a diff."""
     if adapter.name == "claude":
-        return tu.aggregate(tu.parse_session(source), pricing)
+        return tu.aggregate(tu.parse_session(source), pricing), "exact"
     parsed = adapter.parse(source)
     for w in parsed.get("warnings") or []:
         if w not in warnings:
             warnings.append(w)
     measurement = tu.measurement_for_adapter(adapter, parsed)
     data = tu.aggregate(parsed["segments"], pricing)
-    return tu.apply_measurement_costs(data, measurement)
+    return tu.apply_measurement_costs(data, measurement), measurement
 
 
 def _diff_from_aggregates(a, b):
@@ -599,12 +600,17 @@ def tool_diff(args):
     pricing = tu.load_pricing(warnings)
     if old_ad.name == "claude":
         data = tu.diff_data(old_src, new_src, pricing)
+        measurement = "exact"
     else:
-        a = _diff_aggregate(old_ad, old_src, pricing, warnings)
-        b = _diff_aggregate(new_ad, new_src, pricing, warnings)
+        a, a_measurement = _diff_aggregate(old_ad, old_src, pricing, warnings)
+        b, b_measurement = _diff_aggregate(new_ad, new_src, pricing, warnings)
         data = _diff_from_aggregates(a, b)
+        # The comparison inherits its weakest side: a Δ measured against an
+        # activity-only session is itself activity-only.
+        measurement = tu.worst_measurement(a_measurement, b_measurement)
     if runtime != "claude":
         data["runtime"] = runtime if runtime != "auto" else old_ad.name
+        data["measurement"] = measurement
     return finish(data, tu.render_diff, args.get("format"), warnings)
 
 
