@@ -2053,35 +2053,78 @@ def _cursor_hook_usage_has_tokens(usage):
     )
 
 
-def _cursor_hook_usage_from_payload(payload):
-    """Map optional Cursor hook token fields to usage buckets (present fields only)."""
+CURSOR_TOKEN_FIELDS = ("input_tokens", "output_tokens",
+                       "cache_read_tokens", "cache_write_tokens")
+
+
+def _cursor_hook_tokens_from_payload(payload):
+    """The token fields a Cursor completion hook carries, stored verbatim.
+
+    Capture stays lossless. Cursor's cumulative `input_tokens` has to have the
+    cache buckets subtracted out before it means "uncached input", but doing
+    that here clamped a measured input to zero whenever the payload's cache
+    fields were larger — with nothing left in the ledger to notice it by.
+    _cursor_usage_from_tokens does the arithmetic at parse time, where an
+    impossible combination can still be disclosed."""
     if not isinstance(payload, dict):
         return None
-    field_map = (
-        ("input_tokens", "input"),
-        ("output_tokens", "output"),
-        ("cache_read_tokens", "cache_read"),
-        ("cache_write_tokens", "cache_5m"),
-    )
-    flat = {}
-    for src, dst in field_map:
-        val = payload.get(src)
+    tokens = {}
+    for field in CURSOR_TOKEN_FIELDS:
+        val = payload.get(field)
         if isinstance(val, (int, float)) and not isinstance(val, bool) and val >= 0:
-            flat[dst] = int(val)
-    if not flat:
+            tokens[field] = int(val)
+    return tokens or None
+
+
+def _cursor_usage_from_tokens(tokens, context, warnings=None):
+    """(usage buckets, trusted) for one completion event's raw token fields.
+
+    `trusted` is False when the cache buckets exceed the reported input: that
+    is a payload shape we do not understand, so the measured input is kept as
+    it stands and the session is downgraded to `partial` rather than being
+    silently clamped to zero uncached input."""
+    if not isinstance(tokens, dict):
+        return None, True
+    vals = {}
+    for field in CURSOR_TOKEN_FIELDS:
+        val = tokens.get(field)
+        vals[field] = int(val) if isinstance(val, (int, float)) and not isinstance(val, bool) and val > 0 else 0
+    if not any(vals.values()):
+        return None, True
+    inp = vals["input_tokens"]
+    cached = vals["cache_read_tokens"] + vals["cache_write_tokens"]
+    trusted = True
+    if inp and cached:
+        if inp >= cached:
+            inp -= cached
+        else:
+            trusted = False
+            warn(f"Cursor hook {context}: input_tokens ({inp}) is below "
+                 f"cache_read+cache_write ({cached}); keeping the reported input "
+                 "and downgrading this session to partial", warnings)
+    return {"input": inp, "output": vals["output_tokens"],
+            "cache_read": vals["cache_read_tokens"],
+            "cache_5m": vals["cache_write_tokens"], "cache_1h": 0}, trusted
+
+
+def _cursor_workspace_roots_from_payload(payload):
+    """Workspace roots from a hook payload — the ledger's only project identity."""
+    roots = payload.get("workspace_roots")
+    if isinstance(roots, str):
+        roots = [roots]
+    if not isinstance(roots, list):
         return None
-    if "input" in flat and ("cache_read" in flat or "cache_5m" in flat):
-        flat["input"] = max(
-            0,
-            flat["input"] - flat.get("cache_read", 0) - flat.get("cache_5m", 0),
-        )
-    return {
-        "input": flat.get("input", 0),
-        "output": flat.get("output", 0),
-        "cache_read": flat.get("cache_read", 0),
-        "cache_5m": flat.get("cache_5m", 0),
-        "cache_1h": 0,
-    }
+    cleaned = [r.strip() for r in roots if isinstance(r, str) and r.strip()]
+    return cleaned or None
+
+
+def _utc_now_iso():
+    """Now, as the second-precision UTC ISO instant transcripts already use.
+
+    Same shape as since_cutoff()'s output so the plain string comparisons the
+    window filters run on stay meaningful."""
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _cursor_hook_activity_from_payload(payload):
@@ -2098,7 +2141,14 @@ def _cursor_hook_activity_from_payload(payload):
 def _cursor_hook_record_from_payload(payload):
     hook = str(payload.get("hook_event_name") or "")
     gen = _sanitize_cursor_id(payload.get("generation_id"))
-    record = {"hook": hook, "generation_id": gen}
+    # The ledger filename hashes the conversation id for path safety, so the
+    # raw id travels in the record: it is what deduplicates a hook-captured
+    # conversation against Cursor's own composer row for the same one.
+    record = {"hook": hook, "generation_id": gen, "ts": _utc_now_iso(),
+              "conversation_id": str(payload.get("conversation_id"))}
+    roots = _cursor_workspace_roots_from_payload(payload)
+    if roots:
+        record["workspace_roots"] = roots
     if hook == "beforeSubmitPrompt":
         prompt = payload.get("prompt")
         if isinstance(prompt, str):
@@ -2119,9 +2169,9 @@ def _cursor_hook_record_from_payload(payload):
         model = payload.get("model") or payload.get("subagent_model")
         if model:
             record["model"] = str(model)
-        usage = _cursor_hook_usage_from_payload(payload)
-        if usage:
-            record["usage"] = usage
+        tokens = _cursor_hook_tokens_from_payload(payload)
+        if tokens:
+            record["tokens"] = tokens
         if hook == "subagentStop":
             record["subagent_id"] = _sanitize_cursor_id(payload.get("subagent_id"))
             record["subagent_type"] = str(payload.get("subagent_type") or "agent")
@@ -2133,7 +2183,16 @@ def _cursor_hook_ledger_path(conversation_id):
 
 
 def _append_cursor_hook_line(ledger_path, record):
-    ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    parent = ledger_path.parent
+    fresh = not parent.is_dir()
+    parent.mkdir(parents=True, exist_ok=True)
+    if fresh:
+        # Ledgers hold prompt previews: owner-only where the filesystem
+        # supports it, and no worse than the default where it does not.
+        try:
+            os.chmod(parent, 0o700)
+        except OSError:
+            pass
     line = json.dumps(record, separators=(",", ":")) + "\n"
     with open(ledger_path, "a", encoding="utf-8") as handle:
         handle.write(line)
@@ -2175,20 +2234,38 @@ def run_cursor_hook():
         return 0
 
 
+def _cursor_ledger_event_usage(ev, warnings):
+    """(usage buckets, trusted) for one ledger event, new shape or legacy.
+
+    New records carry the hook's raw `tokens`; ledgers written before the
+    capture stopped normalizing carry an already-bucketed `usage`, which is
+    taken as it stands (its input was subtracted at capture time)."""
+    if "tokens" in ev:
+        gen = ev.get("generation_id") or "unknown"
+        return _cursor_usage_from_tokens(ev.get("tokens"), f"generation {gen}", warnings)
+    usage = ev.get("usage")
+    if not _cursor_hook_usage_has_tokens(usage):
+        return None, True
+    return {k: int(usage.get(k) or 0)
+            for k in ("input", "output", "cache_read", "cache_5m", "cache_1h")}, True
+
+
 def _cursor_parse_hook_ledger(session, warnings):
+    """(segments, measurement) for one conversation's hook ledger."""
     segments = []
     saw_tokens = False
+    trusted = True
     path = session.ledger_path
     if path is None or not path.is_file():
         warn(f"Cursor hook ledger not found for {session.composer_id!r}", warnings)
-        return segments, saw_tokens
+        return segments, "activity_only"
 
     events = []
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
         warn(f"cannot read Cursor hook ledger: {exc}", warnings)
-        return segments, saw_tokens
+        return segments, "activity_only"
     for line in text.splitlines():
         line = line.strip()
         if not line:
@@ -2218,21 +2295,20 @@ def _cursor_parse_hook_ledger(session, warnings):
         return gen_meta[gen]
 
     def record_completion(meta, ev):
-        usage = ev.get("usage")
-        has_tokens = _cursor_hook_usage_has_tokens(usage)
+        usage, ev_trusted = _cursor_ledger_event_usage(ev, warnings)
         if meta["usage"] is not None:
-            return
-        if has_tokens:
+            return None
+        if usage:
             if ev.get("model"):
                 meta["model"] = str(ev.get("model"))
             meta["usage"] = usage
             meta["completion_done"] = True
-            return True
+            return ev_trusted
         if not meta["completion_done"]:
             if ev.get("model"):
                 meta["model"] = str(ev.get("model"))
             meta["completion_done"] = True
-        return False
+        return None
 
     for ev in events:
         gen = ev.get("generation_id")
@@ -2270,19 +2346,17 @@ def _cursor_parse_hook_ledger(session, warnings):
             if sub["stop_recorded"]:
                 continue
             sub["stop_recorded"] = True
-            usage = ev.get("usage")
+            usage, ev_trusted = _cursor_ledger_event_usage(ev, warnings)
             model = ev.get("model") or sub.get("model") or "unknown"
             parent = sub.get("parent_gen") or gen
             parent_meta = meta_for(parent)
             bucket = empty_usage()
-            if _cursor_hook_usage_has_tokens(usage):
+            bucket["requests"] = 1
+            if usage:
                 saw_tokens = True
-                for key in ("input", "output", "cache_read", "cache_5m", "cache_1h"):
-                    if key in usage:
-                        bucket[key] = int(usage.get(key) or 0)
-                bucket["requests"] = 1
-            else:
-                bucket["requests"] = 1
+                trusted = trusted and ev_trusted
+                for key, value in usage.items():
+                    bucket[key] = value
             parent_meta["subagents"].append({
                 "type": sub.get("type") or "agent",
                 "description": sub.get("description") or "",
@@ -2290,8 +2364,10 @@ def _cursor_parse_hook_ledger(session, warnings):
                 "by_model": {model: bucket},
             })
         elif hook in _CURSOR_COMPLETION_HOOKS:
-            if record_completion(meta, ev):
+            ev_trusted = record_completion(meta, ev)
+            if ev_trusted is not None:
                 saw_tokens = True
+                trusted = trusted and ev_trusted
 
     for gen in gen_order:
         meta = gen_meta[gen]
@@ -2309,7 +2385,9 @@ def _cursor_parse_hook_ledger(session, warnings):
         elif meta["completion_done"]:
             seg["by_model"].setdefault(model, empty_usage())["requests"] += 1
         segments.append(seg)
-    return segments, saw_tokens
+    if not saw_tokens:
+        return segments, "activity_only"
+    return segments, ("exact" if trusted else "partial")
 
 
 def _cursor_bubble_text(bubble):
@@ -2525,8 +2603,7 @@ class CursorAdapter(RuntimeAdapter):
             segments = _cursor_parse_cloud_export(source, warnings)
             measurement = "activity_only"
         elif source.source == "hook_ledger":
-            segments, saw_tokens = _cursor_parse_hook_ledger(source, warnings)
-            measurement = "exact" if saw_tokens else "activity_only"
+            segments, measurement = _cursor_parse_hook_ledger(source, warnings)
         else:
             segments, saw_tokens = _cursor_parse_sqlite(source, warnings)
             measurement = "partial" if saw_tokens else "activity_only"

@@ -1,6 +1,7 @@
 """Cursor hook ledger: fail-open CLI, JSONL append, and adapter parse."""
 import json
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -78,7 +79,10 @@ def test_before_submit_writes_truncated_prompt(tmp_path):
     assert len(lines[0]["prompt"]) == 120
 
 
-def test_stop_writes_optional_token_fields(tmp_path):
+def test_stop_writes_raw_token_fields(tmp_path):
+    # Capture is lossless: normalization (subtracting cache from a cumulative
+    # input) happens at parse time, where a nonsensical combination can still
+    # be disclosed instead of silently clamped into the ledger.
     r = run_cursor_hook(
         base_payload(
             hook_event_name="stop",
@@ -92,11 +96,13 @@ def test_stop_writes_optional_token_fields(tmp_path):
     assert r.returncode == 0
     lines = read_ledger_lines(ledger_path(tmp_path, "conv-abc"))
     assert lines[0]["hook"] == "stop"
-    assert lines[0]["usage"]["output"] == 200
-    assert lines[0]["usage"]["cache_read"] == 400
-    assert lines[0]["usage"]["cache_5m"] == 50
-    # input_tokens includes cache; uncached input is normalized
-    assert lines[0]["usage"]["input"] == 550
+    assert lines[0]["tokens"] == {
+        "input_tokens": 1000,
+        "output_tokens": 200,
+        "cache_read_tokens": 400,
+        "cache_write_tokens": 50,
+    }
+    assert "usage" not in lines[0]
 
 
 def test_stop_missing_token_fields_still_records(tmp_path):
@@ -107,7 +113,44 @@ def test_stop_missing_token_fields_still_records(tmp_path):
     assert r.returncode == 0
     lines = read_ledger_lines(ledger_path(tmp_path, "conv-abc"))
     assert "usage" not in lines[0]
+    assert "tokens" not in lines[0]
     assert lines[0]["model"] == "claude-sonnet-4"
+
+
+def test_records_carry_utc_timestamp_and_raw_conversation_id(tmp_path):
+    raw_id = "acme/foo"
+    r = run_cursor_hook(
+        base_payload(conversation_id=raw_id, prompt="hi",
+                     hook_event_name="beforeSubmitPrompt"),
+        tmp_path,
+    )
+    assert r.returncode == 0
+    record = read_ledger_lines(ledger_path(tmp_path, raw_id))[0]
+    # The filename is hashed for path safety, so the raw id has to travel
+    # inside the record for dedupe against Cursor's own composer ids.
+    assert record["conversation_id"] == raw_id
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", record["ts"])
+
+
+def test_records_carry_workspace_roots(tmp_path):
+    r = run_cursor_hook(
+        base_payload(prompt="hi", hook_event_name="beforeSubmitPrompt",
+                     workspace_roots=["/tmp/project", 7, "  "]),
+        tmp_path,
+    )
+    assert r.returncode == 0
+    record = read_ledger_lines(ledger_path(tmp_path, "conv-abc"))[0]
+    assert record["workspace_roots"] == ["/tmp/project"]
+
+
+def test_ledger_directory_is_private(tmp_path):
+    r = run_cursor_hook(
+        base_payload(prompt="hi", hook_event_name="beforeSubmitPrompt"),
+        tmp_path,
+    )
+    assert r.returncode == 0
+    mode = stat.S_IMODE((tmp_path / "ledger" / "cursor").stat().st_mode)
+    assert mode == 0o700
 
 
 def test_unsafe_conversation_id_sanitized(tmp_path):
@@ -411,3 +454,66 @@ def test_subagent_id_reused_across_generations(tu, tmp_path, monkeypatch):
     assert segs[0]["subagents"][0]["by_model"]["claude-sonnet-4"]["output"] == 11
     assert segs[1]["subagents"][0]["type"] == "shell"
     assert segs[1]["subagents"][0]["by_model"]["claude-sonnet-4"]["output"] == 22
+
+
+def parse_ledger(tu, tmp_path, conversation_id):
+    path = ledger_path(tmp_path, conversation_id, tu)
+    return tu.get_runtime_adapter("cursor").parse(
+        tu.CursorSession(conversation_id, "hook_ledger", ledger_path=path)
+    )
+
+
+def test_parse_subtracts_cache_from_cumulative_input(tu, tmp_path, monkeypatch):
+    monkeypatch.setenv("TOKEN_USAGE_LEDGER_DIR", str(tmp_path / "ledger"))
+    conv = "conv-cumulative"
+    run_cursor_hook(
+        base_payload(conversation_id=conv, generation_id="gen-c",
+                     hook_event_name="stop", input_tokens=1000, output_tokens=200,
+                     cache_read_tokens=400, cache_write_tokens=50),
+        tmp_path,
+    )
+    result = parse_ledger(tu, tmp_path, conv)
+    assert result["measurement"] == "exact"
+    bucket = result["segments"][0]["by_model"]["claude-sonnet-4"]
+    assert bucket["input"] == 550
+    assert bucket["cache_read"] == 400
+    assert bucket["cache_5m"] == 50
+
+
+def test_parse_preserves_input_when_cache_exceeds_it(tu, tmp_path, monkeypatch):
+    # Subtracting here used to clamp a measured 300-token input to zero.
+    monkeypatch.setenv("TOKEN_USAGE_LEDGER_DIR", str(tmp_path / "ledger"))
+    conv = "conv-impossible"
+    run_cursor_hook(
+        base_payload(conversation_id=conv, generation_id="gen-i",
+                     hook_event_name="stop", input_tokens=300, output_tokens=20,
+                     cache_read_tokens=400, cache_write_tokens=50),
+        tmp_path,
+    )
+    result = parse_ledger(tu, tmp_path, conv)
+    assert result["measurement"] == "partial"
+    bucket = result["segments"][0]["by_model"]["claude-sonnet-4"]
+    assert bucket["input"] == 300
+    assert any("gen-i" in w and "below" in w for w in result["warnings"]), result["warnings"]
+
+
+def test_parse_reads_legacy_normalized_usage_records(tu, tmp_path, monkeypatch):
+    # Ledgers written before capture stopped normalizing keep working.
+    monkeypatch.setenv("TOKEN_USAGE_LEDGER_DIR", str(tmp_path / "ledger"))
+    conv = "conv-legacy"
+    path = ledger_path(tmp_path, conv, tu)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"hook": "beforeSubmitPrompt", "generation_id": "gen-l",
+                    "prompt": "legacy turn"}) + "\n"
+        + json.dumps({"hook": "stop", "generation_id": "gen-l",
+                      "model": "claude-sonnet-4",
+                      "usage": {"input": 550, "output": 200, "cache_read": 400,
+                                "cache_5m": 50, "cache_1h": 0}}) + "\n",
+        encoding="utf-8",
+    )
+    result = parse_ledger(tu, tmp_path, conv)
+    assert result["measurement"] == "exact"
+    bucket = result["segments"][0]["by_model"]["claude-sonnet-4"]
+    assert bucket["input"] == 550
+    assert bucket["cache_read"] == 400
