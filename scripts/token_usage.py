@@ -29,6 +29,7 @@ Stdlib only. Python 3.9+.
 """
 
 import argparse
+import contextlib
 import hashlib
 import html
 import json
@@ -101,13 +102,48 @@ def _valid_rates(v):
             and ("cache_read" not in v or _is_rate(v["cache_read"])))
 
 
+_WARNED_IN_SCOPE = None       # set() while a deduped_warnings() block is open
+
+
 def warn(message, warnings=None):
     """Report a non-fatal problem on stderr and, when a list is given, collect
     it. MCP callers never see stderr, so anything that silently changes the
-    numbers has to be able to travel in the result too."""
-    print(f"token-usage: {message}", file=sys.stderr)
+    numbers has to be able to travel in the result too.
+
+    Inside a deduped_warnings() block the same message reaches stderr once;
+    the caller's list still receives every occurrence, because counting them
+    is the caller's decision, not this function's."""
+    if _WARNED_IN_SCOPE is None or message not in _WARNED_IN_SCOPE:
+        if _WARNED_IN_SCOPE is not None:
+            _WARNED_IN_SCOPE.add(message)
+        print(f"token-usage: {message}", file=sys.stderr)
     if warnings is not None:
         warnings.append(message)
+
+
+@contextlib.contextmanager
+def deduped_warnings():
+    """Print each distinct warning to stderr once for the duration of the block.
+
+    For a command that deliberately scans one corpus several times — the
+    dashboard's four groupings plus its partial-enrichment pass — where a
+    single missing root is one problem however many passes trip over it.
+
+    Scoped to the block rather than to the process: a warning that recurs
+    legitimately, across two history calls in a long-lived MCP server or
+    across live's refreshes, must still be reported each time it happens.
+    Nesting reuses the open scope instead of restarting it, and the scope is
+    released even when the body raises, so a failed command cannot leave the
+    next one silenced."""
+    global _WARNED_IN_SCOPE
+    if _WARNED_IN_SCOPE is not None:
+        yield
+        return
+    _WARNED_IN_SCOPE = set()
+    try:
+        yield
+    finally:
+        _WARNED_IN_SCOPE = None
 
 
 def load_pricing(warnings=None):
@@ -1338,10 +1374,25 @@ def dashboard_data(runtime="claude", since=None, project=None, project_dir=None,
     """Aggregate indexed history for the static HTML dashboard."""
     warnings = warnings if warnings is not None else []
     scan = _history_scan_kwargs(since, project, warnings, runtime, project_dir)
-    by_project, scan_measurements, runtime_name = _run_history_core(by="project", **scan)
-    by_day, _, _ = _run_history_core(by="day", **scan)
-    by_command, _, _ = _run_history_core(by="command", **scan)
-    by_model, _, _ = _run_history_core(by="model", **scan)
+    # Five passes over one corpus. Without a scope around them a single missing
+    # root reaches the terminal five times, which reads as five problems — the
+    # same repetition the page itself is deduplicated to avoid.
+    with deduped_warnings():
+        by_project, scan_measurements, runtime_name = _run_history_core(
+            by="project", **scan)
+        by_day, _, _ = _run_history_core(by="day", **scan)
+        by_command, _, _ = _run_history_core(by="command", **scan)
+        by_model, _, _ = _run_history_core(by="model", **scan)
+        out = _dashboard_payload(
+            since, project, by_project, by_day, by_command, by_model,
+            scan_measurements, runtime_name, warnings)
+        _enrich_dashboard_partials(out, scan, warnings)
+    _dedupe_warnings_in_place(warnings)
+    return out
+
+
+def _dashboard_payload(since, project, by_project, by_day, by_command, by_model,
+                       scan_measurements, runtime_name, warnings):
     usage_total, cost_total, sessions = _sum_history_rows(by_project["rows"])
     measurement = history_scan_measurement(scan_measurements)
     out = {
@@ -1365,11 +1416,6 @@ def dashboard_data(runtime="claude", since=None, project=None, project_dir=None,
     }
     if runtime_name != "claude":
         out["runtime"] = runtime_name
-    _enrich_dashboard_partials(out, scan, warnings)
-    # One page, five scans of the same corpus over one shared list: a missing
-    # root or an unreadable session announced itself once per scan, so the
-    # footnote read as five separate problems.
-    _dedupe_warnings_in_place(warnings)
     return out
 
 

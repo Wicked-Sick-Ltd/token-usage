@@ -449,6 +449,75 @@ def test_dashboard_deduplicates_repeated_scan_warnings(tu, tmp_path, monkeypatch
     assert html_out.count("Claude Code projects directory") == 1
 
 
+def test_dashboard_names_each_scan_warning_once_on_stderr(tu, tmp_path, monkeypatch,
+                                                          capsys):
+    # The page was deduplicated but stderr was not, so the terminal still
+    # showed one problem four times while the page it produced showed it once.
+    monkeypatch.setenv("TOKEN_USAGE_PROJECTS_DIR", str(tmp_path / "missing-projects"))
+    monkeypatch.setenv("TOKEN_USAGE_LEDGER_DIR", str(tmp_path / "cache"))
+    tu.dashboard_data(runtime="claude", since="36500d", warnings=[])
+    err = capsys.readouterr().err
+    assert err.count("no readable Claude Code projects directory") == 1
+
+
+def test_cli_dashboard_names_each_scan_warning_once_on_stderr(tu, tmp_path, monkeypatch):
+    out = tmp_path / "dash.html"
+    r = subprocess.run(
+        [sys.executable, str(SCRIPT), "dashboard", "--since", "36500d",
+         "--output", str(out)],
+        capture_output=True, text=True, check=False,
+        env={**os.environ,
+             "TOKEN_USAGE_PROJECTS_DIR": str(tmp_path / "missing-projects"),
+             "TOKEN_USAGE_LEDGER_DIR": str(tmp_path / "cache")},
+    )
+    assert r.returncode == 0, r.stderr
+    assert r.stderr.count("no readable Claude Code projects directory") == 1
+
+
+def test_warning_dedup_is_scoped_not_global(tu, capsys):
+    # A once-per-process flag would fix the dashboard and quietly break every
+    # other command: a warning that recurs legitimately — a second history run
+    # in an MCP server, a live refresh after the corpus changed — must still be
+    # reported each time it happens.
+    tu.warn("a recurring problem")
+    tu.warn("a recurring problem")
+    assert capsys.readouterr().err.count("a recurring problem") == 2
+
+    with tu.deduped_warnings():
+        tu.warn("a recurring problem")
+        tu.warn("a recurring problem")
+        tu.warn("a different problem")
+    err = capsys.readouterr().err
+    assert err.count("a recurring problem") == 1
+    assert err.count("a different problem") == 1
+
+    # The scope ends with the command that opened it.
+    tu.warn("a recurring problem")
+    tu.warn("a recurring problem")
+    assert capsys.readouterr().err.count("a recurring problem") == 2
+
+
+def test_warning_dedup_scope_still_collects_every_occurrence(tu, capsys):
+    # Suppression is about the terminal, not about the caller's list: a
+    # surface that counts warnings keeps seeing them, and dedupes on purpose.
+    warnings = []
+    with tu.deduped_warnings():
+        tu.warn("same problem", warnings)
+        tu.warn("same problem", warnings)
+    assert warnings == ["same problem", "same problem"]
+    assert capsys.readouterr().err.count("same problem") == 1
+
+
+def test_warning_dedup_scope_is_released_when_the_body_raises(tu, capsys):
+    with pytest.raises(ValueError), tu.deduped_warnings():
+        tu.warn("noted once")
+        raise ValueError("boom")
+    capsys.readouterr()
+    tu.warn("noted once")
+    tu.warn("noted once")
+    assert capsys.readouterr().err.count("noted once") == 2
+
+
 def test_dashboard_renders_each_named_warning_once(tu, tmp_path, monkeypatch):
     # The rendered warnings note names its warnings, so a five-times-repeated
     # scan warning printed "5 warning(s)" for one problem.
