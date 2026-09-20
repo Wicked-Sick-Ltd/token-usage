@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 
+import pytest
 from conftest import SCRIPT, assistant, usage, user, write_jsonl
 from test_cursor_cli import zero_token_tree
 
@@ -199,11 +200,11 @@ def test_cli_export_history_stdout(tu, tmp_path, monkeypatch):
         check=False,
     )
     assert r.returncode == 0, r.stderr
-    lines = [ln for ln in r.stdout.strip().split("\n") if ln]
+    assert r.stdout.endswith("\n")
+    lines = [ln for ln in r.stdout.split("\n") if ln]
     assert len(lines) >= 3
     first = json.loads(lines[0])
     assert first["schema"] == "token-usage.aggregate.v1"
-    assert r.stdout.endswith("\n") or len(lines) == 1
 
 
 def test_cli_export_session_file(tu, tmp_path, monkeypatch):
@@ -252,7 +253,87 @@ def test_cli_export_default_scope_history(tu, tmp_path, monkeypatch):
     assert json.loads(r.stdout.strip().split("\n")[0])["scope"] == "history"
 
 
-def test_export_apis_missing_before_implementation(tu):
-    assert callable(getattr(tu, "session_export_records", None))
-    assert callable(getattr(tu, "history_export_records", None))
-    assert callable(getattr(tu, "render_jsonl", None))
+def test_export_public_helpers_exist(tu):
+    assert callable(tu.session_export_records)
+    assert callable(tu.history_export_records)
+    assert callable(tu.history_export_data)
+    assert callable(tu.render_jsonl)
+    assert callable(tu.history_scan_measurement)
+
+
+def test_history_export_worst_measurement_without_public_json_key(tu, tmp_path, monkeypatch):
+    seed_history(tmp_path, monkeypatch)
+    public = tu.run_history(by="project", since="36500d")
+    assert "measurements" not in public
+
+    real_core = tu._run_history_core
+
+    def mixed_counts(**kwargs):
+        data, _counts, runtime_name = real_core(**kwargs)
+        return data, {"exact": 2, "partial": 1}, runtime_name
+
+    monkeypatch.setattr(tu, "_run_history_core", mixed_counts)
+    export_data, counts = tu.history_export_data(by="project", since="36500d")
+    assert counts == {"exact": 2, "partial": 1}
+    assert "measurements" not in export_data
+    records = tu.history_export_records(
+        export_data, generated_at=GENERATED_AT, measurement_counts=counts)
+    assert records and all(r["measurement"] == "partial" for r in records)
+
+
+def test_cli_export_rejects_transcript_with_history_scope(tu, tmp_path, monkeypatch):
+    seed_history(tmp_path, monkeypatch)
+    proj = tmp_path / "projects"
+    transcript = next(proj.glob("*/*.jsonl"))
+    r = subprocess.run(
+        [sys.executable, str(SCRIPT), "export", str(transcript),
+         "--scope", "history", "--output", "-"],
+        capture_output=True,
+        text=True,
+        env=_env(tmp_path, TOKEN_USAGE_PROJECTS_DIR=str(proj)),
+        check=False,
+    )
+    assert r.returncode != 0
+    assert "TRANSCRIPT applies only to --scope session" in r.stderr + r.stdout
+
+
+@pytest.mark.parametrize("by,dim_key", [
+    ("project", "project"),
+    ("day", "day"),
+    ("command", "command"),
+    ("model", "model"),
+])
+def test_history_export_dimensions_by_grouping(tu, tmp_path, monkeypatch, by, dim_key):
+    seed_history(tmp_path, monkeypatch)
+    export_data, counts = tu.history_export_data(by=by, since="36500d")
+    records = tu.history_export_records(
+        export_data, generated_at=GENERATED_AT, measurement_counts=counts)
+    groups = [r for r in records if r["key"] != "total"]
+    assert groups
+    assert all(r["group_by"] == by for r in records)
+    assert all(dim_key in r["dimensions"] for r in groups)
+
+
+def test_history_export_empty_filtered_history(tu, tmp_path, monkeypatch):
+    seed_history(tmp_path, monkeypatch)
+    export_data, counts = tu.history_export_data(by="project", since="0d")
+    assert export_data["rows"] == []
+    records = tu.history_export_records(
+        export_data, generated_at=GENERATED_AT, measurement_counts=counts)
+    assert len(records) == 1
+    assert records[0]["key"] == "total"
+    assert records[0]["measurement"] == "exact"
+    assert records[0]["metrics"]["gen_ai.usage.output_tokens"] == 0
+
+
+def test_render_jsonl_strict_trailing_newline(tu):
+    assert tu.render_jsonl([]) == ""
+    one = tu.render_jsonl([{"schema": "token-usage.aggregate.v1", "metrics": {}}])
+    assert one.endswith("\n")
+    assert one.count("\n") == 1
+    many = tu.render_jsonl([
+        {"a": 1},
+        {"b": 2},
+    ])
+    assert many.endswith("\n")
+    assert many.count("\n") == 2

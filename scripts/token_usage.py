@@ -1052,6 +1052,19 @@ def iter_summaries(pricing, cutoff=None, project=None, exclude=None, progress=Fa
 
 def run_history(by="project", since=None, project=None, warnings=None, runtime="claude",
                 corpus_project_dir=None, corpus_resolution=None):
+    data, measurements, runtime_name = _run_history_core(
+        by=by, since=since, project=project, warnings=warnings, runtime=runtime,
+        corpus_project_dir=corpus_project_dir, corpus_resolution=corpus_resolution)
+    out = dict(data)
+    if runtime_name != "claude":
+        out["runtime"] = runtime_name
+        out["measurements"] = measurements
+    return out
+
+
+def _run_history_core(by="project", since=None, project=None, warnings=None, runtime="claude",
+                      corpus_project_dir=None, corpus_resolution=None):
+    """Scan indexed history; always returns per-session measurement tallies."""
     pricing = load_pricing(warnings)
     cutoff = since_cutoff(since)
     if corpus_resolution is not None:
@@ -1102,13 +1115,30 @@ def run_history(by="project", since=None, project=None, warnings=None, runtime="
                 add_row(label, agg["usage"], agg["cost_usd"], agg["invocations"])
 
     ordered = sorted(rows.values(), key=lambda r: (-(r["cost_usd"] or 0), r["key"]))
-    out = {"by": by, "since": since, "project": project, "rows": ordered,
-           "unpriced_models": sorted(unpriced), "skipped_transcripts": skipped,
-           "projects_dir_missing": missing_root}
-    if runtime_name != "claude":
-        out["runtime"] = runtime_name
-        out["measurements"] = measurements
-    return out
+    data = {"by": by, "since": since, "project": project, "rows": ordered,
+            "unpriced_models": sorted(unpriced), "skipped_transcripts": skipped,
+            "projects_dir_missing": missing_root}
+    return data, measurements, runtime_name
+
+
+def history_scan_measurement(counts, *, has_rows=True):
+    """Worst measurement level for a corpus scan tally (dashboard + export)."""
+    if counts:
+        return worst_measurement(*counts.keys())
+    return "exact"
+
+
+def history_export_data(by="project", since=None, project=None, warnings=None, runtime="claude",
+                        corpus_project_dir=None):
+    """History rows for export plus scan measurement tallies for any runtime."""
+    warnings = warnings if warnings is not None else []
+    data, measurement_counts, runtime_name = _run_history_core(
+        by=by, since=since, project=project, warnings=warnings, runtime=runtime,
+        corpus_project_dir=corpus_project_dir)
+    data = dict(data)
+    data["runtime"] = runtime_name
+    data["warnings"] = warnings
+    return data, measurement_counts
 
 
 def _count_measurement(counts, summary):
@@ -1264,18 +1294,13 @@ def dashboard_data(runtime="claude", since=None, project=None, project_dir=None,
     """Aggregate indexed history for the static HTML dashboard."""
     warnings = warnings if warnings is not None else []
     scan = _history_scan_kwargs(since, project, warnings, runtime, project_dir)
-    by_project = run_history(by="project", **scan)
-    by_day = run_history(by="day", **scan)
-    by_command = run_history(by="command", **scan)
-    by_model = run_history(by="model", **scan)
+    by_project, scan_measurements, runtime_name = _run_history_core(by="project", **scan)
+    by_day, _, _ = _run_history_core(by="day", **scan)
+    by_command, _, _ = _run_history_core(by="command", **scan)
+    by_model, _, _ = _run_history_core(by="model", **scan)
     usage_total, cost_total, sessions = _sum_history_rows(by_project["rows"])
-    counts = by_project.get("measurements") or {}
-    if counts:
-        measurement = worst_measurement(*counts.keys())
-    elif by_project["rows"]:
-        measurement = "exact"
-    else:
-        measurement = "exact"
+    measurement = history_scan_measurement(
+        scan_measurements, has_rows=bool(by_project["rows"]))
     out = {
         "since": since,
         "project": project,
@@ -1292,11 +1317,11 @@ def dashboard_data(runtime="claude", since=None, project=None, project_dir=None,
         "unpriced_models": by_project.get("unpriced_models"),
         "skipped_transcripts": by_project.get("skipped_transcripts"),
         "projects_dir_missing": by_project.get("projects_dir_missing"),
-        "measurements": counts,
+        "measurements": scan_measurements,
         "warnings": warnings,
     }
-    if by_project.get("runtime"):
-        out["runtime"] = by_project["runtime"]
+    if runtime_name != "claude":
+        out["runtime"] = runtime_name
     _enrich_dashboard_partials(out, scan, warnings)
     return out
 
@@ -1600,13 +1625,11 @@ def _export_metrics(usage, cost_usd):
     }
 
 
-def _export_history_measurement(data):
-    counts = data.get("measurements") or {}
-    if counts:
-        return worst_measurement(*counts.keys())
-    if data.get("rows"):
-        return "exact"
-    return "exact"
+def _export_history_measurement(data, measurement_counts=None):
+    counts = measurement_counts
+    if counts is None:
+        counts = data.get("measurements") or {}
+    return history_scan_measurement(counts, has_rows=bool(data.get("rows")))
 
 
 def _export_record(*, runtime, scope, key, dimensions, usage, cost_usd, measurement,
@@ -1663,12 +1686,12 @@ def session_export_records(data, generated_at=None):
     return records
 
 
-def history_export_records(data, generated_at=None):
+def history_export_records(data, generated_at=None, *, measurement_counts=None):
     """One row per history grouping key plus a final total row."""
     ts = _export_timestamp(generated_at)
     runtime = data.get("runtime") or "claude"
     group_by = data["by"]
-    measurement = _export_history_measurement(data)
+    measurement = _export_history_measurement(data, measurement_counts)
     warnings = data.get("warnings") or []
     records = []
     for row in data["rows"]:
@@ -4122,10 +4145,11 @@ def main():
         else:
             if args.transcript:
                 sys.exit("token-usage: TRANSCRIPT applies only to --scope session")
-            data = run_history(by=args.by, since=args.since, project=args.project,
-                               runtime=args.runtime, warnings=warnings)
-            data["warnings"] = warnings
-            records = history_export_records(data)
+            export_data, measurement_counts = history_export_data(
+                by=args.by, since=args.since, project=args.project,
+                runtime=args.runtime, warnings=warnings)
+            records = history_export_records(
+                export_data, measurement_counts=measurement_counts)
         write_text_output(render_jsonl(records), args.output)
         return
     if getattr(args, "diff", None):
