@@ -104,6 +104,19 @@ def test_project_aware_session_discovery(tu, tmp_path, monkeypatch):
     assert len(sessions) == 1
     assert sessions[0].composer_id == "comp-usage-001"
     assert sessions[0].source == "sqlite"
+    assert sessions[0].project_path == project.resolve()
+
+
+def test_adapter_project_is_workspace_slug_not_composer_id(tu, tmp_path, monkeypatch):
+    project = tmp_path / "repo"
+    project.mkdir()
+    cursor_root = tmp_path / "cursor-user"
+    build_cursor_tree(cursor_root, project_folder=str(project.resolve()))
+    monkeypatch.setenv("TOKEN_USAGE_CURSOR_DIR", str(cursor_root))
+    adapter = tu.get_runtime_adapter("cursor")
+    session = next(adapter.iter_sessions())
+    assert adapter.project(session) == tu.project_slug(str(project.resolve()))
+    assert adapter.session_id(session) == "comp-usage-001"
 
 
 def test_global_recent_sessions_without_project(tu, tmp_path, monkeypatch):

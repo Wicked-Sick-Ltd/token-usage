@@ -65,6 +65,75 @@ def test_invalid_runtime_rejected(tmp_path):
     assert "runtime" in r.stderr.lower() or "gemini" in r.stderr
 
 
+def test_auto_session_ambiguous_when_both_corpora_match(tmp_path):
+    from conftest import assistant, usage, user, write_jsonl
+
+    proj = tmp_path / "projects"
+    t = write_jsonl(proj / "p" / "s.jsonl", [
+        user("2026-06-10T10:00:00Z", command="/go"),
+        assistant("2026-06-10T10:00:01Z", usage(out=10), request_id="r1"),
+    ])
+    cursor_root = tmp_path / "cursor-user"
+    build_cursor_tree(cursor_root)
+    env = _env(
+        tmp_path,
+        cursor_root,
+        TOKEN_USAGE_PROJECTS_DIR=str(proj),
+        TOKEN_USAGE_TRANSCRIPT=str(t),
+    )
+    r = subprocess.run(
+        [sys.executable, str(SCRIPT), "json", "--runtime", "auto"],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+    assert r.returncode != 0
+    assert "ambiguous" in r.stderr.lower()
+
+
+def test_auto_corpus_ambiguous_subprocess(tmp_path):
+    from conftest import assistant, usage, user, write_jsonl
+
+    proj = tmp_path / "projects"
+    write_jsonl(proj / "p" / "s.jsonl", [
+        user("2026-06-10T10:00:00Z", command="/go"),
+        assistant("2026-06-10T10:00:01Z", usage(out=10), request_id="r1"),
+    ])
+    cursor_root = tmp_path / "cursor-user"
+    build_cursor_tree(cursor_root)
+    env = _env(tmp_path, cursor_root, TOKEN_USAGE_PROJECTS_DIR=str(proj))
+    r = subprocess.run(
+        [sys.executable, str(SCRIPT), "history", "--runtime", "auto", "--json"],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+    assert r.returncode != 0
+    assert "ambiguous" in r.stderr.lower()
+
+
+def test_auto_resolves_cursor_only_history(tmp_path):
+    cursor_root = tmp_path / "cursor-user"
+    build_cursor_tree(cursor_root)
+    env = _env(
+        tmp_path,
+        cursor_root,
+        TOKEN_USAGE_PROJECTS_DIR=str(tmp_path / "no-claude"),
+    )
+    r = subprocess.run(
+        [sys.executable, str(SCRIPT), "history", "--runtime", "auto", "--json"],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+    assert r.returncode == 0, r.stderr
+    data = json.loads(r.stdout)
+    assert data.get("runtime") == "cursor"
+
+
 def test_default_runtime_is_claude(tu, tmp_path, monkeypatch):
     from conftest import assistant, usage, user, write_jsonl
 

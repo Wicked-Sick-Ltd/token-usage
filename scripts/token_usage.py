@@ -1137,8 +1137,7 @@ def run_top_consumers(by="session", since="30d", project=None, limit=10, warning
             # "partial": some of this session's usage ran on an unpriced
             # model, so cost_usd is a priced subtotal — the session ranks on
             # it, and a bare number would hide that.
-            sid = (s["project"] if adapter.name == "cursor"
-                   else Path(s["path"]).stem)
+            sid = s.get("session_id") or Path(s["path"]).stem
             sessions.append({"session_id": sid, "path": s["path"],
                              "project": s["project"], "first_ts": s["first_ts"],
                              "usage": s["total"]["usage"],
@@ -1495,10 +1494,10 @@ def run_insights(transcript=None, since=None, project=None, budget=None, warning
         return out
     if isinstance(transcript, CursorSession):
         _validate_runtime_name(runtime)
-        if runtime == "auto":
-            runtime_name = "cursor"
-        else:
-            runtime_name = runtime
+        if runtime not in ("cursor", "auto"):
+            sys.exit("token-usage: CursorSession requires --runtime cursor "
+                     "(got claude)")
+        runtime_name = "cursor" if runtime == "auto" else runtime
         adapter = get_runtime_adapter(runtime_name)
     else:
         adapter, runtime_name = resolve_runtime(runtime, transcript_arg=transcript,
@@ -1527,7 +1526,7 @@ def run_insights(transcript=None, since=None, project=None, budget=None, warning
     for w in parsed.get("warnings") or []:
         if w not in warnings:
             warnings.append(w)
-    measurement = parsed.get("measurement") or "activity_only"
+    measurement = measurement_for_adapter(adapter, parsed)
     data = aggregate(parsed["segments"], pricing)
     data = apply_measurement_costs(data, measurement)
     baseline = compute_baseline(pricing, project=project_name, exclude=exclude,
@@ -1778,6 +1777,9 @@ class ClaudeAdapter(RuntimeAdapter):
     def project(self, source):
         return Path(source).parent.name
 
+    def session_id(self, source):
+        return Path(source).stem
+
     def describe(self, source):
         path = Path(source)
         return f"{path.parent.name}/{path.name}"
@@ -1832,15 +1834,24 @@ def _cursor_kv_json(conn, key):
 class CursorSession:
     """One Cursor conversation source (SQLite composer, export, or hook ledger)."""
 
-    __slots__ = ("composer_id", "db_path", "export_path", "ledger_path", "source")
+    __slots__ = (
+        "composer_id",
+        "db_path",
+        "export_path",
+        "ledger_path",
+        "project_path",
+        "source",
+    )
 
     def __init__(self, composer_id, source, db_path=None, export_path=None,
-                 ledger_path=None):
+                 ledger_path=None, project_path=None):
         self.composer_id = composer_id
         self.source = source
         self.db_path = Path(db_path).resolve() if db_path else None
         self.export_path = Path(export_path).resolve() if export_path else None
         self.ledger_path = Path(ledger_path).resolve() if ledger_path else None
+        self.project_path = (Path(project_path).expanduser().resolve()
+                             if project_path else None)
 
 
 def _cursor_folder_uri_to_path(folder_uri):
@@ -1856,6 +1867,39 @@ def _cursor_folder_uri_to_path(folder_uri):
         return Path(path).expanduser().resolve()
     except OSError:
         return None
+
+
+def _cursor_folder_for_workspace(cursor_root, workspace_id):
+    """Resolved workspace folder path for a workspaceStorage id, or None."""
+    if not workspace_id:
+        return None
+    ws_json = cursor_root / "workspaceStorage" / workspace_id / "workspace.json"
+    if not ws_json.is_file():
+        return None
+    try:
+        data = json.loads(ws_json.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, ValueError):
+        return None
+    folder = data.get("folder") or data.get("configuration", {}).get("folder")
+    return _cursor_folder_uri_to_path(folder)
+
+
+def _cursor_project_path_for_composer(cursor_root, db_path, composer_id):
+    """Workspace folder for a composer row in the global database."""
+    if not db_path or not db_path.is_file():
+        return None
+    try:
+        conn = open_cursor_db(db_path)
+    except sqlite3.Error:
+        return None
+    try:
+        data = _cursor_kv_json(conn, f"composerData:{composer_id}")
+        if not isinstance(data, dict):
+            return None
+        ws_id = data.get("workspaceStorageId") or data.get("workspaceId")
+        return _cursor_folder_for_workspace(cursor_root, ws_id)
+    finally:
+        conn.close()
 
 
 def _cursor_workspace_ids_for_project(cursor_root, project_dir):
@@ -2377,9 +2421,12 @@ class CursorAdapter(RuntimeAdapter):
                                          export_path=path)
                 return None
         if session_id:
-            db = _cursor_global_db_path(cursor_user_dir())
+            root = cursor_user_dir()
+            db = _cursor_global_db_path(root)
             if db.is_file():
-                return CursorSession(str(session_id), "sqlite", db_path=db)
+                folder = _cursor_project_path_for_composer(root, db, str(session_id))
+                return CursorSession(str(session_id), "sqlite", db_path=db,
+                                     project_path=folder)
         for session in self.iter_sessions(project_dir=project_dir):
             return session
         return None
@@ -2401,8 +2448,11 @@ class CursorAdapter(RuntimeAdapter):
         try:
             composers = _cursor_list_composers(
                 conn, workspace_ids if project_dir is not None else None)
-            for _updated, composer_id, _data in composers:
-                yield CursorSession(composer_id, "sqlite", db_path=db_path)
+            for _updated, composer_id, data in composers:
+                ws_id = data.get("workspaceStorageId") or data.get("workspaceId")
+                folder = _cursor_folder_for_workspace(cursor_root, ws_id)
+                yield CursorSession(composer_id, "sqlite", db_path=db_path,
+                                    project_path=folder)
         finally:
             conn.close()
 
@@ -2426,11 +2476,20 @@ class CursorAdapter(RuntimeAdapter):
         return {"segments": segments, "measurement": measurement,
                 "warnings": warnings}
 
+    def session_id(self, source):
+        if isinstance(source, CursorSession):
+            return source.composer_id
+        return str(source)
+
     def project(self, source):
         if isinstance(source, CursorSession):
+            if source.project_path is not None:
+                return project_slug(str(source.project_path))
             if source.source == "cloud_export" and source.export_path:
-                return source.export_path.stem
-            return source.composer_id
+                return project_slug(source.export_path.stem)
+            if source.source == "hook_ledger":
+                return "cursor-hooks"
+            return project_slug(f"cursor:{source.composer_id}")
         return str(source)
 
     def describe(self, source):
@@ -2456,6 +2515,16 @@ def get_runtime_adapter(name):
 
 
 RUNTIME_CHOICES = ("claude", "cursor", "auto")
+
+_DEFAULT_MEASUREMENT = {"claude": "exact", "cursor": "activity_only"}
+
+
+def measurement_for_adapter(adapter, parsed):
+    """Canonical measurement when the adapter parse omits or nulls the field."""
+    value = parsed.get("measurement") if isinstance(parsed, dict) else None
+    if value:
+        return value
+    return _DEFAULT_MEASUREMENT[adapter.name]
 
 
 def _validate_runtime_name(name):
@@ -2542,7 +2611,7 @@ def summarize_adapter_source(adapter, source, pricing, warnings=None):
     for w in parsed.get("warnings") or []:
         if w not in warnings:
             warnings.append(w)
-    measurement = parsed.get("measurement") or "activity_only"
+    measurement = measurement_for_adapter(adapter, parsed)
     segments = parsed.get("segments") or []
     if not segments:
         raise UnreadableTranscript("no measurable activity")
@@ -2550,9 +2619,11 @@ def summarize_adapter_source(adapter, source, pricing, warnings=None):
     data = apply_measurement_costs(data, measurement)
     st = _adapter_source_stat(adapter, source)
     path = adapter.describe(source)
+    sid = adapter.session_id(source) if hasattr(adapter, "session_id") else path
     return {
         "version": INDEX_VERSION,
         "path": path,
+        "session_id": sid,
         "mtime_ns": st.st_mtime_ns,
         "size": st.st_size,
         "pricing": pricing_fingerprint(pricing),
@@ -2641,7 +2712,13 @@ def _corpus_has_claude_sessions():
     root = projects_dir()
     if not root.is_dir() or not os.access(root, os.R_OK | os.X_OK):
         return False
-    return any(root.glob("*/*.jsonl"))
+    for path in sorted(root.glob("*/*.jsonl")):
+        try:
+            if path.stat().st_size and _has_entries(path):
+                return True
+        except OSError:
+            continue
+    return False
 
 
 def _corpus_has_cursor_sessions(project_dir=None):
@@ -2913,7 +2990,7 @@ def _session_aggregate(adapter, runtime_name, transcript_arg, pricing, warnings)
     for w in parsed.get("warnings") or []:
         if w not in warnings:
             warnings.append(w)
-    measurement = parsed.get("measurement") or "exact"
+    measurement = measurement_for_adapter(adapter, parsed)
     data = aggregate(parsed["segments"], pricing)
     data = apply_measurement_costs(data, measurement)
     data["transcript_path"] = path_label

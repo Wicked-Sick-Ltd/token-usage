@@ -326,6 +326,19 @@ def test_insights_cli_rejects_transcript_plus_since(tu, tmp_path):
     assert out.returncode != 0 and "--since" in out.stderr
 
 
+def test_cursor_session_rejects_mismatched_runtime(tu, tmp_path, monkeypatch):
+    from test_cursor_adapter import build_cursor_tree
+
+    cursor_root = tmp_path / "cursor-user"
+    build_cursor_tree(cursor_root, composer_id="comp-zero")
+    monkeypatch.setenv("TOKEN_USAGE_CURSOR_DIR", str(cursor_root))
+    monkeypatch.setenv("TOKEN_USAGE_LEDGER_DIR", str(tmp_path / "cache"))
+    session = next(tu.get_runtime_adapter("cursor").iter_sessions())
+    import pytest
+    with pytest.raises(SystemExit, match="CursorSession.*cursor"):
+        tu.run_insights(transcript=session, runtime="claude")
+
+
 def test_cursor_insights_activity_only_no_cost_findings(tu, tmp_path, monkeypatch):
     from test_cursor_adapter import build_cursor_tree
 

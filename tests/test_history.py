@@ -556,9 +556,69 @@ def test_cursor_history_two_composers(tu, tmp_path, monkeypatch):
 
     data = tu.run_history(by="project", runtime="cursor")
     assert data["runtime"] == "cursor"
+    alpha_slug = tu.project_slug(str((tmp_path / "alpha").resolve()))
+    beta_slug = tu.project_slug(str((tmp_path / "beta").resolve()))
     keys = {r["key"] for r in data["rows"]}
-    assert keys == {"comp-alpha", "comp-beta"}
+    assert keys == {alpha_slug, beta_slug}
     assert sum(r["calls"] for r in data["rows"]) == 2
+
+
+def test_cursor_history_groups_composers_in_one_workspace(tu, tmp_path, monkeypatch):
+    from test_cursor_adapter import build_cursor_tree
+
+    cursor_root = tmp_path / "cursor-user"
+    repo = (tmp_path / "mono-repo").resolve()
+    repo.mkdir()
+    build_cursor_tree(
+        cursor_root,
+        composer_id="comp-a",
+        workspace_id="ws-mono",
+        project_folder=str(repo),
+    )
+    build_cursor_tree(
+        cursor_root,
+        composer_id="comp-b",
+        workspace_id="ws-mono",
+        project_folder=str(repo),
+    )
+    monkeypatch.setenv("TOKEN_USAGE_CURSOR_DIR", str(cursor_root))
+    monkeypatch.setenv("TOKEN_USAGE_LEDGER_DIR", str(tmp_path / "cache"))
+
+    data = tu.run_history(by="project", runtime="cursor")
+    assert len(data["rows"]) == 1
+    assert data["rows"][0]["key"] == tu.project_slug(str(repo))
+    assert data["rows"][0]["calls"] == 2
+
+
+def test_auto_corpus_resolves_cursor_when_only_cursor_has_sessions(tu, tmp_path, monkeypatch):
+    from test_cursor_adapter import build_cursor_tree
+
+    cursor_root = tmp_path / "cursor-user"
+    build_cursor_tree(cursor_root)
+    monkeypatch.setenv("TOKEN_USAGE_CURSOR_DIR", str(cursor_root))
+    monkeypatch.setenv("TOKEN_USAGE_LEDGER_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("TOKEN_USAGE_PROJECTS_DIR", str(tmp_path / "empty-projects"))
+
+    _adapter, name = tu.resolve_runtime_corpus("auto")
+    assert name == "cursor"
+    assert _adapter.name == "cursor"
+
+
+def test_auto_corpus_not_ambiguous_when_claude_dir_has_only_unreadable_jsonl(
+        tu, tmp_path, monkeypatch):
+    from test_cursor_adapter import build_cursor_tree
+
+    proj = tmp_path / "projects"
+    (proj / "slug").mkdir(parents=True)
+    (proj / "slug" / "junk.jsonl").write_bytes(b"\xff\xfe\n")
+    cursor_root = tmp_path / "cursor-user"
+    build_cursor_tree(cursor_root)
+    monkeypatch.setenv("TOKEN_USAGE_PROJECTS_DIR", str(proj))
+    monkeypatch.setenv("TOKEN_USAGE_CURSOR_DIR", str(cursor_root))
+    monkeypatch.setenv("TOKEN_USAGE_LEDGER_DIR", str(tmp_path / "cache"))
+
+    _adapter, name = tu.resolve_runtime_corpus("auto")
+    assert name == "cursor"
 
 
 def test_cursor_top_consumers_sessions(tu, tmp_path, monkeypatch):
