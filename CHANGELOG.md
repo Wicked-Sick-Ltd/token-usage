@@ -29,6 +29,24 @@ adheres to [Semantic Versioning](https://semver.org/).
   prompt previews and the hook's raw token fields. It is the highest-confidence
   Cursor read path, ahead of read-only Desktop SQLite and explicit Cloud Agent
   export JSON.
+- **Cursor Plugin manifest** — `.cursor-plugin/plugin.json` bundles the stdio MCP
+  server (`scripts/mcp_server.py`), Cursor hooks (`hooks/hooks-cursor.json`), and
+  the `skills/report/` skill. Paths are relative to the plugin root;
+  `${CURSOR_PLUGIN_ROOT}` is used in hook and MCP `args`. Manual `~/.cursor/mcp.json`
+  registration remains documented in the README. There is still no repository-root
+  `mcp.json` (Claude Code would treat it as project-scope config in a checkout).
+- **`docs/cursor-adapter.md`** — evidence note distinguishing official hooks/plugin
+  docs, reverse-engineered SQLite, observed Cloud export behavior, v1 limitations,
+  privacy, and a future Gemini/Codex adapter contract.
+- **README** — Cursor Plugin and manual MCP install, `--runtime cursor` CLI examples,
+  and a concise v1 can/cannot measure section for Cursor.
+
+### Changed
+
+- **`skills/report/SKILL.md`** — Cursor runtime and MCP guidance without a single
+  hardcoded tool prefix.
+- **SECURITY.md** — scope now includes Cursor hook commands, read-only Cursor Desktop
+  SQLite, and Cursor hook ledgers under `~/.cache/token-usage/cursor/`.
 
 ### Fixed
 
@@ -61,18 +79,27 @@ adheres to [Semantic Versioning](https://semver.org/).
   insights and their MCP markdown name a `partial` or activity-only measurement
   and the warnings behind it, so zero buckets cannot read as free usage; corpus
   JSON carries per-level `measurements` counts.
+- **Cursor diff measurement missing entirely** — an MCP Cursor `diff` now carries
+  the worst-side `measurement` (a Δ against an unmeasured session is not a Δ of
+  `$0.00`), and `render_diff` names it and the warnings behind it. A default
+  Claude diff is unchanged in both JSON and markdown.
 - **Cursor session identity** — hook sessions take their project from the
   recorded workspace roots instead of all becoming `cursor-hooks`, ledgers are
   ordered by recency rather than filename, an MCP `session_id` that exists in no
-  ledger and no composer row fails closed, and an adapter session name renders
-  as `composer:<id>` rather than `/composer:<id>`.
+  ledger and no composer row fails closed, and report *and* insights name an
+  adapter session as `composer:<id>` rather than `/composer:<id>`.
+- **Default Claude session JSON grew runtime keys** — routing Claude through the
+  adapter seam added `runtime`, `measurement` and `warnings` to `token-usage
+  json`. A default Claude run is byte-for-byte its pre-runtime payload again
+  (warnings still go to stderr, as they always did), matching both the MCP
+  session payload and the README's "the CLI's JSON shapes plus `transcript`,
+  `resolved_via` and `warnings`". Cursor keeps all three.
 - **Cursor discovery cost and privacy** — discovery selects only
   `composerData:%` rows (it used to read every bubble blob and then re-query
   each key), the ledger root is read lazily so a changed
   `TOKEN_USAGE_LEDGER_DIR` takes effect, the ledger directory is created
   owner-only where supported, and `sqlite3` is imported where it is used so the
   hook path never loads it.
-
 - **Cursor hooks schema** — `hooks/hooks-cursor.json` now uses Cursor's documented
   `version: 1` flat entries (`command`/`timeout` per event, no nested `hooks` wrapper).
 - **README Cursor examples** — removed nonexistent `--composer` CLI flag; document
@@ -85,27 +112,6 @@ adheres to [Semantic Versioning](https://semver.org/).
 - **Cursor explicit selector fallthrough** — a non-empty CLI/MCP `transcript` path
   must resolve to an existing Cloud export `.json`; bogus paths no longer silently
   analyze the latest local session. `session_id` composer lookup unchanged.
-
-### Changed
-
-- **`skills/report/SKILL.md`** — Cursor runtime and MCP guidance without a single
-  hardcoded tool prefix.
-- **SECURITY.md** — scope now includes Cursor hook commands, read-only Cursor Desktop
-  SQLite, and Cursor hook ledgers under `~/.cache/token-usage/cursor/`.
-
-### Added
-
-- **Cursor Plugin manifest** — `.cursor-plugin/plugin.json` bundles the stdio MCP
-  server (`scripts/mcp_server.py`), Cursor hooks (`hooks/hooks-cursor.json`), and
-  the `skills/report/` skill. Paths are relative to the plugin root;
-  `${CURSOR_PLUGIN_ROOT}` is used in hook and MCP `args`. Manual `~/.cursor/mcp.json`
-  registration remains documented in the README. There is still no repository-root
-  `mcp.json` (Claude Code would treat it as project-scope config in a checkout).
-- **`docs/cursor-adapter.md`** — evidence note distinguishing official hooks/plugin
-  docs, reverse-engineered SQLite, observed Cloud export behavior, v1 limitations,
-  privacy, and a future Gemini/Codex adapter contract.
-- **README** — Cursor Plugin and manual MCP install, `--runtime cursor` CLI examples,
-  and a concise v1 can/cannot measure section for Cursor.
 
 ## [0.6.1] — 2026-09-07
 
