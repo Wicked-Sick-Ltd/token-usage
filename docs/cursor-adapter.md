@@ -161,7 +161,7 @@ telemetry — and are intentionally **not** exposed through the stdio MCP server
 | Command | Role | Cursor notes |
 | --- | --- | --- |
 | `dashboard` | Static HTML archive of indexed history | Activity-only or `partial` corpora disclose unmeasured cost/token cards |
-| `live` | Polling refresh of one session report | Same session discovery and measurement warnings as `report` |
+| `live` | Polling refresh of one session report | Same session discovery and measurement warnings as `report`; preferred terminal refresh for Cursor (no `latest.json` statusline) |
 | `export` | JSONL aggregates (`token-usage.aggregate.v1`) | `measurement` and `warnings` preserved; redact labels before sharing |
 
 Export uses OTel-style **metric names**, not OTLP protobuf/HTTP. A future OTLP
@@ -178,5 +178,15 @@ exporter can map this stable schema without breaking JSONL consumers.
 | LLM-generated insights | **Out of scope** — `insights` stays rule-based arithmetic |
 | Gemini, Codex, other runtimes | **Future adapters** — implement `RuntimeAdapter` per the contract above; dashboard/export need no runtime-specific code once summaries are canonical |
 
-Windows statusline parity lives in `examples/statusline.ps1` (reads
-`latest.json` under `TOKEN_USAGE_LEDGER_DIR` or `~/.cache/token-usage/`).
+### Statusline vs live (Cursor)
+
+Claude Code Stop hooks write per-session JSON ledgers plus an aggregate
+`latest.json` symlink under `TOKEN_USAGE_LEDGER_DIR` or `~/.cache/token-usage/`.
+`examples/statusline.ps1` is **Windows parity for that Claude layout** (reads
+`latest.json`; dependency-free PowerShell).
+
+Cursor hooks append JSONL under `~/.cache/token-usage/cursor/` (override directory
+with `TOKEN_USAGE_LEDGER_DIR`). They do **not** maintain `latest.json`, so the
+PowerShell statusline example does not apply. Use
+`python3 scripts/token_usage.py live --runtime cursor` when you want a refreshing
+terminal view of the current Cursor session.

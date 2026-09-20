@@ -228,13 +228,15 @@ When the session's estimated cost crosses the threshold the Stop hook emits a `s
 
 ### Statusline (optional)
 
-`examples/statusline.sh` reads the per-session live ledger (from stdin `session_id`) and renders e.g. `⏶ 214k out · $33.87 · top: /code-review`. Wire it up with `/statusline` or merge it into your existing statusline script. Requires `jq`.
+`examples/statusline.sh` reads the per-session live ledger (from stdin `session_id`) and renders e.g. `⏶ 214k out · $33.87 · top: /code-review`. Wire it up with `/statusline` in **Claude Code** or merge it into your existing statusline script. Requires `jq`.
 
-On Windows (or anywhere with PowerShell 7+), `examples/statusline.ps1` is dependency-free: it reads `$env:TOKEN_USAGE_LEDGER_DIR/latest.json`, or `~/.cache/token-usage/latest.json` when unset, formats output tokens, estimated cost, and the top `by_label` activity, and **exits silently** (code 0, no output) when the ledger is missing or malformed. Example statusline command:
+On Windows with **Claude Code**, `examples/statusline.ps1` is a dependency-free counterpart to `statusline.sh`: it reads the aggregate `latest.json` pointer that Claude Stop/SubagentStop hooks maintain (`$env:TOKEN_USAGE_LEDGER_DIR/latest.json`, or `~/.cache/token-usage/latest.json` when unset). That file points at the current session's JSON ledger; the script formats output tokens, estimated cost, and the top `by_label` activity, and **exits silently** (code 0, no stdout/stderr) when the ledger is missing or malformed.
 
 ```text
 pwsh -NoProfile -File C:/path/to/token-usage/examples/statusline.ps1
 ```
+
+**Cursor** hook ledgers live as JSONL under `~/.cache/token-usage/cursor/` and do not maintain `latest.json`, so this PowerShell example is not a Cursor statusline. For a refreshing Cursor session view in the terminal, use `python3 scripts/token_usage.py live --runtime cursor` (optional `--interval`, `--iterations`).
 
 CI on Linux validates `statusline.ps1` structurally only; it does not execute PowerShell unless `pwsh` is installed.
 

@@ -47,9 +47,10 @@ adheres to [Semantic Versioning](https://semver.org/).
 - **`export` CLI** — RFC-8259 JSONL with schema `token-usage.aggregate.v1` and
   OTel-style metric names (local interchange, not OTLP wire format); session and
   history scopes with atomic file output.
-- **`examples/statusline.ps1`** — dependency-free PowerShell statusline reading
-  `TOKEN_USAGE_LEDGER_DIR/latest.json` or `~/.cache/token-usage/latest.json`;
-  silent on missing or malformed ledgers.
+- **`examples/statusline.ps1`** — dependency-free PowerShell statusline for
+  **Claude Code on Windows**: reads aggregate `TOKEN_USAGE_LEDGER_DIR/latest.json`
+  or `~/.cache/token-usage/latest.json` (Stop-hook JSON ledger); silent on missing
+  or malformed files. Not for Cursor (JSONL hooks, no `latest.json`).
 - **README (0.7 surfaces)** — dashboard/live/export usage, privacy/redaction notes,
   Windows statusline setup, and MCP scope (dashboard/export remain CLI-only).
 - **Roadmap disclosures** — HTTP/SSE MCP transport and true OTLP mapping deferred
@@ -59,6 +60,9 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Statusline docs** — clarify `statusline.ps1` targets Claude Code's aggregate
+  `latest.json` ledger on Windows; Cursor users should use `live --runtime cursor`
+  because hook storage is JSONL without `latest.json`.
 - **`skills/report/SKILL.md`** — Cursor runtime and MCP guidance without a single
   hardcoded tool prefix.
 - **SECURITY.md** — scope now includes Cursor hook commands, read-only Cursor Desktop

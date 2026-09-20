@@ -1,13 +1,18 @@
-# token-usage statusline example (Windows / PowerShell) — session cost + top activity.
+# token-usage statusline example (Windows / PowerShell) — Claude Code session cost + top activity.
 #
-# Setup: point Cursor or Claude Code statusline at this script (dependency-free):
+# Setup (Claude Code on Windows): point /statusline at this script (dependency-free):
 #   "command": "pwsh -NoProfile -File C:/path/to/token-usage/examples/statusline.ps1"
 #
-# Reads the live ledger symlink maintained by Stop/SubagentStop hooks:
+# Reads the aggregate ledger pointer maintained by Claude Code Stop/SubagentStop hooks:
 #   $env:TOKEN_USAGE_LEDGER_DIR/latest.json  (override directory)
 #   or ~/.cache/token-usage/latest.json
 #
-# Missing or malformed ledgers exit 0 with no output (never blocks the editor).
+# That file is a symlink to the current session's JSON ledger (same shape as statusline.sh).
+# Cursor hook storage is append-only JSONL and does not write latest.json — use
+#   python3 scripts/token_usage.py live --runtime cursor
+# for a refreshing terminal view instead of wiring this script.
+#
+# Missing or malformed ledgers exit 0 with no stdout/stderr (never blocks the editor).
 
 $ErrorActionPreference = 'Stop'
 
