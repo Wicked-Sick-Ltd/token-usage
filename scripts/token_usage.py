@@ -1640,6 +1640,70 @@ def locate_transcript(arg=None, session_id=None, project_dir=None):
                                          project_dir=project_dir)[0]
 
 
+class RuntimeAdapter:
+    """Runtime-specific transcript discovery and parsing."""
+
+    name = "runtime"
+
+    def locate(self, arg=None, session_id=None, project_dir=None):
+        raise NotImplementedError
+
+    def iter_sessions(self, project_dir=None):
+        raise NotImplementedError
+
+    def parse(self, source):
+        raise NotImplementedError
+
+    def project(self, source):
+        raise NotImplementedError
+
+    def describe(self, source):
+        raise NotImplementedError
+
+
+class ClaudeAdapter(RuntimeAdapter):
+    name = "claude"
+
+    def locate(self, arg=None, session_id=None, project_dir=None):
+        return locate_transcript(arg, session_id=session_id, project_dir=project_dir)
+
+    def iter_sessions(self, project_dir=None):
+        root = projects_dir()
+        if project_dir is not None:
+            slug_dir = root / project_slug(
+                str(Path(project_dir).expanduser().resolve()))
+            if slug_dir.is_dir():
+                for path in sorted(slug_dir.glob("*.jsonl")):
+                    yield path
+            return
+        if root.is_dir():
+            for path in sorted(root.glob("*/*.jsonl")):
+                yield path
+
+    def parse(self, source):
+        return parse_session(source)
+
+    def project(self, source):
+        return Path(source).parent.name
+
+    def describe(self, source):
+        path = Path(source)
+        return f"{path.parent.name}/{path.name}"
+
+
+_RUNTIME_ADAPTERS = {
+    "claude": ClaudeAdapter(),
+}
+
+
+def get_runtime_adapter(name):
+    """Return the adapter for a runtime name (`claude`, …)."""
+    try:
+        return _RUNTIME_ADAPTERS[name]
+    except KeyError:
+        raise ValueError(f"unknown runtime {name!r}") from None
+
+
 def budget_from_env(warnings=None):
     """Session budget from TOKEN_USAGE_BUDGET_USD, or None when unset/unparseable.
     Shared by the CLI, the Stop hook and the MCP server so all three read the
