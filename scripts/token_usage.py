@@ -240,6 +240,41 @@ def unpriced_footnote(models):
             f"add rates to {user_pricing_path()}")
 
 
+MEASUREMENT_NAMES = {"partial": "partial", "activity_only": "activity-only"}
+
+
+def measurement_note(measurement):
+    """Disclosure line for one session's non-exact measurement, else None.
+
+    A runtime that reports no token counts produces zero buckets and (for
+    activity-only data) a suppressed cost column — typographically identical
+    to a session that genuinely cost nothing. Markdown has to say which."""
+    if measurement == "partial":
+        return ("Measurement: partial — this runtime reported only some token "
+                "buckets for this session, so totals and costs are lower bounds.")
+    if measurement == "activity_only":
+        return ("Measurement: activity-only — this runtime reported no token counts "
+                "for this session, so zero usage means unmeasured, not free.")
+    return None
+
+
+def measurement_scan_note(counts):
+    """The same disclosure for a corpus scan, counting the sessions behind it."""
+    parts = [f"{counts[key]} {name}" for key, name in MEASUREMENT_NAMES.items()
+             if counts.get(key)]
+    if not parts:
+        return None
+    return ("Measurement: " + " and ".join(parts) + " session(s) — zero or missing "
+            "token buckets mean unmeasured usage, not free usage.")
+
+
+def warnings_note(warnings):
+    """The warnings behind a measurement disclosure, named rather than counted."""
+    if not warnings:
+        return None
+    return f"{len(warnings)} warning(s): " + "; ".join(warnings)
+
+
 def merge_by_model(dest, src):
     for model, bucket in src.items():
         d = dest.setdefault(model, empty_usage())
@@ -622,6 +657,16 @@ def fmt_cost_delta(c):
     return f"{'-' if c < 0 else '+'}${abs(c):.2f}"
 
 
+def session_display(path_str):
+    """How a report names the session it measured.
+
+    "<project>/<file>" for a transcript path, and the label itself for an
+    adapter-supplied name — Path("composer:abc") has no parent, which used to
+    render as the nonsense "/composer:abc"."""
+    path = Path(path_str)
+    return f"{path.parent.name}/{path.name}" if path.parent.name else str(path_str)
+
+
 def sub_row(label, u, cost):
     """One ↳ breakdown row (a subset of its parent row) for the report table."""
     return (f"| ↳ {label} | | {fmt_tokens(u['output'])} | {fmt_tokens(u['input'])} "
@@ -668,8 +713,13 @@ def render_report(data, show_agents=False, show_models=False):
         # Resolution can fall back to a transcript in a project other than
         # the caller's (see find_latest_transcript) — always name which one
         # was actually measured, rather than leaving that silent.
-        tp = Path(transcript_path)
-        lines.append(f"Session: `{tp.parent.name}/{tp.name}`")
+        lines.append(f"Session: `{session_display(transcript_path)}`")
+    note = measurement_note(data.get("measurement"))
+    if note:
+        lines.append(note)
+        named = warnings_note(data.get("warnings"))
+        if named:
+            lines.append(named)
     savings = t.get("cache_savings_usd")
     if savings is not None and savings >= 0.01:
         lines.append(f"Prompt caching saved ~{fmt_cost(savings)} vs. full input rates.")
@@ -980,9 +1030,11 @@ def run_history(by="project", since=None, project=None, warnings=None, runtime="
         missing_root = check_cursor_root(warnings)
         summary_iter = iter_adapter_summaries(adapter, pricing, cutoff=cutoff,
                                               project=project, progress=True,
-                                              skipped=skipped, warnings=warnings)
+                                              skipped=skipped, warnings=warnings,
+                                              project_dir=corpus_project_dir)
     rows = {}
     unpriced = set()
+    measurements = {}
 
     def add_row(key, usage_dict, cost, calls):
         r = rows.setdefault(key, {"key": key, "usage": empty_usage(),
@@ -995,6 +1047,7 @@ def run_history(by="project", since=None, project=None, warnings=None, runtime="
 
     for s in summary_iter:
         unpriced.update(unpriced_models(s.get("by_model", {}), pricing))
+        _count_measurement(measurements, s)
         if by == "project":
             add_row(s["project"], s["total"]["usage"], s["total"]["cost_usd"], 1)
         elif by == "day":
@@ -1016,7 +1069,15 @@ def run_history(by="project", since=None, project=None, warnings=None, runtime="
            "projects_dir_missing": missing_root}
     if runtime_name != "claude":
         out["runtime"] = runtime_name
+        out["measurements"] = measurements
     return out
+
+
+def _count_measurement(counts, summary):
+    """Tally one scanned session's measurement level for the scan disclosure."""
+    level = summary.get("measurement")
+    if level:
+        counts[level] = counts.get(level, 0) + 1
 
 
 def burn_rate_line(total_cost, since):
@@ -1054,18 +1115,32 @@ def scan_footnotes(data, unpriced=True):
     check_projects_root — "nothing here to read" is not "you spent nothing").
 
     `unpriced=False` for renders with no cost figures to qualify — insights,
-    and a top-consumers table with no rows."""
+    and a top-consumers table with no rows.
+
+    The wording follows the runtime that was scanned: a Cursor root is not a
+    Claude Code projects directory, and calling it one sends the reader to
+    fix the wrong thing."""
     models = data.get("unpriced_models") or []
     skipped = data.get("skipped_transcripts") or []
     root = data.get("projects_dir_missing")
+    cursor = (data.get("runtime") or "claude") == "cursor"
     notes = []
     if unpriced and models:
         notes.append(unpriced_footnote(models))
     if skipped:
-        notes.append(f"{len(skipped)} transcript(s) skipped (unreadable): {', '.join(skipped)}")
+        kind = "Cursor session" if cursor else "transcript"
+        notes.append(f"{len(skipped)} {kind}(s) skipped (unreadable): {', '.join(skipped)}")
     if root:
-        notes.append(f"No readable Claude Code projects directory at {root} "
-                     "— nothing was scanned.")
+        where = ("readable Cursor session data (Desktop SQLite or hook ledger) at"
+                 if cursor else "readable Claude Code projects directory at")
+        notes.append(f"No {where} {root} — nothing was scanned.")
+    measured = (measurement_scan_note(data.get("measurements") or {})
+                or measurement_note(data.get("measurement")))
+    if measured:
+        notes.append(measured)
+        named = warnings_note(data.get("warnings"))
+        if named:
+            notes.append(named)
     return notes
 
 
@@ -1143,12 +1218,15 @@ def run_top_consumers(by="session", since="30d", project=None, limit=10, warning
         missing_root = check_cursor_root(warnings)
         summary_iter = iter_adapter_summaries(adapter, pricing, cutoff=cutoff,
                                               project=project, skipped=skipped,
-                                              warnings=warnings)
+                                              warnings=warnings,
+                                              project_dir=corpus_project_dir)
     unpriced = set()
+    measurements = {}
     sessions, commands = [], {}
     for s in summary_iter:
         session_unpriced = unpriced_models(s.get("by_model", {}), pricing)
         unpriced.update(session_unpriced)
+        _count_measurement(measurements, s)
         if by == "session":
             # "partial": some of this session's usage ran on an unpriced
             # model, so cost_usd is a priced subtotal — the session ranks on
@@ -1184,6 +1262,7 @@ def run_top_consumers(by="session", since="30d", project=None, limit=10, warning
             "skipped_transcripts": skipped, "projects_dir_missing": missing_root}
     if runtime_name != "claude":
         data["runtime"] = runtime_name
+        data["measurements"] = measurements
     if by == "session":
         # Counted over the whole window: unpriced sessions rank last, so the
         # limit is exactly what hides them.
@@ -1290,7 +1369,8 @@ def compute_baseline(pricing, project, days=30, exclude=None, warnings=None,
         missing_root = check_cursor_root(warnings)
         summary_iter = iter_adapter_summaries(adapter, pricing, cutoff=cutoff,
                                               exclude=exclude, skipped=skipped,
-                                              warnings=warnings)
+                                              warnings=warnings,
+                                              project_dir=corpus_project_dir)
     session_costs, commands = [], {}
     for s in summary_iter:
         if s["project"] != project:
@@ -1491,7 +1571,8 @@ def run_insights(transcript=None, since=None, project=None, budget=None, warning
             missing_root = check_cursor_root(warnings)
             summaries = list(iter_adapter_summaries(adapter, pricing, cutoff=cutoff,
                                                     project=project, skipped=skipped,
-                                                    warnings=warnings))
+                                                    warnings=warnings,
+                                                    project_dir=corpus_project_dir))
         # The trend rules compare the window's halves, so "how many sessions
         # matched" is not the whole story of what could be compared: report
         # the first half too, and let the renderer disclose a dead one.
@@ -1512,6 +1593,10 @@ def run_insights(transcript=None, since=None, project=None, budget=None, warning
                "warnings": warnings}
         if runtime_name != "claude":
             out["runtime"] = runtime_name
+            measurements = {}
+            for s in summaries:
+                _count_measurement(measurements, s)
+            out["measurements"] = measurements
         return out
     if isinstance(transcript, CursorSession):
         _validate_runtime_name(runtime)
@@ -2954,17 +3039,24 @@ def cached_adapter_summary(adapter, source, pricing, warnings=None):
 
 
 def iter_adapter_summaries(adapter, pricing, cutoff=None, project=None, exclude=None,
-                           progress=False, skipped=None, warnings=None):
-    """Yield cached_adapter_summary() for every session the adapter discovers."""
+                           progress=False, skipped=None, warnings=None,
+                           project_dir=None):
+    """Yield cached_adapter_summary() for every session the adapter discovers.
+
+    `project` is a substring filter on the project slug — the same rule
+    iter_summaries applies for Claude — and `project_dir` is the discovery
+    hint, a real filesystem path. They were one argument, so `--project
+    my-repo` was handed to the adapter as a path, matched no workspace, and
+    every Cursor corpus query with a project filter came back empty."""
     parsed = 0
     saw_any = False
-    for source in adapter.iter_sessions(project_dir=project):
+    for source in adapter.iter_sessions(project_dir=project_dir, warnings=warnings):
         saw_any = True
         try:
             s, hit = cached_adapter_summary(adapter, source, pricing, warnings)
         except (OSError, ValueError, AttributeError) as e:
             desc = adapter.describe(source)
-            warn(f"skipping unreadable Cursor session {desc}: {e}")
+            warn(f"skipping unreadable {adapter.name} session {desc}: {e}")
             if skipped is not None:
                 skipped.append(desc)
             continue

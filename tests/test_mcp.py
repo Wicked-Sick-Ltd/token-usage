@@ -984,6 +984,41 @@ def test_claude_project_dir_does_not_select_cursor_sessions(mcp, tmp_path, monke
     assert data["transcript"] != str(s1)
 
 
+def test_session_cost_markdown_cursor_discloses_measurement(mcp, tmp_path, monkeypatch):
+    seed_cursor(tmp_path, monkeypatch)
+    text, err = call(mcp, "session_cost", runtime="cursor",
+                     session_id="comp-usage-001", format="markdown")
+    assert not err, text
+    assert "Measurement: partial" in text
+    assert "/composer:" not in text
+
+
+def test_history_markdown_cursor_discloses_measurement(mcp, tmp_path, monkeypatch):
+    seed_cursor(tmp_path, monkeypatch)
+    text, err = call(mcp, "history", runtime="cursor", format="markdown")
+    assert not err, text
+    assert "partial session(s)" in text
+
+
+def test_markdown_warnings_are_named_once(mcp, tmp_path, monkeypatch):
+    # The measurement disclosure names the warnings behind it; the markdown
+    # envelope must not then repeat each of them verbatim.
+    from test_cursor_adapter import build_cursor_tree
+
+    cursor_root = tmp_path / "cursor-user"
+    build_cursor_tree(cursor_root, bubble_headers=[{"bubbleId": "user-1", "type": 1},
+                                                   {"bubbleId": "ghost-bubble", "type": 2}])
+    monkeypatch.setenv("TOKEN_USAGE_CURSOR_DIR", str(cursor_root))
+    monkeypatch.setenv("TOKEN_USAGE_LEDGER_DIR", str(tmp_path / "cache"))
+    monkeypatch.delenv("TOKEN_USAGE_PROJECT_DIR", raising=False)
+    monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+    text, err = call(mcp, "session_cost", runtime="cursor",
+                     session_id="comp-usage-001", format="markdown")
+    assert not err, text
+    assert "activity-only" in text
+    assert text.count("missing Cursor bubble 'ghost-bubble'") == 1
+
+
 def test_serve_exits_cleanly_when_stdin_is_none(mcp, monkeypatch):
     # A process started with stdin closed (`python mcp_server.py 0<&-`) gets
     # sys.stdin is None; both _resilient_stdin fallbacks handed that straight

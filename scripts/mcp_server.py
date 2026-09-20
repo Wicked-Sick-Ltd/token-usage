@@ -504,11 +504,16 @@ def guess_note_cursor(via):
 
 def finish(data, render, fmt, warnings, footnotes=()):
     """JSON payload (always carrying "warnings"), or the rendered markdown with
-    each footnote — the warnings included — as its own block."""
+    each footnote — the warnings included — as its own block.
+
+    A warning the render already names (the measurement disclosure lists the
+    ones behind it) is not repeated: saying it twice reads like two problems."""
     data["warnings"] = warnings
     if fmt != "markdown":
         return json.dumps(data)
-    return "\n\n".join([render(data), *footnotes, *(f"Warning: {w}" for w in warnings)])
+    rendered = render(data)
+    return "\n\n".join([rendered, *footnotes,
+                        *(f"Warning: {w}" for w in warnings if w not in rendered)])
 
 
 def tool_session_cost(args):
