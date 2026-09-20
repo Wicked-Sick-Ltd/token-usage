@@ -360,6 +360,81 @@ def test_dashboard_all_activity_only_stays_unmeasured(tu, tmp_path, monkeypatch)
     assert "Costs unmeasured (activity-only)" in svg
 
 
+def _measurement_card(html_out):
+    """The text of the summary section's Measurement card."""
+    cards, _ = html_out.split("</section>", 1)
+    return cards.split("Measurement", 1)[1].split("</div>", 1)[0]
+
+
+def test_dashboard_measurement_card_names_the_mixed_tally(tu, tmp_path, monkeypatch):
+    # "activity_only" alone, next to populated cost cards, reads like a
+    # contradiction: the reader cannot tell whether the totals are a lower
+    # bound from one weak session or from the whole corpus.
+    seed_mixed_cursor_corpus(tu, tmp_path, monkeypatch)
+    data = tu.dashboard_data(runtime="cursor", since="2020-01-01")
+    card = _measurement_card(tu.render_dashboard(data, generated_at=GENERATED_AT))
+    assert "activity_only (1 of 2 sessions)" in card
+
+
+def test_dashboard_measurement_card_stays_clear_when_all_activity_only(
+        tu, tmp_path, monkeypatch):
+    zero_token_tree(tmp_path, monkeypatch)
+    data = tu.dashboard_data(runtime="cursor", since="2020-01-01")
+    card = _measurement_card(tu.render_dashboard(data, generated_at=GENERATED_AT))
+    assert "activity_only" in card
+    # "1 of 1" invites the reader to look for the measured remainder; "all"
+    # says plainly that there is none.
+    assert "all 1 session)" in card
+    assert "1 of 1" not in card
+
+
+def test_dashboard_measurement_card_is_bare_without_a_tally(tu, tmp_path, monkeypatch):
+    # A Claude corpus records no per-session levels, so there is no tally to
+    # qualify "exact" with and nothing to add.
+    seed_projects(tmp_path, monkeypatch)
+    data = tu.dashboard_data(since="36500d")
+    assert data["measurements"] == {}
+    card = _measurement_card(tu.render_dashboard(data, generated_at=GENERATED_AT))
+    assert "exact" in card
+    assert "session" not in card
+
+
+@pytest.mark.parametrize("level,counts,expected", [
+    ("activity_only", {"exact": 1, "activity_only": 1}, "activity_only (1 of 2 sessions)"),
+    ("activity_only", {"activity_only": 1}, "activity_only (all 1 session)"),
+    ("activity_only", {"activity_only": 3}, "activity_only (all 3 sessions)"),
+    ("partial", {"exact": 99, "partial": 1}, "partial (1 of 100 sessions)"),
+    ("exact", {"exact": 4}, "exact (all 4 sessions)"),
+    ("exact", {}, "exact"),
+    ("exact", {"exact": 0}, "exact"),
+])
+def test_measurement_card_label(tu, level, counts, expected):
+    assert tu._dashboard_measurement_label(level, counts) == expected
+
+
+def test_dashboard_activity_only_reads_only_the_scan_tally(tu):
+    # dashboard_data always supplies "measurements", so an empty tally means
+    # nothing was scanned — not that everything scanned was unmeasured.
+    assert tu._dashboard_activity_only(
+        {"measurements": {}, "summary": {"measurement": "activity_only"}}) is False
+    assert tu._dashboard_activity_only(
+        {"measurements": {}, "summary": {}}) is False
+    assert tu._dashboard_activity_only(
+        {"measurements": {"activity_only": 2}, "summary": {}}) is True
+    assert tu._dashboard_activity_only(
+        {"measurements": {"exact": 1, "activity_only": 1}, "summary": {}}) is False
+
+
+def test_dashboard_data_always_supplies_a_measurement_tally(tu, tmp_path, monkeypatch):
+    # The predicate above drops its summary fallback, so this is the contract
+    # that keeps it correct: every dashboard_data result carries a tally.
+    seed_projects(tmp_path, monkeypatch)
+    assert "measurements" in tu.dashboard_data(since="36500d")
+    assert "measurements" in tu.dashboard_data(since="0d")
+    monkeypatch.setenv("TOKEN_USAGE_PROJECTS_DIR", str(tmp_path / "gone"))
+    assert "measurements" in tu.dashboard_data(since="36500d")
+
+
 def test_dashboard_deduplicates_repeated_scan_warnings(tu, tmp_path, monkeypatch):
     # dashboard_data runs four history scans plus the partial-enrichment scan
     # over one shared warnings list, so every corpus warning arrived five times.

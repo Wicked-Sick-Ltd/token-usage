@@ -1427,12 +1427,33 @@ def _dashboard_activity_only(data):
     throwing their totals away to protect the reader from one weak session
     tells them they spent nothing. A mixed scan keeps its numbers and
     discloses the lower bound through the scan footnote, which counts the
-    sessions behind each level."""
+    sessions behind each level.
+
+    The tally is the only input. dashboard_data always supplies it, so an
+    empty one means nothing was scanned — an empty window, or a corpus like
+    Claude's that records no per-session levels — and neither is a corpus of
+    unmeasured sessions."""
     counts = data.get("measurements") or {}
     measured = {level for level, n in counts.items() if n}
-    if measured:
-        return measured == {"activity_only"}
-    return data["summary"].get("measurement") == "activity_only"
+    return bool(measured) and measured == {"activity_only"}
+
+
+def _dashboard_measurement_label(level, counts):
+    """The Measurement card's text: the worst level, and how much of the scan
+    sits at it.
+
+    A bare "activity_only" beside populated cost cards reads as a
+    contradiction — the reader cannot tell a lower bound owed to one weak
+    session from one owed to the whole corpus. "all N sessions" says there is
+    no measured remainder to look for; "M of N sessions" says how little of
+    the scan the caveat covers."""
+    total = sum(counts.values())
+    at_level = counts.get(level, 0)
+    if not total or not at_level:
+        return level
+    unit = "session" if total == 1 else "sessions"
+    share = f"all {total} {unit}" if at_level == total else f"{at_level} of {total} {unit}"
+    return f"{level} ({share})"
 
 
 _DASHBOARD_UNMEASURED = "— (unmeasured)"
@@ -1597,6 +1618,8 @@ def render_dashboard(data, generated_at=None):
     in_card = _dashboard_metric_display(u["input"], activity_only, token=True)
     cache_card = _dashboard_metric_display(u["cache_read"], activity_only, token=True)
     svg = _dashboard_svg_chart(data.get("by_day") or [], activity_only)
+    measurement_card = _dashboard_measurement_label(
+        summary.get("measurement") or "exact", data.get("measurements") or {})
     model_rows = _dashboard_table_rows(data.get("top_models") or [], calls_col="calls")
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -1633,7 +1656,7 @@ svg .scale {{ font-size: 10px; fill: #444; }}
 <div class="card"><span>Input tokens</span><strong>{html.escape(in_card)}</strong></div>
 <div class="card"><span>Cache reads</span><strong>{html.escape(cache_card)}</strong></div>
 <div class="card"><span>Sessions</span><strong>{summary['sessions']}</strong></div>
-<div class="card"><span>Measurement</span><strong>{html.escape(summary.get('measurement') or 'exact')}</strong></div>
+<div class="card"><span>Measurement</span><strong>{html.escape(measurement_card)}</strong></div>
 </section>
 <section aria-label="Daily cost chart">
 <h2>Daily estimated cost</h2>
