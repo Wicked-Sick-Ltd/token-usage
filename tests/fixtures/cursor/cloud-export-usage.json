@@ -1,0 +1,35 @@
+{
+  "id": "cloud-run-002",
+  "title": "Cloud agent usage pass",
+  "model": "claude-sonnet-4",
+  "createdAt": "2026-06-14T12:00:00.000Z",
+  "messages": [
+    {
+      "role": "user",
+      "text": "Measure the export path with explicit usage fields.",
+      "timestamp": "2026-06-14T12:00:00.000Z"
+    },
+    {
+      "role": "assistant",
+      "text": "This turn reports usage, so cost is measurable.",
+      "timestamp": "2026-06-14T12:00:30.000Z",
+      "model": "claude-sonnet-4",
+      "usage": {
+        "input_tokens": 400,
+        "output_tokens": 120,
+        "cache_read_input_tokens": 900
+      }
+    },
+    {
+      "role": "user",
+      "text": "This turn has no usage at all.",
+      "timestamp": "2026-06-14T12:01:00.000Z"
+    },
+    {
+      "role": "assistant",
+      "text": "Unmeasured turn; counted as one request only.",
+      "timestamp": "2026-06-14T12:01:20.000Z",
+      "model": "claude-sonnet-4"
+    }
+  ]
+}

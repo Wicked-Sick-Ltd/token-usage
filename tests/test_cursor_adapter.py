@@ -276,6 +276,65 @@ def test_cloud_export_activity_only_without_guessed_tokens(tu, tmp_path):
     assert result["segments"][0]["label"] == "Cloud agent documentation pass"
 
 
+def cloud_export_source(tu, tmp_path, fixture, composer_id):
+    export_path = tmp_path / fixture
+    export_path.write_text((FIXTURES / fixture).read_text(encoding="utf-8"),
+                           encoding="utf-8")
+    return tu.CursorSession(composer_id=composer_id, source="cloud_export",
+                            export_path=export_path)
+
+
+def test_cloud_export_with_explicit_usage_is_partial_not_activity_only(tu, tmp_path):
+    # An export that states usage for some turns HAS measured tokens: labelling
+    # the whole session activity_only nulls the cost and contradicts the very
+    # token counts the report prints.
+    source = cloud_export_source(tu, tmp_path, "cloud-export-usage.json",
+                                 "cloud-run-002")
+    result = tu.get_runtime_adapter("cursor").parse(source)
+    assert result["measurement"] == "partial"
+    total = tu.empty_usage()
+    for seg in result["segments"]:
+        for k, v in tu.sum_buckets(seg["by_model"]).items():
+            total[k] += v
+    assert total["output"] == 120
+    assert total["input"] == 400
+    assert total["cache_read"] == 900
+
+
+def test_cloud_export_parser_returns_saw_tokens_signal(tu, tmp_path):
+    measured = cloud_export_source(tu, tmp_path, "cloud-export-usage.json",
+                                   "cloud-run-002")
+    unmeasured = cloud_export_source(tu, tmp_path, "cloud-export.json",
+                                     "cloud-run-001")
+    segments, saw_tokens = tu._cursor_parse_cloud_export(measured, [])
+    assert saw_tokens is True
+    assert len(segments) == 2
+    segments, saw_tokens = tu._cursor_parse_cloud_export(unmeasured, [])
+    assert saw_tokens is False
+    assert len(segments) == 2
+
+
+def test_cloud_export_partial_session_keeps_a_cost(tu, tmp_path):
+    source = cloud_export_source(tu, tmp_path, "cloud-export-usage.json",
+                                 "cloud-run-002")
+    adapter = tu.get_runtime_adapter("cursor")
+    parsed = adapter.parse(source)
+    data = tu.aggregate(parsed["segments"], tu.load_pricing())
+    data = tu.apply_measurement_costs(data, parsed["measurement"])
+    assert data["total"]["cost_usd"] is not None
+    assert data["total"]["cost_usd"] > 0
+
+
+def test_cloud_export_unreadable_still_returns_the_signal_pair(tu, tmp_path):
+    missing = tu.CursorSession(composer_id="cloud-run-404", source="cloud_export",
+                               export_path=tmp_path / "absent.json")
+    warnings = []
+    segments, saw_tokens = tu._cursor_parse_cloud_export(missing, warnings)
+    assert segments == []
+    assert saw_tokens is False
+    assert warnings
+
+
 def test_sqlite_opened_read_only(tu, tmp_path, monkeypatch):
     cursor_root = tmp_path / "cursor-user"
     db_path = build_cursor_tree(cursor_root)

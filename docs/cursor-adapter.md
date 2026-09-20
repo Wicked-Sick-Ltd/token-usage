@@ -59,9 +59,10 @@ Override the root in tests with `TOKEN_USAGE_CURSOR_DIR`.
 
 A sample Cloud Agent JSON export (see `tests/fixtures/cursor/cloud-export.json`)
 carries messages, tool calls, and child-agent references. It did **not** expose
-a stable public token-usage field. V1 accepts an explicit export path as an
-**activity-only** source and uses token fields only when they are actually
-present — no undocumented cloud API and no account credentials.
+a stable public token-usage field. V1 accepts an explicit export path and uses
+token fields only when they are actually present: an export that states usage
+for at least one turn is reported as **partial**, and one that states none is
+**activity-only** — no undocumented cloud API and no account credentials.
 
 Cloud Agents run repository hooks from `.cursor/hooks.json` on the VM; a user's
 local `~/.cursor` hooks and local MCP registrations do not automatically follow
@@ -95,7 +96,9 @@ title → bounded first-user-prompt summary → `(no activity)`.
 2. **Desktop SQLite** — historical composers/bubbles; `partial` when any
    `tokenCount` is usable and `activity_only` otherwise. It never claims
    `exact`: per-bubble counts are best-effort, not a billing source.
-3. **Explicit Cloud export JSON** — activity and any present usage fields only.
+3. **Explicit Cloud export JSON** — activity plus any explicit `usage` /
+   `tokenUsage` fields; `partial` when at least one turn states usage and
+   `activity_only` when none does. Nothing is inferred from message length.
 
 CLI and MCP accept `--runtime` / `runtime`: `claude` (default), `cursor`, or
 `auto`. One call never mixes corpora.

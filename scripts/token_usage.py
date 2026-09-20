@@ -3220,13 +3220,22 @@ def _cursor_parse_sqlite(session, warnings):
 
 
 def _cursor_parse_cloud_export(session, warnings):
+    """(segments, saw_tokens) for a Cloud Agent export JSON.
+
+    Most exports state no usage at all, which is why the measurement default
+    for this source is activity_only. But some do carry explicit `usage` /
+    `tokenUsage` objects, and those tokens are read verbatim into the buckets —
+    so the caller needs to know they are there. Calling such a session
+    activity_only nulls its cost while the report still prints the tokens
+    behind it, which reads as "these tokens were free"."""
     segments = []
+    saw_tokens = False
     try:
         data = json.loads(session.export_path.read_text(encoding="utf-8",
                                                         errors="replace"))
     except (OSError, ValueError) as exc:
         warn(f"cannot read Cursor cloud export: {exc}", warnings)
-        return segments
+        return segments, saw_tokens
     title = data.get("title") or data.get("name") or ""
     messages = data.get("messages") or []
     for msg in messages:
@@ -3261,10 +3270,11 @@ def _cursor_parse_cloud_export(session, warnings):
                 if not any(flat[k] for k in flat):
                     flat = None
             if flat:
+                saw_tokens = True
                 add_flat(bucket, flat)
             else:
                 bucket["requests"] += 1
-    return segments
+    return segments, saw_tokens
 
 
 class CursorAdapter(RuntimeAdapter):
@@ -3370,8 +3380,8 @@ class CursorAdapter(RuntimeAdapter):
             return {"segments": [], "measurement": "activity_only",
                     "warnings": warnings}
         if source.source == "cloud_export":
-            segments = _cursor_parse_cloud_export(source, warnings)
-            measurement = "activity_only"
+            segments, saw_tokens = _cursor_parse_cloud_export(source, warnings)
+            measurement = "partial" if saw_tokens else "activity_only"
         elif source.source == "hook_ledger":
             segments, measurement = _cursor_parse_hook_ledger(source, warnings)
         else:
