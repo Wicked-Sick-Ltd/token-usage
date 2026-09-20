@@ -326,3 +326,52 @@ def test_dashboard_renders_each_named_warning_once(tu, tmp_path, monkeypatch):
     html_out = tu.render_dashboard(data, generated_at=GENERATED_AT)
     assert html_out.count("ghost-bubble") == 1
     assert "1 warning(s)" in html_out
+
+
+def _axis_labels(svg):
+    return re.findall(r'class="axis">([^<]*)</text>', svg)
+
+
+def _bar_titles(svg):
+    return re.findall(r"<title>([^<]*)</title>", svg)
+
+
+def thirty_days(cost=1.0):
+    return [{"key": f"2026-06-{d:02d}", "cost_usd": cost * d,
+             "usage": {"output": d, "input": d, "cache_read": 0,
+                       "cache_5m": 0, "cache_1h": 0, "requests": d},
+             "calls": 1}
+            for d in range(1, 31)]
+
+
+def test_dashboard_chart_thins_thirty_day_axis_labels(tu):
+    svg = tu._dashboard_svg_chart(thirty_days(), False)
+    labels = [ln for ln in _axis_labels(svg) if ln]
+    assert 0 < len(labels) <= 10, labels
+    # Every bar keeps its own hover title even when its label is dropped.
+    assert len(_bar_titles(svg)) == 30
+
+
+def test_dashboard_chart_keeps_every_label_for_a_short_window(tu):
+    svg = tu._dashboard_svg_chart(thirty_days()[:7], False)
+    assert len([ln for ln in _axis_labels(svg) if ln]) == 7
+
+
+def test_dashboard_chart_labels_the_maximum_scale(tu):
+    svg = tu._dashboard_svg_chart(thirty_days(), False)
+    assert tu.fmt_cost(30.0) in svg
+    assert 'class="scale"' in svg
+
+
+def test_dashboard_chart_scale_label_absent_without_measured_cost(tu):
+    svg = tu._dashboard_svg_chart(thirty_days(), True)
+    assert 'class="scale"' not in svg
+
+
+def test_dashboard_model_rows_have_no_unreachable_partial_footnote(tu):
+    # A by-model row IS one model: its cost is fully priced or None, never a
+    # priced subtotal, so no model row can ever be marked partial.
+    rows = [{"key": "claude-mystery-9", "partial": True, "cost_usd": 1.0,
+             "usage": tu.empty_usage(), "calls": 1}]
+    notes = tu._dashboard_partial_footnotes({"top_models": rows})
+    assert notes == []

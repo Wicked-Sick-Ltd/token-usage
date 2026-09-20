@@ -1424,6 +1424,20 @@ def _dashboard_metric_display(value, activity_only, token=False):
     return fmt_tokens(value) if token else fmt_cost(value)
 
 
+_DASHBOARD_AXIS_LABEL_PX = 62
+
+
+def _dashboard_axis_stride(bar_w):
+    """How many bars each printed x-axis label has to cover to stay legible.
+
+    A 30-day window packs bars about 19px apart, and an ISO date needs ~62px,
+    so labelling every bar overprinted them into a grey smear. Every bar keeps
+    its own <title>, which is where the exact day and cost still live."""
+    if bar_w <= 0:
+        return 1
+    return max(1, math.ceil(_DASHBOARD_AXIS_LABEL_PX / bar_w))
+
+
 def _dashboard_svg_chart(by_day, activity_only):
     """Inline SVG daily cost bars; deterministic geometry for a given dataset."""
     width, height, pad = 640, 220, 36
@@ -1434,13 +1448,13 @@ def _dashboard_svg_chart(by_day, activity_only):
         )
         return f'<svg viewBox="0 0 {width} {height}" role="img" aria-label="Daily cost">{inner}</svg>'
     costs = [r["cost_usd"] if r["cost_usd"] is not None else 0.0 for r in by_day]
-    max_cost = max(costs) if costs else 0.0
-    if max_cost <= 0:
-        max_cost = 1.0
+    peak = max(costs) if costs else 0.0
+    max_cost = peak if peak > 0 else 1.0
     plot_w = width - pad * 2
     plot_h = height - pad * 2
     n = len(by_day)
     bar_w = plot_w / max(n, 1)
+    stride = _dashboard_axis_stride(bar_w)
     parts = [
         f'<rect x="0" y="0" width="{width}" height="{height}" fill="none"/>',
     ]
@@ -1455,10 +1469,18 @@ def _dashboard_svg_chart(by_day, activity_only):
             f'<rect x="{x:.1f}" y="{y:.1f}" width="{w:.1f}" height="{bar_h:.1f}" '
             f'class="bar"><title>{title}</title></rect>'
         )
-        label = html.escape(str(row["key"]))
+        if i % stride == 0:
+            label = html.escape(str(row["key"]))
+            parts.append(
+                f'<text x="{x + w / 2:.1f}" y="{height - 8}" text-anchor="middle" '
+                f'class="axis">{label}</text>'
+            )
+    # Bars are scaled to the window's own peak, so without this the tallest
+    # bar could be five cents or five hundred dollars and read identically.
+    if peak > 0 and not activity_only:
         parts.append(
-            f'<text x="{x + w / 2:.1f}" y="{height - 8}" text-anchor="middle" '
-            f'class="axis">{label}</text>'
+            f'<text x="{pad}" y="{pad - 8}" text-anchor="start" class="scale">'
+            f'max {html.escape(fmt_cost(peak))}/day</text>'
         )
     note = ""
     if activity_only:
@@ -1492,11 +1514,16 @@ def _dashboard_table_rows(rows, calls_col="calls"):
 
 
 def _dashboard_partial_footnotes(data):
+    """Priced-subtotal footnotes for the rows that can actually carry one.
+
+    Model rows cannot: a by-model row *is* one model, so its cost is either
+    fully priced or None — never a subtotal. Only the project and command
+    groupings mix priced and unpriced model usage into a single cell, and
+    only they are marked by _enrich_dashboard_partials."""
     notes = []
     for kind, rows in (
         ("project", data.get("top_projects") or []),
         ("command", data.get("top_commands") or []),
-        ("model", data.get("top_models") or []),
     ):
         note = partial_footnote(rows, kind)
         if note:
@@ -1564,6 +1591,7 @@ th {{ background: #f4f4f4; }}
 .note, .empty {{ background: #fff8e6; border-left: 3px solid #e6b800; padding: 0.5rem 0.75rem; }}
 svg .bar {{ fill: #3b6ea5; }}
 svg .axis {{ font-size: 10px; fill: #333; }}
+svg .scale {{ font-size: 10px; fill: #444; }}
 </style>
 </head>
 <body>
