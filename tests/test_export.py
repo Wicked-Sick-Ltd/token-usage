@@ -225,19 +225,26 @@ def test_cli_export_session_file(tu, tmp_path, monkeypatch):
 
 
 def test_cli_export_history_runtime_isolation(tu, tmp_path, monkeypatch):
+    # A Claude corpus must not leak into a --runtime cursor export. The
+    # assertion used to hide behind `if lines and lines[0]`, so an empty
+    # stdout — including one caused by reading some other corpus — passed.
     seed_history(tmp_path, monkeypatch)
     r = subprocess.run(
         [sys.executable, str(SCRIPT), "export", "--scope", "history",
          "--runtime", "cursor", "--since", "36500d", "--output", "-"],
         capture_output=True,
         text=True,
-        env=_env(tmp_path, TOKEN_USAGE_PROJECTS_DIR=str(tmp_path / "projects")),
+        env=_env(tmp_path,
+                 TOKEN_USAGE_PROJECTS_DIR=str(tmp_path / "projects"),
+                 TOKEN_USAGE_CURSOR_DIR=str(tmp_path / "cursor-empty")),
         check=False,
     )
     assert r.returncode == 0, r.stderr
-    lines = r.stdout.strip().split("\n")
-    if lines and lines[0]:
-        assert json.loads(lines[0])["runtime"] == "cursor"
+    records = [json.loads(ln) for ln in r.stdout.split("\n") if ln]
+    assert [rec["key"] for rec in records] == ["total"]
+    assert records[0]["runtime"] == "cursor"
+    assert records[0]["metrics"]["gen_ai.usage.output_tokens"] == 0
+    assert "-Users-x-repo-one" not in r.stdout
 
 
 def test_cli_export_default_scope_history(tu, tmp_path, monkeypatch):

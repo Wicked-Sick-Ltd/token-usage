@@ -99,6 +99,24 @@ def test_cursor_adapter_registered(tu):
     assert adapter.name == "cursor"
 
 
+def test_cursor_root_is_isolated_from_developer_data(tu):
+    # Cursor's User directory doubles as a session corpus, so any test that
+    # reaches discovery without pinning TOKEN_USAGE_CURSOR_DIR reads the
+    # developer's own ~/.config/Cursor/User. An autouse fixture pins it for
+    # the whole suite; a test that wants its own root sets one afterwards.
+    assert list(tu.get_runtime_adapter("cursor").iter_sessions()) == []
+    assert os.environ.get("TOKEN_USAGE_CURSOR_DIR")
+    assert Path.home() not in tu.cursor_user_dir().parents
+
+
+def test_cursor_root_isolation_reaches_subprocesses(tu):
+    # Subprocess CLI tests build their env from os.environ, so the same pin
+    # has to be an environment variable rather than a monkeypatched attribute.
+    pinned = Path(os.environ["TOKEN_USAGE_CURSOR_DIR"])
+    assert any(p.name.startswith("cursor-isolated") for p in pinned.parents)
+    assert not pinned.exists()
+
+
 def test_locate_explicit_bogus_id_does_not_fall_through_to_latest(tu, tmp_path, monkeypatch):
     cursor_root = tmp_path / "cursor-user"
     build_cursor_tree(cursor_root)
@@ -292,7 +310,7 @@ def test_cloud_export_with_explicit_usage_is_partial_not_activity_only(tu, tmp_p
                                  "cloud-run-002")
     result = tu.get_runtime_adapter("cursor").parse(source)
     assert result["measurement"] == "partial"
-    total = tu.empty_usage()
+    total = dict(tu.empty_usage())
     for seg in result["segments"]:
         for k, v in tu.sum_buckets(seg["by_model"]).items():
             total[k] += v

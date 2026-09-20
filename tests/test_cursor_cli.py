@@ -68,7 +68,10 @@ def test_json_runtime_cursor_includes_runtime_fields(tmp_path):
     assert r.returncode == 0, r.stderr
     data = json.loads(r.stdout)
     assert data["runtime"] == "cursor"
-    assert data["measurement"] in ("partial", "exact", "activity_only")
+    # build_cursor_tree's bubbles carry usable tokenCount, so this corpus is
+    # deterministically partial. Accepting any of the three levels asserted
+    # nothing at all.
+    assert data["measurement"] == "partial"
     assert isinstance(data["warnings"], list)
     assert "by_label" in data
 
@@ -132,7 +135,8 @@ def test_invalid_runtime_rejected(tmp_path):
         check=False,
     )
     assert r.returncode != 0
-    assert "runtime" in r.stderr.lower() or "gemini" in r.stderr
+    assert "--runtime" in r.stderr
+    assert "gemini" in r.stderr
 
 
 def test_auto_session_ambiguous_when_both_corpora_match(tmp_path):

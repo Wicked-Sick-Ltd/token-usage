@@ -931,7 +931,7 @@ def test_insights_runtime_cursor_session_mode(mcp, tmp_path, monkeypatch):
                            session_id="comp-usage-001")[0])
     assert data["mode"] == "session"
     assert data["runtime"] == "cursor"
-    assert data["measurement"] in ("partial", "exact", "activity_only")
+    assert data["measurement"] == "partial"
     assert data["resolved_via"] == "session_id"
     assert "composer:comp-usage-001" in data["transcript"]
     assert isinstance(data["warnings"], list)

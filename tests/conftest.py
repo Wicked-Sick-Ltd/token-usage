@@ -40,6 +40,19 @@ def _isolated_ledger_dir(monkeypatch, tmp_path_factory):
 
 
 @pytest.fixture(autouse=True)
+def _isolated_cursor_dir(monkeypatch, tmp_path_factory):
+    # Cursor's User directory is a session corpus too, so a developer running
+    # the suite with Cursor installed would otherwise have their own
+    # composers joined to every fixture-scoped scan — and subprocess CLI tests
+    # build their env from os.environ, so this has to be an env var. Pinned
+    # for the whole suite at a path that does not exist; a test that wants its
+    # own root sets TOKEN_USAGE_CURSOR_DIR afterwards (monkeypatch keeps the
+    # later value).
+    monkeypatch.setenv("TOKEN_USAGE_CURSOR_DIR",
+                       str(tmp_path_factory.mktemp("cursor-isolated") / "User"))
+
+
+@pytest.fixture(autouse=True)
 def _no_cowork_mounts(monkeypatch):
     # Transcript discovery falls through to the Cowork sandbox mounts, which on
     # a real Cowork host hold a live transcript this suite must never see.

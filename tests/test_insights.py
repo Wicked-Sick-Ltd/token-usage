@@ -662,7 +662,7 @@ def test_cursor_session_insights_still_disclose_runtime_and_measurement(
     session = next(tu.get_runtime_adapter("cursor").iter_sessions())
     r = tu.run_insights(transcript=session, runtime="cursor")
     assert r["runtime"] == "cursor"
-    assert r["measurement"] in ("exact", "partial", "activity_only")
+    assert r["measurement"] == "partial"
     assert isinstance(r["warnings"], list)
 
 
