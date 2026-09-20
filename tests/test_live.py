@@ -1,13 +1,16 @@
 """Portable live terminal polling: run_live loop and CLI wiring."""
 import os
+import signal
 import subprocess
 import sys
+import threading
 from datetime import datetime, timezone
 
 import pytest
 from conftest import SCRIPT, assistant, usage, user, write_jsonl
+from test_cursor_adapter import build_cursor_tree
+from test_cursor_cli import _env
 
-LIVE_CLEAR = "\x1b[2J\x1b[H"
 FIXED_NOW = datetime(2026, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
 
 
@@ -67,8 +70,8 @@ def test_run_live_tty_clear_between_refreshes(tu, tmp_path, monkeypatch):
     )
 
     joined = "".join(chunks)
-    assert joined.count(LIVE_CLEAR) == 1
-    assert joined.index(LIVE_CLEAR) < joined.rindex("**Total**")
+    assert joined.count(tu.LIVE_CLEAR) == 1
+    assert joined.index(tu.LIVE_CLEAR) < joined.rindex("**Total**")
 
 
 def test_run_live_redirected_uses_timestamp_separator(tu, tmp_path, monkeypatch):
@@ -88,7 +91,7 @@ def test_run_live_redirected_uses_timestamp_separator(tu, tmp_path, monkeypatch)
     )
 
     joined = "".join(chunks)
-    assert LIVE_CLEAR not in joined
+    assert tu.LIVE_CLEAR not in joined
     assert f"\n--- {expected_ts} ---\n" in joined
 
 
@@ -214,3 +217,160 @@ def test_cli_live_validates_iterations(tmp_path, monkeypatch):
     )
     assert r.returncode != 0
     assert "iterations" in r.stderr.lower()
+
+
+class _FlushTrackingStream:
+    def __init__(self):
+        self.chunks = []
+        self.flush_count = 0
+
+    def write(self, text):
+        self.chunks.append(text)
+
+    def flush(self):
+        self.flush_count += 1
+
+
+def test_run_live_default_output_flushes_each_frame(tu, tmp_path, monkeypatch):
+    seed_two_sessions(tmp_path, monkeypatch)
+    stream = _FlushTrackingStream()
+
+    tu.run_live(
+        transcript=None,
+        runtime="claude",
+        interval=0.01,
+        iterations=2,
+        output_stream=stream,
+        sleep_fn=lambda _s: None,
+        isatty_fn=lambda: False,
+        clock_fn=lambda: FIXED_NOW,
+    )
+
+    assert stream.flush_count == 2
+    assert "**Total**" in "".join(stream.chunks)
+
+
+def test_run_live_dedupes_warnings_across_frames(tu, tmp_path, monkeypatch):
+    t = write_jsonl(tmp_path / "sess.jsonl", [
+        user("2026-06-12T10:00:00Z"),
+        assistant("2026-06-12T10:00:01Z", usage(out=5), request_id="r1"),
+    ])
+    warnings = []
+    real_agg = tu._session_aggregate
+
+    def agg_with_repeat(*args, **kwargs):
+        data = real_agg(*args, **kwargs)
+        wlist = kwargs.get("warnings") if "warnings" in kwargs else args[4]
+        wlist.append("repeated live warning")
+        return data
+
+    monkeypatch.setattr(tu, "_session_aggregate", agg_with_repeat)
+    tu.run_live(
+        transcript=str(t),
+        runtime="claude",
+        interval=0.01,
+        iterations=2,
+        warnings=warnings,
+        output=lambda _s: None,
+        sleep_fn=lambda _s: None,
+        isatty_fn=lambda: False,
+        clock_fn=lambda: FIXED_NOW,
+    )
+    assert warnings.count("repeated live warning") == 1
+
+
+def test_live_cursor_explicit_invalid_selector_fail_closed(tmp_path):
+    cursor_root = tmp_path / "cursor-user"
+    build_cursor_tree(cursor_root)
+    bogus = "comp-not-a-file-on-disk"
+    r = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "live",
+            "--runtime",
+            "cursor",
+            "--iterations",
+            "1",
+            bogus,
+        ],
+        capture_output=True,
+        text=True,
+        env=_env(tmp_path, cursor_root),
+        check=False,
+    )
+    assert r.returncode != 0, r.stdout
+    assert "Refactor token parser" not in r.stdout
+    assert ".json" in r.stderr.lower()
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="POSIX SIGINT subprocess semantics not exercised on Windows CI",
+)
+def test_cli_live_sigint_exits_zero_after_first_frame(tmp_path):
+    proj = tmp_path / "projects"
+    (tmp_path / "xdg").mkdir()
+    transcript = write_jsonl(proj / "-Users-x-live" / "live-sigint.jsonl", [
+        user("2026-06-12T10:00:00Z"),
+        assistant("2026-06-12T10:00:01Z", usage(out=42), request_id="sig"),
+    ])
+    env = {
+        **os.environ,
+        "TOKEN_USAGE_PROJECTS_DIR": str(proj),
+        "TOKEN_USAGE_LEDGER_DIR": str(tmp_path / "cache"),
+        "XDG_CONFIG_HOME": str(tmp_path / "xdg"),
+        "PYTHONUNBUFFERED": "1",
+    }
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-u",
+            str(SCRIPT),
+            "live",
+            str(transcript),
+            "--interval",
+            "3600",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        env=env,
+        text=True,
+        bufsize=0,
+    )
+    buf_parts = []
+    frame_ready = threading.Event()
+
+    def _read_stdout():
+        assert proc.stdout is not None
+        accumulated = ""
+        while True:
+            byte = proc.stdout.read(1)
+            if not byte:
+                break
+            buf_parts.append(byte)
+            accumulated += byte
+            if "**Total**" in accumulated:
+                frame_ready.set()
+                return
+
+    reader = threading.Thread(target=_read_stdout, daemon=True)
+    reader.start()
+    try:
+        assert frame_ready.wait(timeout=10.0), (
+            f"first frame not flushed: {''.join(buf_parts)!r} (rc={proc.poll()})"
+        )
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=2)
+            pytest.fail("live did not exit after SIGINT within 5s")
+        assert proc.returncode == 0, "".join(buf_parts)
+    finally:
+        if proc.stdout is not None:
+            proc.stdout.close()
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=2)

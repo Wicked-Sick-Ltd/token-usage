@@ -3741,7 +3741,8 @@ def _add_runtime_arg(parser):
 
 def run_live(transcript=None, runtime="claude", interval=2.0, iterations=None,
              show_agents=False, show_models=False, warnings=None, output=None,
-             sleep_fn=None, clock_fn=None, isatty_fn=None, project_dir=None):
+             output_stream=None, flush_fn=None, sleep_fn=None, clock_fn=None,
+             isatty_fn=None, project_dir=None):
     """Poll session aggregates and render the report table until iterations or Ctrl-C."""
     if interval <= 0:
         raise ValueError("interval must be > 0")
@@ -3749,8 +3750,14 @@ def run_live(transcript=None, runtime="claude", interval=2.0, iterations=None,
         raise ValueError("iterations must be positive when supplied")
 
     if output is None:
+        stream = output_stream if output_stream is not None else sys.stdout
+
         def output(text):
-            sys.stdout.write(text)
+            stream.write(text)
+            if flush_fn is not None:
+                flush_fn()
+            else:
+                stream.flush()
     if sleep_fn is None:
         sleep_fn = time.sleep
     if clock_fn is None:
@@ -3769,20 +3776,37 @@ def run_live(transcript=None, runtime="claude", interval=2.0, iterations=None,
 
     done = 0
     while iterations is None or done < iterations:
+        frame_parts = []
         if done > 0:
             if isatty_fn():
-                output(LIVE_CLEAR)
+                frame_parts.append(LIVE_CLEAR)
             else:
                 ts = clock_fn().strftime("%Y-%m-%dT%H:%M:%SZ")
-                output(f"\n--- {ts} ---\n")
+                frame_parts.append(f"\n--- {ts} ---\n")
 
         data = _session_aggregate(adapter, runtime_name, transcript, pricing, warnings)
-        output(render_report(data, show_agents=show_agents, show_models=show_models) + "\n")
+        frame_parts.append(
+            render_report(data, show_agents=show_agents, show_models=show_models) + "\n"
+        )
+        output("".join(frame_parts))
+        _dedupe_warnings_in_place(warnings)
 
         done += 1
         if iterations is not None and done >= iterations:
             break
         sleep_fn(interval)
+
+
+def _dedupe_warnings_in_place(warnings):
+    """Keep warning order stable while dropping repeats across live refreshes."""
+    seen = set()
+    out = []
+    for w in warnings:
+        if w in seen:
+            continue
+        seen.add(w)
+        out.append(w)
+    warnings[:] = out
 
 
 def _session_aggregate(adapter, runtime_name, transcript_arg, pricing, warnings):
