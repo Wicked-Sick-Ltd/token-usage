@@ -506,14 +506,20 @@ def finish(data, render, fmt, warnings, footnotes=()):
     """JSON payload (always carrying "warnings"), or the rendered markdown with
     each footnote — the warnings included — as its own block.
 
-    A warning the render already names (the measurement disclosure lists the
-    ones behind it) is not repeated: saying it twice reads like two problems."""
+    Warnings the render already discloses are not repeated: saying them twice
+    reads like twice as many problems. That is decided by looking for the
+    measurement disclosure's own warnings note, not by asking whether each
+    warning's text appears somewhere in the markdown — a short warning is a
+    substring of some table header, project slug or model id by accident, and
+    matching that way drops it while nothing in the render calls it a warning."""
     data["warnings"] = warnings
     if fmt != "markdown":
         return json.dumps(data)
     rendered = render(data)
+    note = tu.warnings_note(warnings)
+    named = bool(note) and note in rendered
     return "\n\n".join([rendered, *footnotes,
-                        *(f"Warning: {w}" for w in warnings if w not in rendered)])
+                        *([] if named else (f"Warning: {w}" for w in warnings))])
 
 
 def tool_session_cost(args):

@@ -1037,6 +1037,31 @@ def test_markdown_warnings_are_named_once(mcp, tmp_path, monkeypatch):
     assert text.count("missing Cursor bubble 'ghost-bubble'") == 1
 
 
+def test_markdown_repeats_a_warning_the_render_only_mentions_in_passing(mcp):
+    # Suppression used to be "is this warning a substring of the markdown",
+    # which any short warning satisfies by accident — a warning whose text
+    # collides with a table header, project slug or model id was dropped even
+    # though nothing in the render disclosed it as a warning.
+    rendered = "| Project | Calls | Total |\n|---|---:|---:|"
+    out = mcp.finish({}, lambda d: rendered, "markdown", ["Total"])
+    assert "Warning: Total" in out
+
+
+def test_markdown_does_not_repeat_the_rendered_warnings_note(mcp, tu):
+    warnings = ["missing Cursor bubble 'ghost-bubble' for composer 'comp-1'"]
+    note = tu.warnings_note(warnings)
+    out = mcp.finish({}, lambda d: f"body\n{note}", "markdown", warnings)
+    assert out.count(warnings[0]) == 1
+    assert "Warning:" not in out
+
+
+def test_markdown_repeats_every_warning_when_the_note_is_absent(mcp):
+    warnings = ["first problem", "second problem"]
+    out = mcp.finish({}, lambda d: "body with no warnings note", "markdown", warnings)
+    assert "Warning: first problem" in out
+    assert "Warning: second problem" in out
+
+
 def test_session_cost_auto_bogus_selector_is_a_clean_tool_error(mcp, tmp_path,
                                                                monkeypatch, capsys):
     seed_cursor(tmp_path, monkeypatch)
