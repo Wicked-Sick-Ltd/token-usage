@@ -89,10 +89,19 @@ def test_render_dashboard_forbids_external_assets(tu, tmp_path, monkeypatch):
     seed_projects(tmp_path, monkeypatch)
     data = tu.dashboard_data(runtime="claude", since="36500d")
     html_out = tu.render_dashboard(data, generated_at=GENERATED_AT).lower()
-    assert "http://" not in html_out
-    assert "https://" not in html_out
-    assert "<script" not in html_out
-    assert "<iframe" not in html_out
+    for forbidden in (
+        "http://",
+        "https://",
+        "//cdn",
+        "@import",
+        'src="http',
+        "<script",
+        "<iframe",
+        "<link ",
+        "<object",
+        "<embed",
+    ):
+        assert forbidden not in html_out
 
 
 def test_render_dashboard_escapes_labels(tu, tmp_path, monkeypatch):
@@ -109,8 +118,8 @@ def test_render_dashboard_empty_history(tu, tmp_path, monkeypatch):
     monkeypatch.setenv("TOKEN_USAGE_LEDGER_DIR", str(tmp_path / "cache"))
     data = tu.dashboard_data(runtime="claude", since="36500d")
     html_out = tu.render_dashboard(data, generated_at=GENERATED_AT)
-    assert "No sessions" in html_out or "no sessions" in html_out.lower()
-    assert "nothing was scanned" in html_out.lower() or "No readable" in html_out
+    assert "nothing was scanned" in html_out.lower()
+    assert "no sessions matched" not in html_out.lower()
 
 
 def test_render_dashboard_activity_only_disclosure(tu, tmp_path, monkeypatch):
@@ -120,6 +129,11 @@ def test_render_dashboard_activity_only_disclosure(tu, tmp_path, monkeypatch):
     html_out = tu.render_dashboard(data, generated_at=GENERATED_AT)
     lower = html_out.lower()
     assert "activity" in lower and "unmeasured" in lower
+    cards, _ = html_out.split("</section>", 1)
+    for label in ("Estimated cost", "Output tokens", "Input tokens", "Cache reads"):
+        chunk = cards.split(label, 1)[1].split("</div>", 1)[0]
+        assert "unmeasured" in chunk.lower()
+        assert ">0<" not in chunk.replace("— (unmeasured)", "")
 
 
 def test_write_text_output_atomic_file(tu, tmp_path):
@@ -164,7 +178,38 @@ def test_cli_dashboard_stdout_mode(tu, tmp_path, monkeypatch):
     )
     assert r.returncode == 0, r.stderr
     assert "<!DOCTYPE html>" in r.stdout
-    assert r.stderr == "" or "token-usage:" in r.stderr  # progress on stderr ok
+    for line in r.stderr.splitlines():
+        assert line.startswith("token-usage:"), line
+
+
+def test_render_dashboard_partial_command_cost_asterisk(tu, tmp_path, monkeypatch):
+    from test_top_consumers import seed as seed_top
+
+    proj = seed_top(tmp_path, monkeypatch)
+    write_jsonl(proj / "-Users-x-two" / "s4.jsonl", [
+        user("2026-06-14T10:00:00Z", command="/review"),
+        assistant("2026-06-14T10:00:01Z", usage(out=500_000),
+                  model="claude-mystery-9", request_id="r5"),
+    ])
+    data = tu.dashboard_data(runtime="claude", since="2026-01-01")
+    html_out = tu.render_dashboard(data, generated_at=GENERATED_AT)
+    assert "$7.00*" in html_out
+    assert "partially priced" in html_out.lower()
+    assert "lower bound" in html_out.lower() or "unpriced models" in html_out.lower()
+
+
+def test_dashboard_data_project_dir_scopes_cursor(tu, tmp_path, monkeypatch):
+    from test_cursor_cli import zero_token_tree
+
+    project = tmp_path / "alpha-repo"
+    project.mkdir()
+    zero_token_tree(tmp_path, monkeypatch, project_folder=str(project))
+    scoped = tu.dashboard_data(runtime="cursor", since="2020-01-01",
+                               project_dir=str(project))
+    assert scoped["summary"]["sessions"] == 1
+    elsewhere = tu.dashboard_data(runtime="cursor", since="2020-01-01",
+                                  project_dir=str(tmp_path / "beta-repo"))
+    assert elsewhere["summary"]["sessions"] == 0
 
 
 def test_dashboard_data_cursor_runtime(tu, tmp_path, monkeypatch):

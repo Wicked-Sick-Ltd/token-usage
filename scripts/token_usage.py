@@ -20,6 +20,7 @@ Subcommands:
     history               Cross-session rollup by project/day/command/model
     insights              Rule-based findings for one session or a window
     top_consumers         Costliest sessions or commands in a window
+    dashboard             Self-contained HTML dashboard from indexed history
 (run with --help for each subcommand's flags)
 
 Stdlib only. Python 3.9+.
@@ -1291,7 +1292,42 @@ def dashboard_data(runtime="claude", since=None, project=None, project_dir=None,
     }
     if by_project.get("runtime"):
         out["runtime"] = by_project["runtime"]
+    _enrich_dashboard_partials(out, scan, warnings)
     return out
+
+
+def _enrich_dashboard_partials(data, scan, warnings):
+    """Mark history rows whose cost is a priced subtotal (unpriced model usage)."""
+    pricing = load_pricing(warnings)
+    cutoff = since_cutoff(scan.get("since"))
+    adapter, _ = resolve_runtime_corpus(
+        scan["runtime"], project_dir=scan.get("corpus_project_dir"), warnings=warnings)
+    skipped = []
+    if adapter.name == "claude":
+        summary_iter = iter_summaries(
+            pricing, cutoff=cutoff, project=scan.get("project"),
+            progress=True, skipped=skipped, warnings=warnings)
+    else:
+        summary_iter = iter_adapter_summaries(
+            adapter, pricing, cutoff=cutoff, project=scan.get("project"),
+            progress=True, skipped=skipped, warnings=warnings,
+            project_dir=scan.get("corpus_project_dir"))
+    project_partial = {}
+    command_partial = {}
+    for s in summary_iter:
+        if unpriced_models(s.get("by_model", {}), pricing):
+            project_partial[s["project"]] = True
+        for label, agg in s["by_label"].items():
+            if agg["cost_usd"] is None or agg.get("unpriced"):
+                command_partial[label] = True
+
+    def _mark(rows, partial_keys):
+        for row in rows:
+            if partial_keys.get(row["key"]):
+                row["partial"] = True
+
+    _mark(data["top_projects"], project_partial)
+    _mark(data["top_commands"], command_partial)
 
 
 def _dashboard_footnote_source(data):
@@ -1310,6 +1346,22 @@ def _dashboard_activity_only(data):
     if counts.get("activity_only"):
         return True
     return data["summary"].get("measurement") == "activity_only"
+
+
+_DASHBOARD_UNMEASURED = "— (unmeasured)"
+
+
+def _dashboard_fmt_cost(cost, partial=False):
+    if cost is None:
+        return "—"
+    text = fmt_cost(cost)
+    return f"{text}*" if partial else text
+
+
+def _dashboard_metric_display(value, activity_only, token=False):
+    if activity_only:
+        return _DASHBOARD_UNMEASURED
+    return fmt_tokens(value) if token else fmt_cost(value)
 
 
 def _dashboard_svg_chart(by_day, activity_only):
@@ -1360,7 +1412,7 @@ def _dashboard_svg_chart(by_day, activity_only):
     )
 
 
-def _dashboard_table_rows(rows, name_col, calls_col="calls"):
+def _dashboard_table_rows(rows, calls_col="calls"):
     if not rows:
         return '<tr><td colspan="6" class="muted">No data</td></tr>'
     lines = []
@@ -1373,10 +1425,23 @@ def _dashboard_table_rows(rows, name_col, calls_col="calls"):
             f"<td>{fmt_tokens(u['output'])}</td>"
             f"<td>{fmt_tokens(u['input'])}</td>"
             f"<td>{fmt_tokens(u['cache_read'])}</td>"
-            f"<td>{fmt_cost(r['cost_usd'])}</td>"
+            f"<td>{html.escape(_dashboard_fmt_cost(r['cost_usd'], r.get('partial')))}</td>"
             "</tr>"
         )
     return "\n".join(lines)
+
+
+def _dashboard_partial_footnotes(data):
+    notes = []
+    for kind, rows in (
+        ("project", data.get("top_projects") or []),
+        ("command", data.get("top_commands") or []),
+        ("model", data.get("top_models") or []),
+    ):
+        note = partial_footnote(rows, kind)
+        if note:
+            notes.append(note)
+    return notes
 
 
 def render_dashboard(data, generated_at=None):
@@ -1395,23 +1460,32 @@ def render_dashboard(data, generated_at=None):
         if project else ""
     )
     footnotes = scan_footnotes(_dashboard_footnote_source(data))
+    footnotes.extend(_dashboard_partial_footnotes(data))
     notes_html = "".join(
         f"<p class=\"note\">{html.escape(note)}</p>" for note in footnotes
     )
+    missing_root = data.get("projects_dir_missing")
     empty = summary["sessions"] == 0 and not data["top_projects"]
     empty_banner = ""
-    if empty:
+    if missing_root:
+        empty_banner = (
+            '<p class="empty">No readable corpus at this path — nothing was scanned.</p>'
+        )
+    elif empty:
         empty_banner = '<p class="empty">No sessions matched this window.</p>'
     unmeasured = (
         '<p class="note">Token and cost totals are unmeasured for activity-only '
         "sessions; zero means unknown, not free.</p>"
         if activity_only else ""
     )
-    cost_card = fmt_cost(summary["cost_usd"])
-    if activity_only and (summary["cost_usd"] is None or summary["cost_usd"] == 0):
-        cost_card = "— (unmeasured)"
+    cost_card = _dashboard_metric_display(summary["cost_usd"], activity_only, token=False)
+    if activity_only:
+        cost_card = _DASHBOARD_UNMEASURED
+    out_card = _dashboard_metric_display(u["output"], activity_only, token=True)
+    in_card = _dashboard_metric_display(u["input"], activity_only, token=True)
+    cache_card = _dashboard_metric_display(u["cache_read"], activity_only, token=True)
     svg = _dashboard_svg_chart(data.get("by_day") or [], activity_only)
-    model_rows = _dashboard_table_rows(data.get("top_models") or [], "Model", "calls")
+    model_rows = _dashboard_table_rows(data.get("top_models") or [], calls_col="calls")
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1442,9 +1516,9 @@ svg .axis {{ font-size: 10px; fill: #333; }}
 {unmeasured}
 <section class="cards" aria-label="Summary">
 <div class="card"><span>Estimated cost</span><strong>{html.escape(cost_card)}</strong></div>
-<div class="card"><span>Output tokens</span><strong>{fmt_tokens(u['output'])}</strong></div>
-<div class="card"><span>Input tokens</span><strong>{fmt_tokens(u['input'])}</strong></div>
-<div class="card"><span>Cache reads</span><strong>{fmt_tokens(u['cache_read'])}</strong></div>
+<div class="card"><span>Output tokens</span><strong>{html.escape(out_card)}</strong></div>
+<div class="card"><span>Input tokens</span><strong>{html.escape(in_card)}</strong></div>
+<div class="card"><span>Cache reads</span><strong>{html.escape(cache_card)}</strong></div>
 <div class="card"><span>Sessions</span><strong>{summary['sessions']}</strong></div>
 <div class="card"><span>Measurement</span><strong>{html.escape(summary.get('measurement') or 'exact')}</strong></div>
 </section>
@@ -1457,7 +1531,7 @@ svg .axis {{ font-size: 10px; fill: #333; }}
 <table>
 <thead><tr><th>Project</th><th>Sessions</th><th>Output</th><th>Input</th><th>Cache read</th><th>Est. cost</th></tr></thead>
 <tbody>
-{_dashboard_table_rows(data.get('top_projects') or [], 'Project')}
+{_dashboard_table_rows(data.get('top_projects') or [])}
 </tbody>
 </table>
 </section>
@@ -1466,7 +1540,7 @@ svg .axis {{ font-size: 10px; fill: #333; }}
 <table>
 <thead><tr><th>Command</th><th>Calls</th><th>Output</th><th>Input</th><th>Cache read</th><th>Est. cost</th></tr></thead>
 <tbody>
-{_dashboard_table_rows(data.get('top_commands') or [], 'Command')}
+{_dashboard_table_rows(data.get('top_commands') or [])}
 </tbody>
 </table>
 </section>
@@ -3778,7 +3852,8 @@ def main():
     if args.cmd == "dashboard":
         warnings = []
         data = dashboard_data(runtime=args.runtime, since=args.since,
-                              project=args.project, warnings=warnings)
+                              project=args.project, project_dir=None,
+                              warnings=warnings)
         html_text = render_dashboard(data)
         write_text_output(html_text, args.output)
         return
