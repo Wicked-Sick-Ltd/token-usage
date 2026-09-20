@@ -327,6 +327,35 @@ def test_cursor_partial_report_markdown_names_partial(tu, tmp_path, monkeypatch)
     assert "Measurement: partial" in out
 
 
+def test_cursor_insights_session_markdown_names_the_composer_not_a_path(
+    tu, tmp_path, monkeypatch,
+):
+    # render_report was taught that an adapter label is not a path; insights
+    # still split it with Path(), so the same session read as "/composer:...".
+    cursor_root = tmp_path / "cursor-user"
+    build_cursor_tree(cursor_root)
+    monkeypatch.setenv("TOKEN_USAGE_CURSOR_DIR", str(cursor_root))
+    monkeypatch.setenv("TOKEN_USAGE_LEDGER_DIR", str(tmp_path / "cache"))
+    adapter = tu.get_runtime_adapter("cursor")
+    out = tu.render_insights(tu.run_insights(transcript=adapter.locate(),
+                                             runtime="cursor"))
+    assert "(session: composer:comp-usage-001)" in out
+    assert "/composer:" not in out
+
+
+def test_claude_insights_still_names_project_and_transcript(tu, tmp_path, monkeypatch):
+    from conftest import assistant, usage, user, write_jsonl
+
+    proj = tmp_path / "projects"
+    t = write_jsonl(proj / "alpha" / "s.jsonl", [
+        user("2026-06-10T10:00:00Z", command="/go"),
+        assistant("2026-06-10T10:00:01Z", usage(out=10), request_id="r1"),
+    ])
+    monkeypatch.setenv("TOKEN_USAGE_PROJECTS_DIR", str(proj))
+    out = tu.render_insights(tu.run_insights(transcript=t))
+    assert "(session: alpha/s.jsonl)" in out
+
+
 def test_missing_cursor_root_footnote_names_cursor_not_claude(tu, tmp_path, monkeypatch):
     monkeypatch.setenv("TOKEN_USAGE_CURSOR_DIR", str(tmp_path / "no-cursor"))
     monkeypatch.setenv("TOKEN_USAGE_LEDGER_DIR", str(tmp_path / "cache"))

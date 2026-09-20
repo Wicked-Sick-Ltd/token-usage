@@ -1758,8 +1758,7 @@ def render_insights(result):
     transcript_path = result.get("transcript_path")
     session = ""
     if transcript_path:
-        tp = Path(transcript_path)
-        session = f"(session: {tp.parent.name}/{tp.name})"
+        session = f"(session: {session_display(transcript_path)})"
     caveat = insights_caveat(result)
     if result["findings"]:
         lines = [f"- [{f['severity']}] {f['message']}" for f in result["findings"]]
