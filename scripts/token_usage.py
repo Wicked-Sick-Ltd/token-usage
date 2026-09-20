@@ -22,6 +22,7 @@ Subcommands:
     top_consumers         Costliest sessions or commands in a window
     dashboard             Self-contained HTML dashboard from indexed history
     live [TRANSCRIPT]     Refreshing terminal report for the current session
+    export [TRANSCRIPT]   JSONL aggregate export for session or indexed history
 (run with --help for each subcommand's flags)
 
 Stdlib only. Python 3.9+.
@@ -1571,6 +1572,154 @@ def write_text_output(text, output_path):
     tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     tmp.write_text(text, encoding="utf-8")
     tmp.replace(path)
+
+
+EXPORT_SCHEMA = "token-usage.aggregate.v1"
+
+
+def _export_timestamp(generated_at=None):
+    if generated_at is not None:
+        return generated_at
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _export_metrics(usage, cost_usd):
+    """Map internal usage buckets to OTel-style metric names (not OTLP wire format)."""
+    cache_write = (usage.get("cache_5m") or 0) + (usage.get("cache_1h") or 0)
+    cost = cost_usd
+    if isinstance(cost, float) and not math.isfinite(cost):
+        cost = None
+    return {
+        "gen_ai.usage.input_tokens": int(usage.get("input") or 0),
+        "gen_ai.usage.output_tokens": int(usage.get("output") or 0),
+        "gen_ai.usage.cache_read_tokens": int(usage.get("cache_read") or 0),
+        "gen_ai.usage.cache_write_tokens": int(cache_write),
+        "gen_ai.usage.requests": int(usage.get("requests") or 0),
+        "gen_ai.estimated_cost.usd": cost,
+    }
+
+
+def _export_history_measurement(data):
+    counts = data.get("measurements") or {}
+    if counts:
+        return worst_measurement(*counts.keys())
+    if data.get("rows"):
+        return "exact"
+    return "exact"
+
+
+def _export_record(*, runtime, scope, key, dimensions, usage, cost_usd, measurement,
+                   warnings, timestamp, group_by=None):
+    rec = {
+        "schema": EXPORT_SCHEMA,
+        "runtime": runtime,
+        "scope": scope,
+        "key": key,
+        "timestamp": timestamp,
+        "dimensions": dimensions,
+        "metrics": _export_metrics(usage, cost_usd),
+        "measurement": measurement,
+        "warnings": list(warnings or []),
+    }
+    if group_by is not None:
+        rec["group_by"] = group_by
+    return rec
+
+
+def session_export_records(data, generated_at=None):
+    """One total row plus one activity row per aggregated command label."""
+    ts = _export_timestamp(generated_at)
+    runtime = data.get("runtime") or "claude"
+    measurement = data.get("measurement") or "exact"
+    warnings = data.get("warnings") or []
+    records = []
+    for label, agg in sorted(data["by_label"].items(), key=lambda kv: kv[0]):
+        if agg["usage"]["requests"] == 0:
+            continue
+        records.append(_export_record(
+            runtime=runtime,
+            scope="session",
+            key=label,
+            dimensions={"activity": label},
+            usage=agg["usage"],
+            cost_usd=agg["cost_usd"],
+            measurement=measurement,
+            warnings=warnings,
+            timestamp=ts,
+        ))
+    total = data["total"]
+    records.append(_export_record(
+        runtime=runtime,
+        scope="session",
+        key="total",
+        dimensions={},
+        usage=total["usage"],
+        cost_usd=total["cost_usd"],
+        measurement=measurement,
+        warnings=warnings,
+        timestamp=ts,
+    ))
+    return records
+
+
+def history_export_records(data, generated_at=None):
+    """One row per history grouping key plus a final total row."""
+    ts = _export_timestamp(generated_at)
+    runtime = data.get("runtime") or "claude"
+    group_by = data["by"]
+    measurement = _export_history_measurement(data)
+    warnings = data.get("warnings") or []
+    records = []
+    for row in data["rows"]:
+        records.append(_export_record(
+            runtime=runtime,
+            scope="history",
+            key=row["key"],
+            dimensions={group_by: row["key"]},
+            usage=row["usage"],
+            cost_usd=row["cost_usd"],
+            measurement=measurement,
+            warnings=warnings,
+            timestamp=ts,
+            group_by=group_by,
+        ))
+    usage_total, cost_total, _sessions = _sum_history_rows(data["rows"])
+    records.append(_export_record(
+        runtime=runtime,
+        scope="history",
+        key="total",
+        dimensions={},
+        usage=usage_total,
+        cost_usd=cost_total,
+        measurement=measurement,
+        warnings=warnings,
+        timestamp=ts,
+        group_by=group_by,
+    ))
+    return records
+
+
+def _json_safe_export(value):
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {k: _json_safe_export(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_json_safe_export(v) for v in value]
+    return value
+
+
+def render_jsonl(records):
+    """Serialize export records to newline-delimited RFC-8259 JSON (no NaN/Infinity)."""
+    lines = []
+    for rec in records or []:
+        safe = _json_safe_export(rec)
+        lines.append(json.dumps(safe, ensure_ascii=False, allow_nan=False,
+                               separators=(",", ":")))
+    if not lines:
+        return ""
+    return "\n".join(lines) + "\n"
 
 
 def run_top_consumers(by="session", since="30d", project=None, limit=10, warnings=None,
@@ -3889,6 +4038,14 @@ def main():
     live.add_argument("--agents", action="store_true")
     live.add_argument("--models", action="store_true")
     _add_runtime_arg(live)
+    exp = sub.add_parser("export")
+    exp.add_argument("transcript", nargs="?", default=None)
+    exp.add_argument("--scope", choices=("session", "history"), default="history")
+    exp.add_argument("--by", choices=("project", "day", "command", "model"), default="project")
+    exp.add_argument("--since", default=None)
+    exp.add_argument("--project", default=None)
+    exp.add_argument("--output", default="-")
+    _add_runtime_arg(exp)
     args = ap.parse_args()
 
     if args.cmd == "hook":
@@ -3947,6 +4104,29 @@ def main():
                      show_agents=args.agents, show_models=args.models)
         except KeyboardInterrupt:
             pass
+        return
+    if args.cmd == "export":
+        warnings = []
+        if args.scope == "session":
+            pricing = load_pricing(warnings)
+            adapter, runtime_name = resolve_runtime(
+                args.runtime, transcript_arg=args.transcript, warnings=warnings)
+            data = _session_aggregate(adapter, runtime_name, args.transcript,
+                                      pricing, warnings)
+            if "runtime" not in data:
+                data["runtime"] = runtime_name
+            if "measurement" not in data:
+                data["measurement"] = "exact"
+            data["warnings"] = warnings
+            records = session_export_records(data)
+        else:
+            if args.transcript:
+                sys.exit("token-usage: TRANSCRIPT applies only to --scope session")
+            data = run_history(by=args.by, since=args.since, project=args.project,
+                               runtime=args.runtime, warnings=warnings)
+            data["warnings"] = warnings
+            records = history_export_records(data)
+        write_text_output(render_jsonl(records), args.output)
         return
     if getattr(args, "diff", None):
         if getattr(args, "transcript", None):
