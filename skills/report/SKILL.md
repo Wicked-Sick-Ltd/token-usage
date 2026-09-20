@@ -1,6 +1,6 @@
 ---
 name: report
-description: Generate a per-activity breakdown of Claude Code or Cowork token usage and estimated API cost for the current or a past session, attributing usage to slash commands (Claude Code) or skills (Cowork), including subagent rollups, per-agent-type and per-model breakdowns, cross-session history with burn rate, compare mode, budget nudge status, and rule-based spend insights. This skill should be used when the user asks "where did my tokens go", "token usage report", "how many tokens did that command or skill use", "what did this session cost", "which command/skill/subagent/model used the most tokens", "show me token history", "what did I spend this week", "what's my burn rate", "token history by day/project/command/model", "compare token usage between two sessions", "which sessions cost the most", "costliest sessions", "top consumers", "any tips on my token spend", "analyse my token usage", or "why was this session expensive".
+description: Generate a per-activity breakdown of Claude Code, Cowork, or Cursor token usage and estimated API cost for the current or a past session, attributing usage to slash commands (Claude Code), skills (Cowork), or Cursor composer generations, including subagent rollups, per-agent-type and per-model breakdowns, cross-session history with burn rate, compare mode, budget nudge status, and rule-based spend insights. This skill should be used when the user asks "where did my tokens go", "token usage report", "how many tokens did that command or skill use", "what did this session cost", "which command/skill/subagent/model used the most tokens", "show me token history", "what did I spend this week", "what's my burn rate", "token history by day/project/command/model", "compare token usage between two sessions", "which sessions cost the most", "costliest sessions", "top consumers", "any tips on my token spend", "analyse my token usage", or "why was this session expensive".
 argument-hint: "[transcript-path]"
 allowed-tools: Bash, Read, mcp__plugin_token-usage_token-usage__session_cost, mcp__plugin_token-usage_token-usage__history, mcp__plugin_token-usage_token-usage__insights, mcp__plugin_token-usage_token-usage__diff, mcp__plugin_token-usage_token-usage__top_consumers, mcp__token-usage__session_cost, mcp__token-usage__history, mcp__token-usage__insights, mcp__token-usage__diff, mcp__token-usage__top_consumers
 version: 0.6.1
@@ -8,17 +8,20 @@ version: 0.6.1
 
 # token-usage report
 
-Produce a per-activity token-usage breakdown for the current Claude Code session: which slash commands consumed tokens, how much ad-hoc (non-command) work consumed, subagent rollups, and an estimated API-equivalent cost. Also handles cross-session history and transcript comparison.
+Produce a per-activity token-usage breakdown: slash commands (Claude Code), skills
+(Cowork), or composer activities (Cursor), plus subagent rollups and API-equivalent cost
+estimates. Also handles cross-session history and transcript comparison.
 
 ## Prefer the MCP tools when present
 
-If tools named `mcp__plugin_token-usage_token-usage__session_cost`, `…__history`,
-`…__insights`, `…__diff` or `…__top_consumers` are available in this session, call them
-instead of shelling out. (Registered by hand with `claude mcp add --scope user` the same
-tools are named `mcp__token-usage__<tool>`; both prefixes are allowed here.) Same data,
-structured result, no path resolution needed. Use `format: "markdown"` when the user
-wants the table shown verbatim. Fall back to the CLI
-below when the tools are absent (e.g. a Cowork sandbox without the server registered).
+If this session exposes MCP tools from the **token-usage** server (`session_cost`,
+`history`, `insights`, `diff`, `top_consumers`), call them instead of shelling out.
+Host-specific tool names differ (Claude Code plugin prefix, user-scope registration, or
+Cursor plugin wiring); match on the tool basename, not a single hardcoded prefix. For
+**Cursor**, pass `runtime: "cursor"` (or `"auto"` when only Cursor artifacts exist) on
+session and corpus tools. Use `format: "markdown"` when the user wants the table shown
+verbatim. Fall back to the CLI below when the tools are absent (e.g. Cowork without MCP,
+or Cursor before the plugin/MCP server is enabled).
 
 ## How to run
 
@@ -53,6 +56,11 @@ python3 "<plugin-root>/scripts/token_usage.py" insights --json [transcript-path]
 
 # Costliest sessions or commands in a window
 python3 "<plugin-root>/scripts/token_usage.py" top_consumers [--by session|command] [--since 30d] [--limit N]
+
+# Cursor — latest discovered session, or an explicit Cloud export .json path
+python3 "<plugin-root>/scripts/token_usage.py" report --runtime cursor
+python3 "<plugin-root>/scripts/token_usage.py" report --runtime cursor /path/to/cloud-export.json
+python3 "<plugin-root>/scripts/token_usage.py" json --runtime cursor
 ```
 
 - With no argument, `report` and `json` auto-discover the most recently modified session transcript for the current working directory's project (`~/.claude/projects/<cwd-slug>/*.jsonl`) — normally the live session. In **Cowork** (the Claude desktop app), where there is no Claude Code project for the cwd, discovery falls back to the read-only transcript mounted in the session sandbox (`<mount>/.claude/projects/…`, `/sessions/*/mnt/.claude/projects/…`). Failing both of those, it falls back further to the newest transcript under **any** project on the machine — so running `report`/`json`/`insights` from a directory with no Claude Code history of its own will analyse whatever project's session is most recent rather than reporting "not found". Pass an explicit transcript path (or `session_id` for the MCP tools) when it matters which session gets analysed.

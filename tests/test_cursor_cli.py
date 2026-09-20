@@ -3,6 +3,7 @@ import json
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 from conftest import SCRIPT
 from test_cursor_adapter import build_cursor_tree
@@ -33,6 +34,25 @@ def test_report_runtime_cursor_subprocess(tmp_path):
     assert r.returncode == 0, r.stderr
     assert "Refactor token parser" in r.stdout
     assert "Total" in r.stdout
+
+
+def test_report_runtime_cursor_cloud_export_positional(tmp_path):
+    export = tmp_path / "cloud-export.json"
+    export.write_text(
+        (Path(__file__).resolve().parent / "fixtures" / "cursor" / "cloud-export.json").read_text(
+            encoding="utf-8"
+        ),
+        encoding="utf-8",
+    )
+    r = subprocess.run(
+        [sys.executable, str(SCRIPT), "report", "--runtime", "cursor", str(export)],
+        capture_output=True,
+        text=True,
+        env=_env(tmp_path),
+        check=False,
+    )
+    assert r.returncode == 0, r.stderr
+    assert "Cloud agent documentation pass" in r.stdout
 
 
 def test_json_runtime_cursor_includes_runtime_fields(tmp_path):

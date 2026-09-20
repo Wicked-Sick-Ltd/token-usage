@@ -64,12 +64,23 @@ The Claude manifest is `.claude-plugin/plugin.json` (MCP server, Stop hook, repo
 
 ### Cursor
 
-**Cursor Plugin (recommended).** Install from the repository or marketplace when listed.
-The manifest `.cursor-plugin/plugin.json` bundles:
+Official install path: open **Customize** in the sidebar, find **token-usage** on the
+[Cursor Marketplace](https://cursor.com/marketplace) once this plugin is published, and
+choose **Install** (project or user scope). See
+[Installing plugins](https://cursor.com/docs/plugins#installing-plugins).
+
+The Cursor manifest `.cursor-plugin/plugin.json` bundles:
 
 - stdio MCP server → `scripts/mcp_server.py`
-- hooks → `hooks/hooks-cursor.json` (`beforeSubmitPrompt`, `stop`, subagent hooks)
+- hooks → `hooks/hooks-cursor.json` (`version` 1 flat schema; `beforeSubmitPrompt`,
+  `stop`, `subagentStart`, `subagentStop`)
 - skill → `skills/report/`
+
+**Before marketplace listing / for a git checkout today:** use **manual MCP** (below).
+Cursor also documents copying a plugin into `~/.cursor/plugins/local/<name>/` and
+reloading the window for local testing ([Test plugins locally](https://cursor.com/docs/plugins#test-plugins-local));
+that requires the full plugin tree (including `.cursor-plugin/plugin.json`) and may be
+disabled by team policy (`Allow Local Plugin Imports`).
 
 Hook commands use `${CURSOR_PLUGIN_ROOT}`; the MCP entry uses the same variable in
 `args`. See [docs/cursor-adapter.md](docs/cursor-adapter.md) for attribution sources,
@@ -158,9 +169,14 @@ python3 scripts/token_usage.py insights --json [transcript.jsonl]
 python3 scripts/token_usage.py top_consumers --since 30d --limit 10
 python3 scripts/token_usage.py top_consumers --by command --project my-repo --json
 
-# Cursor runtime (hook ledger, Desktop SQLite, or explicit Cloud export JSON)
+# Cursor runtime — latest discovered session (hook ledger, then Desktop SQLite)
 python3 scripts/token_usage.py report --runtime cursor
-python3 scripts/token_usage.py json --runtime cursor --composer <composer-id>
+python3 scripts/token_usage.py json --runtime cursor
+
+# Cursor runtime — explicit Cloud Agent export JSON (activity / any present usage fields)
+python3 scripts/token_usage.py report --runtime cursor /path/to/cloud-export.json
+python3 scripts/token_usage.py json --runtime cursor /path/to/cloud-export.json
+
 python3 scripts/token_usage.py history --runtime cursor --by day --since 7d
 python3 scripts/token_usage.py insights --runtime cursor
 ```

@@ -6,6 +6,20 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Cursor hooks schema** — `hooks/hooks-cursor.json` now uses Cursor's documented
+  `version: 1` flat entries (`command`/`timeout` per event, no nested `hooks` wrapper).
+- **README Cursor examples** — removed nonexistent `--composer` CLI flag; document
+  latest-session `--runtime cursor` and explicit Cloud export `.json` positional paths.
+- **Cursor install docs** — align with official Customize / Marketplace flow; manual
+  MCP for git checkouts before listing; link to local plugin testing docs.
+
+### Changed
+
+- **`skills/report/SKILL.md`** — Cursor runtime and MCP guidance without a single
+  hardcoded tool prefix.
+
 ### Added
 
 - **Cursor Plugin manifest** — `.cursor-plugin/plugin.json` bundles the stdio MCP
