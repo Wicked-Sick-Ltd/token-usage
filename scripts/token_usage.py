@@ -3091,10 +3091,17 @@ def _corpus_has_claude_sessions():
     return False
 
 
-def _corpus_has_cursor_sessions(project_dir=None):
+def _corpus_has_cursor_sessions(project_dir=None, warnings=None):
+    """True when the Cursor corpus has anything to read (an `auto` probe)."""
+    import sqlite3
     adapter = get_runtime_adapter("cursor")
-    for _ in adapter.iter_sessions(project_dir=project_dir):
-        return True
+    try:
+        for _ in adapter.iter_sessions(project_dir=project_dir, warnings=warnings):
+            return True
+    except (OSError, ValueError, sqlite3.Error) as exc:
+        # A probe, not a query: an unreadable Cursor corpus must answer
+        # "nothing to read here" and leave a valid Claude scan working.
+        warn(f"ignoring unreadable Cursor corpus: {exc}", warnings)
     return False
 
 
@@ -3104,26 +3111,39 @@ def resolve_runtime(name, transcript_arg=None, project_dir=None, warnings=None):
     if name == "auto":
         claude = None
         cursor = None
+        # A selector the Cursor adapter rejects is an answer ("not a Cursor
+        # session"), not a crash: under auto it only becomes the user's error
+        # when the Claude side found nothing either — and then as the
+        # adapter's own message, never as a traceback.
+        selector_error = []
+
+        def locate_cursor():
+            try:
+                return get_runtime_adapter("cursor").locate(
+                    transcript_arg, project_dir=project_dir)
+            except CursorExplicitSelectorError as exc:
+                selector_error.append(str(exc))
+                return None
+
         if transcript_arg:
             p = Path(transcript_arg)
             if p.suffix.lower() == ".jsonl":
                 claude = locate_transcript(transcript_arg, project_dir=project_dir)
             elif p.suffix.lower() == ".json" and p.is_file():
-                cursor = get_runtime_adapter("cursor").locate(
-                    transcript_arg, project_dir=project_dir)
+                cursor = locate_cursor()
             else:
                 claude = locate_transcript(transcript_arg, project_dir=project_dir)
-                cursor = get_runtime_adapter("cursor").locate(
-                    transcript_arg, project_dir=project_dir)
+                cursor = locate_cursor()
         else:
             claude = locate_transcript(transcript_arg, project_dir=project_dir)
-            cursor = get_runtime_adapter("cursor").locate(
-                transcript_arg, project_dir=project_dir)
+            cursor = locate_cursor()
         if claude and cursor:
             sys.exit("token-usage: --runtime auto is ambiguous — both Claude and "
                      "Cursor sessions match; pass --runtime claude or cursor")
         if cursor:
             return get_runtime_adapter("cursor"), "cursor"
+        if not claude and selector_error:
+            sys.exit(selector_error[0])
         return get_runtime_adapter("claude"), "claude"
     return get_runtime_adapter(name), name
 
@@ -3134,7 +3154,8 @@ def resolve_runtime_corpus(name, project_dir=None, warnings=None):
     if name != "auto":
         return get_runtime_adapter(name), name
     has_claude = _corpus_has_claude_sessions()
-    has_cursor = _corpus_has_cursor_sessions(project_dir=project_dir)
+    has_cursor = _corpus_has_cursor_sessions(project_dir=project_dir,
+                                             warnings=warnings)
     if has_claude and has_cursor:
         sys.exit("token-usage: --runtime auto is ambiguous — both Claude and "
                  "Cursor corpora have sessions; pass --runtime claude or cursor")

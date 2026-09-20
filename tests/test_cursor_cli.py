@@ -335,3 +335,53 @@ def test_missing_cursor_root_footnote_names_cursor_not_claude(tu, tmp_path, monk
     assert data["projects_dir_missing"] == str((tmp_path / "no-cursor").resolve())
     assert "Claude Code projects directory" not in out
     assert "Cursor" in out and "nothing was scanned" in out
+
+
+def test_auto_runtime_bogus_selector_is_a_clean_error_not_a_traceback(tmp_path):
+    cursor_root = tmp_path / "cursor-user"
+    build_cursor_tree(cursor_root)
+    r = subprocess.run(
+        [sys.executable, str(SCRIPT), "report", "--runtime", "auto",
+         "comp-not-a-file-on-disk"],
+        capture_output=True,
+        text=True,
+        env=_env(tmp_path, cursor_root,
+                 TOKEN_USAGE_PROJECTS_DIR=str(tmp_path / "no-claude")),
+        check=False,
+    )
+    assert r.returncode != 0
+    assert "Traceback" not in r.stderr, r.stderr
+    assert "CursorExplicitSelectorError" not in r.stderr
+    assert ".json" in r.stderr.lower()
+
+
+def corrupt_cursor_db(cursor_root):
+    """A state.vscdb that is not a SQLite database at all."""
+    db = cursor_root / "globalStorage" / "state.vscdb"
+    db.parent.mkdir(parents=True, exist_ok=True)
+    db.write_bytes(b"this is not a database\n")
+    return db
+
+
+def test_auto_corpus_probe_survives_a_corrupt_cursor_database(tmp_path):
+    from conftest import assistant, usage, user, write_jsonl
+
+    proj = tmp_path / "projects"
+    write_jsonl(proj / "p" / "s.jsonl", [
+        user("2026-06-10T10:00:00Z", command="/go"),
+        assistant("2026-06-10T10:00:01Z", usage(out=10), request_id="r1"),
+    ])
+    cursor_root = tmp_path / "cursor-user"
+    corrupt_cursor_db(cursor_root)
+    r = subprocess.run(
+        [sys.executable, str(SCRIPT), "history", "--runtime", "auto", "--json"],
+        capture_output=True,
+        text=True,
+        env=_env(tmp_path, cursor_root, TOKEN_USAGE_PROJECTS_DIR=str(proj)),
+        check=False,
+    )
+    assert r.returncode == 0, r.stderr
+    assert "Traceback" not in r.stderr
+    data = json.loads(r.stdout)
+    assert "runtime" not in data
+    assert len(data["rows"]) == 1

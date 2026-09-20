@@ -1019,6 +1019,18 @@ def test_markdown_warnings_are_named_once(mcp, tmp_path, monkeypatch):
     assert text.count("missing Cursor bubble 'ghost-bubble'") == 1
 
 
+def test_session_cost_auto_bogus_selector_is_a_clean_tool_error(mcp, tmp_path,
+                                                               monkeypatch, capsys):
+    seed_cursor(tmp_path, monkeypatch)
+    monkeypatch.setenv("TOKEN_USAGE_PROJECTS_DIR", str(tmp_path / "no-claude"))
+    text, err = call(mcp, "session_cost", runtime="auto",
+                     transcript="comp-not-a-file-on-disk")
+    assert err, text
+    assert "CursorExplicitSelectorError" not in text
+    assert ".json" in text
+    assert "Traceback" not in capsys.readouterr().err
+
+
 def test_serve_exits_cleanly_when_stdin_is_none(mcp, monkeypatch):
     # A process started with stdin closed (`python mcp_server.py 0<&-`) gets
     # sys.stdin is None; both _resilient_stdin fallbacks handed that straight
