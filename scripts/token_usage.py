@@ -21,6 +21,7 @@ Subcommands:
     insights              Rule-based findings for one session or a window
     top_consumers         Costliest sessions or commands in a window
     dashboard             Self-contained HTML dashboard from indexed history
+    live [TRANSCRIPT]     Refreshing terminal report for the current session
 (run with --help for each subcommand's flags)
 
 Stdlib only. Python 3.9+.
@@ -34,8 +35,11 @@ import math
 import os
 import re
 import sys
+import time
 import urllib.parse
 from pathlib import Path
+
+LIVE_CLEAR = "\x1b[2J\x1b[H"
 
 COMMAND_RE = re.compile(r"<command-name>([^<]+)</command-name>")
 OTHER_LABEL = "(no command)"
@@ -3735,6 +3739,52 @@ def _add_runtime_arg(parser):
                         help="which agent runtime to read (default: claude)")
 
 
+def run_live(transcript=None, runtime="claude", interval=2.0, iterations=None,
+             show_agents=False, show_models=False, warnings=None, output=None,
+             sleep_fn=None, clock_fn=None, isatty_fn=None, project_dir=None):
+    """Poll session aggregates and render the report table until iterations or Ctrl-C."""
+    if interval <= 0:
+        raise ValueError("interval must be > 0")
+    if iterations is not None and iterations <= 0:
+        raise ValueError("iterations must be positive when supplied")
+
+    if output is None:
+        def output(text):
+            sys.stdout.write(text)
+    if sleep_fn is None:
+        sleep_fn = time.sleep
+    if clock_fn is None:
+        def clock_fn():
+            from datetime import datetime, timezone
+            return datetime.now(timezone.utc)
+    if isatty_fn is None:
+        def isatty_fn():
+            return hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
+
+    if warnings is None:
+        warnings = []
+    pricing = load_pricing(warnings)
+    adapter, runtime_name = resolve_runtime(
+        runtime, transcript_arg=transcript, project_dir=project_dir, warnings=warnings)
+
+    done = 0
+    while iterations is None or done < iterations:
+        if done > 0:
+            if isatty_fn():
+                output(LIVE_CLEAR)
+            else:
+                ts = clock_fn().strftime("%Y-%m-%dT%H:%M:%SZ")
+                output(f"\n--- {ts} ---\n")
+
+        data = _session_aggregate(adapter, runtime_name, transcript, pricing, warnings)
+        output(render_report(data, show_agents=show_agents, show_models=show_models) + "\n")
+
+        done += 1
+        if iterations is not None and done >= iterations:
+            break
+        sleep_fn(interval)
+
+
 def _session_aggregate(adapter, runtime_name, transcript_arg, pricing, warnings):
     """Parse one session and return (aggregate dict, measurement, path label)."""
     if adapter.name == "claude":
@@ -3808,6 +3858,13 @@ def main():
     dash.add_argument("--project", default=None)
     dash.add_argument("--output", default="token-usage-dashboard.html")
     _add_runtime_arg(dash)
+    live = sub.add_parser("live")
+    live.add_argument("transcript", nargs="?", default=None)
+    live.add_argument("--interval", type=float, default=2.0)
+    live.add_argument("--iterations", type=int, default=None)
+    live.add_argument("--agents", action="store_true")
+    live.add_argument("--models", action="store_true")
+    _add_runtime_arg(live)
     args = ap.parse_args()
 
     if args.cmd == "hook":
@@ -3854,6 +3911,18 @@ def main():
                               warnings=warnings)
         html_text = render_dashboard(data)
         write_text_output(html_text, args.output)
+        return
+    if args.cmd == "live":
+        if args.interval <= 0:
+            sys.exit("token-usage: --interval must be > 0")
+        if args.iterations is not None and args.iterations <= 0:
+            sys.exit("token-usage: --iterations must be > 0")
+        try:
+            run_live(transcript=args.transcript, runtime=args.runtime,
+                     interval=args.interval, iterations=args.iterations,
+                     show_agents=args.agents, show_models=args.models)
+        except KeyboardInterrupt:
+            pass
         return
     if getattr(args, "diff", None):
         if getattr(args, "transcript", None):
