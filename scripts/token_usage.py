@@ -1531,8 +1531,7 @@ def run_insights(transcript=None, since=None, project=None, budget=None, warning
     else:
         source = adapter.locate(transcript)
         if source is None:
-            sys.exit("token-usage: no Cursor session found — pass a composer id, "
-                     "export path, or set TOKEN_USAGE_CURSOR_DIR")
+            sys.exit(CURSOR_CLI_SESSION_NOT_FOUND)
         parsed = adapter.parse(source)
         exclude = adapter.describe(source)
         project_name = adapter.project(source)
@@ -1803,6 +1802,12 @@ class ClaudeAdapter(RuntimeAdapter):
 CURSOR_NO_ACTIVITY = "(no activity)"
 CURSOR_USER_BUBBLE = 1
 CURSOR_ASSISTANT_BUBBLE = 2
+CURSOR_CLI_SESSION_NOT_FOUND = (
+    "token-usage: no Cursor session found — pass a Cloud Agent export .json path, "
+    "or omit the selector for local discovery (hook ledger / Desktop SQLite under "
+    "TOKEN_USAGE_CURSOR_DIR). Composer IDs are accepted via MCP session_id only, "
+    "not as a CLI positional argument."
+)
 
 
 def cursor_user_dir():
@@ -2998,8 +3003,7 @@ def _session_aggregate(adapter, runtime_name, transcript_arg, pricing, warnings)
     else:
         source = adapter.locate(transcript_arg)
         if source is None:
-            sys.exit("token-usage: no Cursor session found — pass a composer id, "
-                     "cloud export .json, or configure TOKEN_USAGE_CURSOR_DIR")
+            sys.exit(CURSOR_CLI_SESSION_NOT_FOUND)
         parsed = adapter.parse(source)
         path_label = adapter.describe(source)
     for w in parsed.get("warnings") or []:

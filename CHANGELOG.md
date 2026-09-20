@@ -14,11 +14,16 @@ adheres to [Semantic Versioning](https://semver.org/).
   latest-session `--runtime cursor` and explicit Cloud export `.json` positional paths.
 - **Cursor install docs** — align with official Customize / Marketplace flow; manual
   MCP for git checkouts before listing; link to local plugin testing docs.
+- **Cursor CLI session errors** — messages no longer imply a bare composer id works
+  as a positional selector; document `.json` export paths, local discovery, and MCP
+  `session_id`.
 
 ### Changed
 
 - **`skills/report/SKILL.md`** — Cursor runtime and MCP guidance without a single
   hardcoded tool prefix.
+- **SECURITY.md** — scope now includes Cursor hook commands, read-only Cursor Desktop
+  SQLite, and Cursor hook ledgers under `~/.cache/token-usage/cursor/`.
 
 ### Added
 
@@ -33,11 +38,6 @@ adheres to [Semantic Versioning](https://semver.org/).
   privacy, and a future Gemini/Codex adapter contract.
 - **README** — Cursor Plugin and manual MCP install, `--runtime cursor` CLI examples,
   and a concise v1 can/cannot measure section for Cursor.
-
-### Changed
-
-- **SECURITY.md** — scope now includes Cursor hook commands, read-only Cursor Desktop
-  SQLite, and Cursor hook ledgers under `~/.cache/token-usage/cursor/`.
 
 ## [0.6.1] — 2026-09-07
 
