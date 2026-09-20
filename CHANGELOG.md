@@ -6,6 +6,25 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Cursor Plugin manifest** — `.cursor-plugin/plugin.json` bundles the stdio MCP
+  server (`scripts/mcp_server.py`), Cursor hooks (`hooks/hooks-cursor.json`), and
+  the `skills/report/` skill. Paths are relative to the plugin root;
+  `${CURSOR_PLUGIN_ROOT}` is used in hook and MCP `args`. Manual `~/.cursor/mcp.json`
+  registration remains documented in the README. There is still no repository-root
+  `mcp.json` (Claude Code would treat it as project-scope config in a checkout).
+- **`docs/cursor-adapter.md`** — evidence note distinguishing official hooks/plugin
+  docs, reverse-engineered SQLite, observed Cloud export behavior, v1 limitations,
+  privacy, and a future Gemini/Codex adapter contract.
+- **README** — Cursor Plugin and manual MCP install, `--runtime cursor` CLI examples,
+  and a concise v1 can/cannot measure section for Cursor.
+
+### Changed
+
+- **SECURITY.md** — scope now includes Cursor hook commands, read-only Cursor Desktop
+  SQLite, and Cursor hook ledgers under `~/.cache/token-usage/cursor/`.
+
 ## [0.6.1] — 2026-09-07
 
 ### Fixed

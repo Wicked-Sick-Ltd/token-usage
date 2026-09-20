@@ -1,6 +1,6 @@
 # token-usage
 
-**Where did my tokens go?** A Claude Code plugin that attributes token usage to the work that consumed it — per-slash-command breakdowns, subagent rollups, a live per-session ledger, cross-session history, and cache-aware cost estimates.
+**Where did my tokens go?** A public MIT plugin for **Claude Code** and **Cursor** that attributes token usage to the work that consumed it — per-activity breakdowns (slash commands in Claude Code, composer generations in Cursor), subagent rollups, cross-session history, optional live ledgers, and cache-aware API-price estimates.
 
 📖 **Documentation:** [discovery.wickedsick.com/token-usage-claude-code-plugin-documentation](https://discovery.wickedsick.com/token-usage-claude-code-plugin-documentation) — overview, use cases, and how it works, kept in step with each release.
 
@@ -48,6 +48,10 @@ Claude Code tells you session totals (`/cost`, OTel metrics) and tools like ccus
 
 ## Installation
 
+Requires `python3` (3.9+, stdlib only — no dependencies).
+
+### Claude Code
+
 ```bash
 # Test locally
 claude --plugin-dir /path/to/token-usage
@@ -56,7 +60,41 @@ claude --plugin-dir /path/to/token-usage
 /plugin install token-usage
 ```
 
-Requires `python3` (3.9+, stdlib only — no dependencies).
+The Claude manifest is `.claude-plugin/plugin.json` (MCP server, Stop hook, report skill).
+
+### Cursor
+
+**Cursor Plugin (recommended).** Install from the repository or marketplace when listed.
+The manifest `.cursor-plugin/plugin.json` bundles:
+
+- stdio MCP server → `scripts/mcp_server.py`
+- hooks → `hooks/hooks-cursor.json` (`beforeSubmitPrompt`, `stop`, subagent hooks)
+- skill → `skills/report/`
+
+Hook commands use `${CURSOR_PLUGIN_ROOT}`; the MCP entry uses the same variable in
+`args`. See [docs/cursor-adapter.md](docs/cursor-adapter.md) for attribution sources,
+limitations, and privacy.
+
+**Manual MCP (no plugin).** Add to `~/.cursor/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "token-usage": {
+      "command": "python3",
+      "args": ["/absolute/path/to/token-usage/scripts/mcp_server.py"]
+    }
+  }
+}
+```
+
+Use MCP tool argument `runtime: "cursor"` (or `"auto"` when Cursor artifacts are
+unambiguous). Register hooks separately via Cursor settings if you want prospective
+hook ledgers without the full plugin bundle.
+
+This repository intentionally has **no** root `mcp.json`: Claude Code also reads that
+file as *project-scope* MCP inside a checkout, which would register a broken server for
+contributors.
 
 ## Usage
 
@@ -119,7 +157,16 @@ python3 scripts/token_usage.py insights --json [transcript.jsonl]
 # Costliest sessions (or --by command) in the last 30 days
 python3 scripts/token_usage.py top_consumers --since 30d --limit 10
 python3 scripts/token_usage.py top_consumers --by command --project my-repo --json
+
+# Cursor runtime (hook ledger, Desktop SQLite, or explicit Cloud export JSON)
+python3 scripts/token_usage.py report --runtime cursor
+python3 scripts/token_usage.py json --runtime cursor --composer <composer-id>
+python3 scripts/token_usage.py history --runtime cursor --by day --since 7d
+python3 scripts/token_usage.py insights --runtime cursor
 ```
+
+`--runtime` accepts `claude` (default), `cursor`, or `auto`. `auto` picks one runtime
+when unambiguous and never mixes Claude transcripts with Cursor composers in one call.
 
 With no argument, `report` and `json` pick the most recent session for the current directory's project; failing that, the Cowork sandbox mount; failing that too, the newest transcript under **any** project on the machine. That last step means running these outside a directory with its own Claude Code history can pick up a different project's most recent session rather than reporting "not found" — pass an explicit transcript path when it matters which session gets analysed.
 
@@ -243,6 +290,26 @@ The `history` subcommand builds an incremental index under `~/.cache/token-usage
 ## Cost disclaimer
 
 Costs are **API-price estimates** from the bundled `data/pricing.json` (rates as of September 2026). Subscription plans (Pro/Max) are not billed per token — treat the figure as "what this would cost at API prices". Update `data/pricing.json` if rates change; models not in the table show `—`. Rates can be added to the user pricing overlay at `~/.config/token-usage/pricing.json`, and unpriced models are named in a report footnote either way. Each entry is `{"input": $/MTok, "output": $/MTok}` with an optional `"cache_read": $/MTok` for models whose cache-hit rate is not 0.1× input (bundled for Fable 5.1 and Mythos 5.1 at $0.25). Sonnet 5 is priced at $2/$10 — its launch price, which Anthropic made permanent in September 2026 instead of raising it to $3/$15.
+
+## Cursor: what v1 can and cannot measure
+
+**Can (when data exists):**
+
+- Per-activity breakdowns from hook ledgers (prospective **exact** buckets when Cursor
+  sends completion token fields), read-only Desktop SQLite composers/bubbles, or an
+  explicit Cloud Agent export path.
+- Cross-session `history`, `insights`, and `top_consumers` with `measurement` and
+  `warnings` in JSON — same aggregate shapes as Claude.
+- API-price estimates from `data/pricing.json` (not subscription billing).
+
+**Cannot:**
+
+- Infer Cursor plan credits, invoice totals, or subscription-tier billing.
+- Guarantee per-bubble `tokenCount` in SQLite (often zero; not billing truth).
+- Reconstruct exact usage for sessions before hooks were enabled.
+- Attribute marginal token cost to individual `@` attachments.
+
+Details: [docs/cursor-adapter.md](docs/cursor-adapter.md).
 
 ## Limitations
 

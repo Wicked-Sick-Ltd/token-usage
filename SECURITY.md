@@ -2,16 +2,38 @@
 
 ## Scope
 
-token-usage runs locally inside Claude Code. It reads Claude Code transcripts
-(`~/.claude/projects/`) and writes a per-session ledger
-(`~/.cache/token-usage/`). It makes **no network calls** and bundles **no
-credentials**. The main security-relevant surfaces are:
+token-usage runs locally on the developer machine (Claude Code, Cowork, and/or
+Cursor). It makes **no network calls** and bundles **no credentials**. Data
+stays on disk in the user's home directory unless they copy reports elsewhere.
 
-- the Stop hook command executed by Claude Code (`hooks/hooks.json`)
-- filesystem path handling (session IDs are sanitised before being used in
-  ledger filenames)
-- the optional statusline script (`examples/statusline.sh`), which shells out
-  to `jq`
+**Claude Code / Cowork**
+
+- Reads session transcripts under `~/.claude/projects/` (and Cowork mount paths
+  when discovered).
+- Writes per-session ledgers under `~/.cache/token-usage/` (override with
+  `TOKEN_USAGE_LEDGER_DIR`).
+- Executes the Stop/SubagentStop hook command in `hooks/hooks.json`.
+
+**Cursor**
+
+- Optional hook commands in `hooks/hooks-cursor.json` (also bundled by
+  `.cursor-plugin/plugin.json`) append to
+  `~/.cache/token-usage/cursor/<conversation_id>.jsonl` — fail-open, truncated
+  prompts only.
+- Reads Cursor Desktop `state.vscdb` **read-only** when building historical
+  reports (`TOKEN_USAGE_CURSOR_DIR` overrides the User data root in tests).
+- Accepts explicit Cloud Agent export JSON paths supplied by the user; does not
+  call Cursor cloud APIs or store account tokens.
+
+**Shared**
+
+- Filesystem path handling (session and conversation IDs are sanitised before
+  ledger filenames).
+- The optional statusline script (`examples/statusline.sh`), which shells out to
+  `jq`.
+- The stdio MCP server (`scripts/mcp_server.py`), started by Claude Code or Cursor
+  plugin config or a manual `mcp.json` entry — same local read/write boundaries as
+  the CLI.
 
 ## Supported versions
 

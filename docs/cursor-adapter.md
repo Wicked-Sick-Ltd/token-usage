@@ -1,0 +1,134 @@
+# Cursor adapter — evidence and contract
+
+This note records what is **official**, what was **reverse-engineered**, what we
+**observed** in exports, and how a future **Gemini/Codex** adapter should plug
+in. It supports the public MIT `token-usage` Cursor Plugin
+(`.cursor-plugin/plugin.json`) and the `CursorAdapter` in `scripts/token_usage.py`.
+
+## Official Cursor surfaces (authoritative)
+
+| Surface | What token-usage uses | Source |
+| --- | --- | --- |
+| **Hooks** | `beforeSubmitPrompt`, `stop`, `subagentStart`, `subagentStop` via `hooks/hooks-cursor.json` | [Cursor hooks](https://cursor.com/docs/hooks) |
+| **Plugin bundle** | MCP server, hooks file, `skills/report/` | [Cursor plugins](https://cursor.com/docs/plugins), [plugin reference](https://cursor.com/docs/reference/plugins) |
+| **MCP in plugins** | Inline `mcpServers` in `.cursor-plugin/plugin.json`; `${CURSOR_PLUGIN_ROOT}` in `command`/`args` | Plugin reference (MCP servers) |
+
+Hook payloads (when present) include stable `conversation_id`, per-turn
+`generation_id`, model, workspace roots, and `transcript_path`. Completion hooks
+may also carry cumulative `input_tokens`, `output_tokens`, `cache_read_tokens`,
+and `cache_write_tokens`. Those token fields are **optional** and are not yet
+documented on the main hooks reference page; treat them as best-effort when
+present.
+
+The hook command is **fail-open**: it appends to a local ledger and never blocks
+the agent. Prompt text in the ledger is truncated to the same 120-character
+preview used for Claude reports.
+
+## Reverse-engineered SQLite (input only)
+
+Cursor Desktop stores VS Code–derived state under:
+
+| OS | Path |
+| --- | --- |
+| macOS | `~/Library/Application Support/Cursor/User` |
+| Linux | `~/.config/Cursor/User` |
+| Windows | `%APPDATA%/Cursor/User` |
+
+`globalStorage/state.vscdb` table `cursorDiskKV` holds keys such as
+`composerData:<id>` and `bubbleId:<composer>:<bubble>`. Workspace folders map
+through `workspaceStorage/*/workspace.json`.
+
+This schema is **not** a public API. `CursorAdapter` opens the database
+**read-only** with stdlib `sqlite3`, never migrates or writes. Per-bubble
+`tokenCount` values are described by Cursor staff as often zero and not billing
+truth ([forum discussion](https://forum.cursor.com/t/cursordiskkv-table-records-always-show-0-for-tokencount/155984)).
+
+Override the root in tests with `TOKEN_USAGE_CURSOR_DIR`.
+
+## Observed Cloud Agent export
+
+A sample Cloud Agent JSON export (see `tests/fixtures/cursor/cloud-export.json`)
+carries messages, tool calls, and child-agent references. It did **not** expose
+a stable public token-usage field. V1 accepts an explicit export path as an
+**activity-only** source and uses token fields only when they are actually
+present — no undocumented cloud API and no account credentials.
+
+Cloud Agents run repository hooks from `.cursor/hooks.json` on the VM; a user's
+local `~/.cursor` hooks and local MCP registrations do not automatically follow
+the agent.
+
+## Attribution mapping (Claude → Cursor)
+
+| Claude concept | Cursor concept | V1 unit |
+| --- | --- | --- |
+| Session transcript | Composer / Cloud run | Session |
+| Slash-command segment | User generation in composer | Sticky activity |
+| Skill tool use | Skill/command when recorded | Activity label |
+| Subagent transcript | Task/subagent child | Child activity (rollup when linked) |
+| Model on request | Composer/bubble model | Per-model bucket |
+| Prompt cache | Hook/cache fields when present | Cache buckets |
+| `@` context | Attachments, rules | Metadata only (no marginal token cost) |
+
+Activity label precedence: explicit command/skill → subagent type → composer
+title → bounded first-user-prompt summary → `(no activity)`.
+
+## Read path confidence (CursorAdapter)
+
+1. **Hook ledger** — `~/.cache/token-usage/cursor/<conversation_id>.jsonl`
+   (override with `TOKEN_USAGE_LEDGER_DIR`). Prospective **exact** attribution when
+   completion hooks include token fields; dedupe by `generation_id`.
+2. **Desktop SQLite** — historical composers/bubbles; `exact`, `partial`, or
+   `activity_only` depending on `tokenCount` and bubble shape.
+3. **Explicit Cloud export JSON** — activity and any present usage fields only.
+
+CLI and MCP accept `--runtime` / `runtime`: `claude` (default), `cursor`, or
+`auto`. One call never mixes corpora.
+
+## V1 can measure
+
+- Per-activity tables and JSON when hook ledgers or SQLite yield segments.
+- Optional **exact** buckets from hook completion fields when Cursor supplies them.
+- Cross-session `history`, `insights`, and `top_consumers` over Cursor sources
+  when data exists (insights does not invent cost findings on activity-only data).
+- API-price **estimates** from `data/pricing.json` — same disclaimer as Claude;
+  **not** Cursor subscription billing.
+
+## V1 cannot measure (explicit)
+
+- Subscription credits, invoice totals, or plan-tier billing.
+- Reliable per-bubble tokens from SQLite when `tokenCount` is zero or missing.
+- Retrospective exact usage before hooks were installed.
+- Parent hook totals **include subagents** — child usage is exact only when child
+  events are captured and linked.
+- Marginal token cost of individual `@` attachments.
+- Guaranteed Cloud export token totals.
+
+## Privacy and security
+
+- No network calls, telemetry, or bundled credentials.
+- SQLite and exports are read locally; hook ledger stores truncated prompts only.
+- See [SECURITY.md](../SECURITY.md) for hook commands and ledger paths.
+
+## Future adapter contract (Gemini, Codex, others)
+
+Any new runtime adapter added to `get_runtime_adapter()` should document, before
+claiming parity with Claude or Cursor:
+
+1. **Authoritative artifact** — official hook, transcript, or export path.
+2. **Deduplication key** — e.g. `requestId`, `generation_id`, message id.
+3. **Token semantics** — which buckets exist, cumulative vs per-turn, cache fields.
+4. **Unavailable dimensions** — listed explicitly in reports (`measurement`,
+   `warnings`).
+5. **Privacy boundary** — what is persisted, truncated, or never stored.
+
+Adapters implement `RuntimeAdapter` (`locate`, `iter_sessions`, `parse`,
+`project`, `describe`) and must not infer tokens from text length, context
+window occupancy, credits, or cost.
+
+## Manual MCP install (without the plugin)
+
+Users who do not install the Cursor Plugin can register the same stdio server in
+`~/.cursor/mcp.json` (absolute path to `scripts/mcp_server.py`). Pass
+`runtime: "cursor"` on MCP tools or `--runtime cursor` on the CLI. No root
+`mcp.json` in this repository — Claude Code would treat it as project-scope
+config inside a checkout.
