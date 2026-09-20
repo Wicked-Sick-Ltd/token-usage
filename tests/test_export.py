@@ -304,6 +304,60 @@ def test_cli_export_rejects_transcript_with_history_scope(tu, tmp_path, monkeypa
     assert "TRANSCRIPT applies only to --scope session" in r.stderr + r.stdout
 
 
+@pytest.mark.parametrize("flag,value", [
+    ("--project", "repo-one"),
+    ("--by", "day"),
+    ("--since", "36500d"),
+])
+def test_cli_export_session_scope_rejects_history_only_options(tu, tmp_path, monkeypatch,
+                                                               flag, value):
+    # These three only shape a corpus scan. Session scope silently dropped
+    # them, so `export --scope session --since 7d` reported the whole session
+    # and looked like it had honoured the window.
+    path = seed_session(tmp_path, monkeypatch)
+    r = subprocess.run(
+        [sys.executable, str(SCRIPT), "export", str(path), "--scope", "session",
+         flag, value, "--output", "-"],
+        capture_output=True,
+        text=True,
+        env=_env(tmp_path, TOKEN_USAGE_PROJECTS_DIR=str(tmp_path / "projects")),
+        check=False,
+    )
+    assert r.returncode != 0
+    assert flag in r.stderr + r.stdout
+    assert "--scope history" in r.stderr + r.stdout
+    assert r.stdout.strip() == ""
+
+
+def test_cli_export_session_scope_accepts_its_own_options(tu, tmp_path, monkeypatch):
+    path = seed_session(tmp_path, monkeypatch)
+    r = subprocess.run(
+        [sys.executable, str(SCRIPT), "export", str(path), "--scope", "session",
+         "--runtime", "claude", "--output", "-"],
+        capture_output=True,
+        text=True,
+        env=_env(tmp_path, TOKEN_USAGE_PROJECTS_DIR=str(tmp_path / "projects")),
+        check=False,
+    )
+    assert r.returncode == 0, r.stderr
+    assert any(json.loads(ln)["key"] == "total" for ln in r.stdout.split("\n") if ln)
+
+
+def test_cli_export_history_still_defaults_to_by_project(tu, tmp_path, monkeypatch):
+    seed_history(tmp_path, monkeypatch)
+    r = subprocess.run(
+        [sys.executable, str(SCRIPT), "export", "--scope", "history",
+         "--since", "36500d", "--output", "-"],
+        capture_output=True,
+        text=True,
+        env=_env(tmp_path, TOKEN_USAGE_PROJECTS_DIR=str(tmp_path / "projects")),
+        check=False,
+    )
+    assert r.returncode == 0, r.stderr
+    records = [json.loads(ln) for ln in r.stdout.split("\n") if ln]
+    assert records and all(rec["group_by"] == "project" for rec in records)
+
+
 @pytest.mark.parametrize("by,dim_key", [
     ("project", "project"),
     ("day", "day"),

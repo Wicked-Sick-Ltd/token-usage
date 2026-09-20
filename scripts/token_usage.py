@@ -4145,7 +4145,9 @@ def main():
     exp = sub.add_parser("export")
     exp.add_argument("transcript", nargs="?", default=None)
     exp.add_argument("--scope", choices=("session", "history"), default="history")
-    exp.add_argument("--by", choices=("project", "day", "command", "model"), default="project")
+    # None rather than "project" so that --scope session can tell an explicit
+    # --by from the history default it must not silently accept.
+    exp.add_argument("--by", choices=("project", "day", "command", "model"), default=None)
     exp.add_argument("--since", default=None)
     exp.add_argument("--project", default=None)
     exp.add_argument("--output", default="-")
@@ -4212,6 +4214,17 @@ def main():
     if args.cmd == "export":
         warnings = []
         if args.scope == "session":
+            # --by/--since/--project only shape a corpus scan. Dropping them
+            # here would report the whole session while looking like the
+            # filter had been applied.
+            ignored = [flag for flag, value in (("--by", args.by),
+                                                ("--since", args.since),
+                                                ("--project", args.project))
+                       if value is not None]
+            if ignored:
+                sys.exit(f"token-usage: {', '.join(ignored)} "
+                         f"appl{'ies' if len(ignored) == 1 else 'y'} to "
+                         "--scope history")
             pricing = load_pricing(warnings)
             adapter, runtime_name = resolve_runtime(
                 args.runtime, transcript_arg=args.transcript, warnings=warnings)
@@ -4227,7 +4240,7 @@ def main():
             if args.transcript:
                 sys.exit("token-usage: TRANSCRIPT applies only to --scope session")
             export_data, measurement_counts = history_export_data(
-                by=args.by, since=args.since, project=args.project,
+                by=args.by or "project", since=args.since, project=args.project,
                 runtime=args.runtime, warnings=warnings)
             records = history_export_records(
                 export_data, measurement_counts=measurement_counts)
