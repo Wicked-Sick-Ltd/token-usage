@@ -7,7 +7,9 @@ import pytest
 
 SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "token_usage.py"
 
-# Loaded once at collection. Module-level constants (e.g. LEDGER_DIR) bind at import — in-process tests must monkeypatch module attributes, not env vars.
+# Loaded once at collection. Roots that a test may need to move (the ledger and
+# Cursor data dirs) are read per call, so env vars are enough; anything still
+# bound at import has to be monkeypatched as a module attribute instead.
 _spec = importlib.util.spec_from_file_location("token_usage", SCRIPT)
 # Public so module-level test helpers (not just the `tu` fixture) can
 # monkeypatch the very same module object the MCP server imports.
