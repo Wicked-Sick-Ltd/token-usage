@@ -517,3 +517,88 @@ def test_parse_reads_legacy_normalized_usage_records(tu, tmp_path, monkeypatch):
     bucket = result["segments"][0]["by_model"]["claude-sonnet-4"]
     assert bucket["input"] == 550
     assert bucket["cache_read"] == 400
+
+
+def synthetic_ledger(tu, tmp_path, conversation_id, records):
+    from test_cursor_adapter import write_ledger
+
+    return write_ledger(tu, tmp_path / "ledger", conversation_id, records)
+
+
+def test_segment_start_ts_is_the_generations_first_event(tu, tmp_path, monkeypatch):
+    from test_cursor_adapter import ledger_record
+
+    monkeypatch.setenv("TOKEN_USAGE_LEDGER_DIR", str(tmp_path / "ledger"))
+    conv = "conv-timed"
+    path = synthetic_ledger(tu, tmp_path, conv, [
+        ledger_record("beforeSubmitPrompt", conversation_id=conv, generation_id="g1",
+                      ts="2026-06-12T10:00:00Z", prompt="first turn"),
+        ledger_record("stop", conversation_id=conv, generation_id="g1",
+                      ts="2026-06-12T10:00:30Z", model="claude-sonnet-4",
+                      tokens={"output_tokens": 10}),
+        ledger_record("beforeSubmitPrompt", conversation_id=conv, generation_id="g2",
+                      ts="2026-06-12T11:00:00Z", prompt="second turn"),
+        ledger_record("stop", conversation_id=conv, generation_id="g2",
+                      ts="2026-06-12T11:00:20Z", model="claude-sonnet-4",
+                      tokens={"output_tokens": 20}),
+    ])
+    segs = tu.get_runtime_adapter("cursor").parse(
+        tu.CursorSession(conv, "hook_ledger", ledger_path=path)
+    )["segments"]
+    assert [s["start_ts"] for s in segs] == ["2026-06-12T10:00:00Z",
+                                             "2026-06-12T11:00:00Z"]
+
+
+def test_subagent_usage_rolls_into_parent_segment_exactly_once(tu, tmp_path, monkeypatch):
+    # Cursor parent hook counts exclude subagents, so the child's tokens are
+    # merged into the parent total and its own row stays a subset of it.
+    from test_cursor_adapter import ledger_record
+
+    monkeypatch.setenv("TOKEN_USAGE_LEDGER_DIR", str(tmp_path / "ledger"))
+    conv = "conv-rollup"
+    path = synthetic_ledger(tu, tmp_path, conv, [
+        ledger_record("beforeSubmitPrompt", conversation_id=conv, generation_id="g1",
+                      prompt="parent turn"),
+        ledger_record("subagentStart", conversation_id=conv, generation_id="g1",
+                      subagent_id="s1", subagent_type="explore",
+                      subagent_model="claude-sonnet-4", task="scan auth"),
+        ledger_record("subagentStop", conversation_id=conv, generation_id="g1",
+                      subagent_id="s1", subagent_type="explore",
+                      model="claude-sonnet-4", tokens={"output_tokens": 99}),
+        ledger_record("stop", conversation_id=conv, generation_id="g1",
+                      model="claude-sonnet-4",
+                      tokens={"input_tokens": 500, "output_tokens": 100}),
+    ])
+    seg = tu.get_runtime_adapter("cursor").parse(
+        tu.CursorSession(conv, "hook_ledger", ledger_path=path)
+    )["segments"][0]
+    assert tu.sum_buckets(seg["by_model"])["output"] == 199
+    assert seg["subagents"][0]["by_model"]["claude-sonnet-4"]["output"] == 99
+    assert seg["subagents"][0]["output_tokens"] == 99
+
+
+def test_child_only_turn_keeps_its_usage(tu, tmp_path, monkeypatch):
+    # A turn whose only recorded usage is its subagent's used to render as an
+    # empty row and be skipped entirely by the report table.
+    from test_cursor_adapter import ledger_record
+
+    monkeypatch.setenv("TOKEN_USAGE_LEDGER_DIR", str(tmp_path / "ledger"))
+    conv = "conv-child-only"
+    path = synthetic_ledger(tu, tmp_path, conv, [
+        ledger_record("beforeSubmitPrompt", conversation_id=conv, generation_id="g1",
+                      prompt="delegate everything"),
+        ledger_record("subagentStart", conversation_id=conv, generation_id="g1",
+                      subagent_id="s1", subagent_type="shell",
+                      subagent_model="claude-sonnet-4", task="run the suite"),
+        ledger_record("subagentStop", conversation_id=conv, generation_id="g1",
+                      subagent_id="s1", subagent_type="shell",
+                      model="claude-sonnet-4", tokens={"output_tokens": 77}),
+    ])
+    result = tu.get_runtime_adapter("cursor").parse(
+        tu.CursorSession(conv, "hook_ledger", ledger_path=path)
+    )
+    seg = result["segments"][0]
+    assert tu.sum_buckets(seg["by_model"])["output"] == 77
+    data = tu.aggregate(result["segments"], tu.load_pricing())
+    assert "delegate everything" in tu.render_report(data, show_agents=True)
+    assert "shell ×1" in tu.render_report(data, show_agents=True)

@@ -2288,6 +2288,7 @@ def _cursor_parse_hook_ledger(session, warnings):
                 "label": "",
                 "model": "unknown",
                 "usage": None,
+                "start_ts": None,
                 "completion_done": False,
                 "subagents": [],
             }
@@ -2314,6 +2315,10 @@ def _cursor_parse_hook_ledger(session, warnings):
         gen = ev.get("generation_id")
         hook = ev.get("hook") or ""
         meta = meta_for(gen)
+        # The generation's first event dates the whole turn: every since/day/
+        # history/top-consumer window filters on it.
+        if meta["start_ts"] is None and isinstance(ev.get("ts"), str) and ev["ts"]:
+            meta["start_ts"] = ev["ts"]
         if hook == "beforeSubmitPrompt":
             meta["prompt"] = str(ev.get("prompt") or "").strip()[:120]
             label = ev.get("label") or _cursor_activity_label("", meta["prompt"])
@@ -2374,7 +2379,7 @@ def _cursor_parse_hook_ledger(session, warnings):
         label = meta["label"] or _cursor_activity_label("", meta["prompt"])
         seg = {
             "label": label,
-            "start_ts": None,
+            "start_ts": meta["start_ts"],
             "by_model": {},
             "prompt": meta["prompt"],
             "subagents": meta["subagents"],
@@ -2384,6 +2389,13 @@ def _cursor_parse_hook_ledger(session, warnings):
             add_flat(seg["by_model"].setdefault(model, empty_usage()), meta["usage"])
         elif meta["completion_done"]:
             seg["by_model"].setdefault(model, empty_usage())["requests"] += 1
+        # Cursor's parent completion hook reports the parent turn only, so a
+        # child's usage is added to the segment total exactly once — the same
+        # parent-includes-children shape Claude subagent rollups produce, with
+        # the per-agent rows staying subsets of it. Without this, a turn that
+        # delegated all its work had no usage at all and the report dropped it.
+        for child in meta["subagents"]:
+            merge_by_model(seg["by_model"], child["by_model"])
         segments.append(seg)
     if not saw_tokens:
         return segments, "activity_only"
