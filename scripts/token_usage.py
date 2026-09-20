@@ -16,6 +16,7 @@ Subcommands:
     report [TRANSCRIPT]   Markdown breakdown table (default: latest session in cwd project)
     json   [TRANSCRIPT]   Same data as JSON
     hook                  Read Claude Code hook JSON on stdin, update the session ledger
+    cursor-hook           Read Cursor hook JSON on stdin, append to the Cursor hook ledger
     history               Cross-session rollup by project/day/command/model
     insights              Rule-based findings for one session or a window
     top_consumers         Costliest sessions or commands in a window
@@ -1850,6 +1851,260 @@ def _cursor_token_flat(token_count):
     return None
 
 
+_CURSOR_COMPLETION_HOOKS = frozenset({"stop", "afterAgentResponse"})
+
+
+def _sanitize_cursor_id(value):
+    """Filesystem-safe Cursor conversation/generation/subagent id."""
+    cleaned = re.sub(r"[^A-Za-z0-9_-]", "", str(value or ""))
+    return cleaned or "unknown"
+
+
+def _cursor_hook_usage_from_payload(payload):
+    """Map optional Cursor hook token fields to usage buckets (present fields only)."""
+    if not isinstance(payload, dict):
+        return None
+    field_map = (
+        ("input_tokens", "input"),
+        ("output_tokens", "output"),
+        ("cache_read_tokens", "cache_read"),
+        ("cache_write_tokens", "cache_5m"),
+    )
+    flat = {}
+    for src, dst in field_map:
+        val = payload.get(src)
+        if isinstance(val, (int, float)) and not isinstance(val, bool) and val >= 0:
+            flat[dst] = int(val)
+    if not flat:
+        return None
+    if "input" in flat and ("cache_read" in flat or "cache_5m" in flat):
+        flat["input"] = max(
+            0,
+            flat["input"] - flat.get("cache_read", 0) - flat.get("cache_5m", 0),
+        )
+    return {
+        "input": flat.get("input", 0),
+        "output": flat.get("output", 0),
+        "cache_read": flat.get("cache_read", 0),
+        "cache_5m": flat.get("cache_5m", 0),
+        "cache_1h": 0,
+    }
+
+
+def _cursor_hook_activity_from_payload(payload):
+    for key in ("command", "skill_name", "skill"):
+        val = payload.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()[:120]
+    prompt = payload.get("prompt")
+    if isinstance(prompt, str) and prompt.strip():
+        return prompt.strip()[:120]
+    return ""
+
+
+def _cursor_hook_record_from_payload(payload):
+    hook = str(payload.get("hook_event_name") or "")
+    gen = _sanitize_cursor_id(payload.get("generation_id"))
+    record = {"hook": hook, "generation_id": gen}
+    if hook == "beforeSubmitPrompt":
+        prompt = payload.get("prompt")
+        if isinstance(prompt, str):
+            record["prompt"] = prompt.strip()[:120]
+        label = _cursor_hook_activity_from_payload(payload)
+        if label:
+            record["label"] = label
+    elif hook == "subagentStart":
+        record["subagent_id"] = _sanitize_cursor_id(payload.get("subagent_id"))
+        record["subagent_type"] = str(payload.get("subagent_type") or "agent")
+        task = payload.get("task")
+        if isinstance(task, str) and task.strip():
+            record["task"] = task.strip()[:120]
+        model = payload.get("subagent_model") or payload.get("model")
+        if model:
+            record["subagent_model"] = str(model)
+    elif hook in _CURSOR_COMPLETION_HOOKS | {"subagentStop"}:
+        model = payload.get("model") or payload.get("subagent_model")
+        if model:
+            record["model"] = str(model)
+        usage = _cursor_hook_usage_from_payload(payload)
+        if usage:
+            record["usage"] = usage
+        if hook == "subagentStop":
+            record["subagent_id"] = _sanitize_cursor_id(payload.get("subagent_id"))
+            record["subagent_type"] = str(payload.get("subagent_type") or "agent")
+    return record
+
+
+def _cursor_hook_ledger_path(conversation_id):
+    return LEDGER_DIR / "cursor" / f"{_sanitize_cursor_id(conversation_id)}.jsonl"
+
+
+def _append_cursor_hook_line(ledger_path, record):
+    ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(record, separators=(",", ":")) + "\n"
+    with open(ledger_path, "a", encoding="utf-8") as handle:
+        handle.write(line)
+        handle.flush()
+        try:
+            os.fsync(handle.fileno())
+        except OSError:
+            pass
+
+
+def _run_cursor_hook(payload):
+    if not isinstance(payload, dict):
+        return 0
+    hook = payload.get("hook_event_name")
+    if not hook:
+        return 0
+    conversation_id = payload.get("conversation_id")
+    if not conversation_id:
+        return 0
+    try:
+        record = _cursor_hook_record_from_payload(payload)
+        _append_cursor_hook_line(_cursor_hook_ledger_path(conversation_id), record)
+    except Exception as e:  # noqa: BLE001 — fail-open
+        _hook_warn(f"cursor-hook: {type(e).__name__}: {e}")
+    return 0
+
+
+def run_cursor_hook():
+    """Cursor hooks entry point: always exit 0, append-only ledger updates."""
+    try:
+        return _run_cursor_hook(_hook_payload())
+    except Exception as e:  # noqa: BLE001
+        _hook_warn(f"cursor-hook: {type(e).__name__}: {e}")
+        return 0
+
+
+def _cursor_parse_hook_ledger(session, warnings):
+    segments = []
+    saw_tokens = False
+    path = session.ledger_path
+    if path is None or not path.is_file():
+        warn(f"Cursor hook ledger not found for {session.composer_id!r}", warnings)
+        return segments, saw_tokens
+
+    events = []
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        warn(f"cannot read Cursor hook ledger: {exc}", warnings)
+        return segments, saw_tokens
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(ev, dict) and ev.get("generation_id"):
+            events.append(ev)
+
+    gen_order = []
+    gen_meta = {}
+    subagents = {}
+
+    def meta_for(gen):
+        if gen not in gen_meta:
+            gen_meta[gen] = {
+                "prompt": "",
+                "label": "",
+                "model": "unknown",
+                "usage": None,
+                "completion_done": False,
+                "subagents": [],
+            }
+            gen_order.append(gen)
+        return gen_meta[gen]
+
+    for ev in events:
+        gen = ev.get("generation_id")
+        hook = ev.get("hook") or ""
+        meta = meta_for(gen)
+        if hook == "beforeSubmitPrompt":
+            meta["prompt"] = str(ev.get("prompt") or "").strip()[:120]
+            label = ev.get("label") or _cursor_activity_label("", meta["prompt"])
+            if label and label != CURSOR_NO_ACTIVITY:
+                meta["label"] = label
+            elif meta["prompt"]:
+                meta["label"] = meta["prompt"]
+        elif hook == "subagentStart":
+            sid = ev.get("subagent_id") or "unknown"
+            subagents[sid] = {
+                "type": ev.get("subagent_type") or "agent",
+                "description": str(ev.get("task") or "").strip()[:120],
+                "model": ev.get("subagent_model") or "unknown",
+                "parent_gen": gen,
+                "stop_recorded": False,
+            }
+        elif hook == "subagentStop":
+            sid = ev.get("subagent_id") or "unknown"
+            sub = subagents.setdefault(
+                sid,
+                {
+                    "type": ev.get("subagent_type") or "agent",
+                    "description": "",
+                    "model": ev.get("model") or "unknown",
+                    "parent_gen": gen,
+                    "stop_recorded": False,
+                },
+            )
+            if sub["stop_recorded"]:
+                continue
+            sub["stop_recorded"] = True
+            usage = ev.get("usage")
+            model = ev.get("model") or sub.get("model") or "unknown"
+            parent = sub.get("parent_gen") or gen
+            parent_meta = meta_for(parent)
+            bucket = empty_usage()
+            if isinstance(usage, dict) and any(usage.get(k) for k in usage if k != "requests"):
+                saw_tokens = True
+                for key in ("input", "output", "cache_read", "cache_5m", "cache_1h"):
+                    if key in usage:
+                        bucket[key] = int(usage.get(key) or 0)
+                bucket["requests"] = 1
+            else:
+                bucket["requests"] = 1
+            parent_meta["subagents"].append({
+                "type": sub.get("type") or "agent",
+                "description": sub.get("description") or "",
+                "output_tokens": bucket["output"],
+                "by_model": {model: bucket},
+            })
+        elif hook in _CURSOR_COMPLETION_HOOKS:
+            if meta["completion_done"]:
+                continue
+            meta["completion_done"] = True
+            if ev.get("model"):
+                meta["model"] = str(ev.get("model"))
+            usage = ev.get("usage")
+            if isinstance(usage, dict) and any(
+                usage.get(k) for k in ("input", "output", "cache_read", "cache_5m", "cache_1h")
+            ):
+                saw_tokens = True
+                meta["usage"] = usage
+
+    for gen in gen_order:
+        meta = gen_meta[gen]
+        label = meta["label"] or _cursor_activity_label("", meta["prompt"])
+        seg = {
+            "label": label,
+            "start_ts": None,
+            "by_model": {},
+            "prompt": meta["prompt"],
+            "subagents": meta["subagents"],
+        }
+        model = meta["model"] or "unknown"
+        if meta["usage"]:
+            add_flat(seg["by_model"].setdefault(model, empty_usage()), meta["usage"])
+        elif meta["completion_done"]:
+            seg["by_model"].setdefault(model, empty_usage())["requests"] += 1
+        segments.append(seg)
+    return segments, saw_tokens
+
+
 def _cursor_bubble_text(bubble):
     if not isinstance(bubble, dict):
         return ""
@@ -2044,9 +2299,8 @@ class CursorAdapter(RuntimeAdapter):
             segments = _cursor_parse_cloud_export(source, warnings)
             measurement = "activity_only"
         elif source.source == "hook_ledger":
-            warn("Cursor hook ledger parsing is not available yet", warnings)
-            segments = []
-            measurement = "activity_only"
+            segments, saw_tokens = _cursor_parse_hook_ledger(source, warnings)
+            measurement = "exact" if saw_tokens else "activity_only"
         else:
             segments, saw_tokens = _cursor_parse_sqlite(source, warnings)
             measurement = "partial" if saw_tokens else "activity_only"
@@ -2288,6 +2542,7 @@ def main():
             p.add_argument("--models", action="store_true")
         p.add_argument("--diff", nargs=2, metavar=("OLD", "NEW"), default=None)
     sub.add_parser("hook")
+    sub.add_parser("cursor-hook")
     h = sub.add_parser("history")
     h.add_argument("--by", choices=("project", "day", "command", "model"), default="project")
     h.add_argument("--since", default=None)
@@ -2309,6 +2564,8 @@ def main():
 
     if args.cmd == "hook":
         sys.exit(run_hook())
+    if args.cmd == "cursor-hook":
+        sys.exit(run_cursor_hook())
     if args.cmd == "history":
         if args.as_json and args.as_csv:
             sys.exit("token-usage: --json and --csv cannot be combined")

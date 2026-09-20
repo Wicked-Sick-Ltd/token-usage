@@ -1,0 +1,49 @@
+{
+  "description": "Captures Cursor composer prompt and completion usage into the token-usage hook ledger (prospective exact attribution when token fields are present)",
+  "hooks": {
+    "beforeSubmitPrompt": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CURSOR_PLUGIN_ROOT}/scripts/token_usage.py\" cursor-hook",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CURSOR_PLUGIN_ROOT}/scripts/token_usage.py\" cursor-hook",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "subagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CURSOR_PLUGIN_ROOT}/scripts/token_usage.py\" cursor-hook",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "subagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CURSOR_PLUGIN_ROOT}/scripts/token_usage.py\" cursor-hook",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}
