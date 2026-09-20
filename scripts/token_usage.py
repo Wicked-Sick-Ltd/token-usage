@@ -3418,9 +3418,15 @@ def _session_aggregate(adapter, runtime_name, transcript_arg, pricing, warnings)
     data = aggregate(parsed["segments"], pricing)
     data = apply_measurement_costs(data, measurement)
     data["transcript_path"] = path_label
-    data["runtime"] = runtime_name
-    data["measurement"] = measurement
-    data["warnings"] = warnings
+    # Same rule the MCP session payload follows: a default Claude run predates
+    # runtimes and keeps the shape it always had, which is also what the README
+    # promises ("the CLI's JSON shapes plus transcript, resolved_via and
+    # warnings" — so warnings is the MCP envelope's, not the CLI's). Claude
+    # warnings still reach a CLI reader the way they always did, on stderr.
+    if runtime_name != "claude":
+        data["runtime"] = runtime_name
+        data["measurement"] = measurement
+        data["warnings"] = warnings
     return data
 
 

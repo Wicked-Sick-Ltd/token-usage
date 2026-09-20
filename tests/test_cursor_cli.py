@@ -228,6 +228,33 @@ def test_default_runtime_is_claude(tu, tmp_path, monkeypatch):
     assert data.get("runtime", "claude") == "claude"
 
 
+def test_default_claude_json_keeps_its_pre_runtime_shape(tmp_path):
+    # Routing Claude through the adapter seam added runtime/measurement to a
+    # payload that never carried them. Cursor discloses both (it has to); a
+    # default Claude run must still look like it did before runtimes existed.
+    from conftest import assistant, usage, user, write_jsonl
+
+    proj = tmp_path / "projects"
+    t = write_jsonl(proj / "p" / "s.jsonl", [
+        user("2026-06-10T10:00:00Z", command="/go"),
+        assistant("2026-06-10T10:00:01Z", usage(out=10), request_id="r1"),
+    ])
+    r = subprocess.run(
+        [sys.executable, str(SCRIPT), "json", str(t)],
+        capture_output=True, text=True, check=False,
+        env=_env(tmp_path, TOKEN_USAGE_PROJECTS_DIR=str(proj)),
+    )
+    assert r.returncode == 0, r.stderr
+    data = json.loads(r.stdout)
+    assert "runtime" not in data
+    assert "measurement" not in data
+    # README: MCP JSON is "the CLI's JSON shapes plus transcript, resolved_via
+    # and warnings" — so warnings belongs to the MCP envelope, not here.
+    assert "warnings" not in data
+    assert data["transcript_path"] == str(t)
+    assert data["by_label"]
+
+
 def zero_token_tree(tmp_path, monkeypatch, project_folder=None):
     """A Cursor corpus whose only session has no measurable tokens."""
     cursor_root = tmp_path / "cursor-user"

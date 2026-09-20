@@ -5,7 +5,7 @@ import os
 import subprocess
 import sys
 
-from conftest import SERVER, TOKEN_USAGE, assistant, usage, user, write_jsonl
+from conftest import SCRIPT, SERVER, TOKEN_USAGE, assistant, usage, user, write_jsonl
 
 PLUGIN_ROOT = SERVER.parent.parent
 
@@ -1099,6 +1099,27 @@ def test_diff_default_claude_keeps_its_pre_runtime_shape(mcp, tmp_path, monkeypa
     text, err = call(mcp, "diff", old=str(s1), new=str(s2), format="markdown")
     assert not err, text
     assert "Measurement:" not in text
+
+
+def test_default_claude_session_json_matches_the_cli(mcp, tmp_path, monkeypatch):
+    # The MCP payload has always omitted runtime/measurement for Claude; the
+    # CLI started emitting them, so the same session had two shapes and a
+    # pre-runtime Claude consumer saw keys it had never been promised.
+    _proj, s1, _s2 = seed(tmp_path, monkeypatch)
+    data = json.loads(call(mcp, "session_cost", transcript=str(s1))[0])
+    assert "runtime" not in data
+    assert "measurement" not in data
+
+    cli = json.loads(subprocess.run(
+        [sys.executable, str(SCRIPT), "json", str(s1)],
+        capture_output=True, text=True, check=True,
+        env={**os.environ,
+             "TOKEN_USAGE_PROJECTS_DIR": str(tmp_path / "projects"),
+             "TOKEN_USAGE_LEDGER_DIR": str(tmp_path / "cache")},
+    ).stdout)
+    assert "runtime" not in cli
+    assert "measurement" not in cli
+    assert cli["transcript_path"] == data["transcript_path"]
 
 
 def test_serve_exits_cleanly_when_stdin_is_none(mcp, monkeypatch):
