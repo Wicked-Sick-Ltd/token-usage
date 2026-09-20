@@ -533,3 +533,49 @@ def test_huge_since_is_an_error_not_an_overflow_traceback(tmp_path):
     assert r.returncode == 1
     assert "Traceback" not in r.stderr
     assert "invalid --since value '999999999999d'" in r.stderr
+
+
+def test_cursor_history_two_composers(tu, tmp_path, monkeypatch):
+    from test_cursor_adapter import build_cursor_tree
+
+    cursor_root = tmp_path / "cursor-user"
+    build_cursor_tree(
+        cursor_root,
+        composer_id="comp-alpha",
+        workspace_id="ws-alpha",
+        project_folder=str((tmp_path / "alpha").resolve()),
+    )
+    build_cursor_tree(
+        cursor_root,
+        composer_id="comp-beta",
+        workspace_id="ws-beta",
+        project_folder=str((tmp_path / "beta").resolve()),
+    )
+    monkeypatch.setenv("TOKEN_USAGE_CURSOR_DIR", str(cursor_root))
+    monkeypatch.setenv("TOKEN_USAGE_LEDGER_DIR", str(tmp_path / "cache"))
+
+    data = tu.run_history(by="project", runtime="cursor")
+    assert data["runtime"] == "cursor"
+    keys = {r["key"] for r in data["rows"]}
+    assert keys == {"comp-alpha", "comp-beta"}
+    assert sum(r["calls"] for r in data["rows"]) == 2
+
+
+def test_cursor_top_consumers_sessions(tu, tmp_path, monkeypatch):
+    from test_cursor_adapter import build_cursor_tree
+
+    cursor_root = tmp_path / "cursor-user"
+    build_cursor_tree(cursor_root, composer_id="comp-one")
+    build_cursor_tree(
+        cursor_root,
+        composer_id="comp-two",
+        workspace_id="ws-two",
+        project_folder=str((tmp_path / "two").resolve()),
+    )
+    monkeypatch.setenv("TOKEN_USAGE_CURSOR_DIR", str(cursor_root))
+    monkeypatch.setenv("TOKEN_USAGE_LEDGER_DIR", str(tmp_path / "cache"))
+
+    data = tu.run_top_consumers(by="session", since="36500d", runtime="cursor", limit=5)
+    assert data["runtime"] == "cursor"
+    assert len(data["rows"]) == 2
+    assert {r["session_id"] for r in data["rows"]} == {"comp-one", "comp-two"}

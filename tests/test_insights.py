@@ -326,6 +326,33 @@ def test_insights_cli_rejects_transcript_plus_since(tu, tmp_path):
     assert out.returncode != 0 and "--since" in out.stderr
 
 
+def test_cursor_insights_activity_only_no_cost_findings(tu, tmp_path, monkeypatch):
+    from test_cursor_adapter import build_cursor_tree
+
+    cursor_root = tmp_path / "cursor-user"
+    zero_headers = [
+        {"bubbleId": "zero-user", "type": 1},
+        {"bubbleId": "zero-asst", "type": 2},
+    ]
+    build_cursor_tree(
+        cursor_root,
+        composer_id="comp-zero",
+        bubble_headers=zero_headers,
+    )
+    monkeypatch.setenv("TOKEN_USAGE_CURSOR_DIR", str(cursor_root))
+    monkeypatch.setenv("TOKEN_USAGE_LEDGER_DIR", str(tmp_path / "cache"))
+
+    adapter = tu.get_runtime_adapter("cursor")
+    session = next(adapter.iter_sessions())
+    r = tu.run_insights(transcript=session, runtime="cursor")
+    assert r["runtime"] == "cursor"
+    assert r.get("measurement") == "activity_only"
+    cost_rules = {"cost-outlier", "budget-pace", "spend-trend", "top-mover", "adhoc-dominance"}
+    assert cost_rules.isdisjoint({f["rule"] for f in r["findings"]})
+    parsed = adapter.parse(session)
+    assert sum(tu.sum_buckets(s["by_model"])["requests"] for s in parsed["segments"]) >= 1
+
+
 def test_insights_cli_rejects_project_without_since(tu, tmp_path):
     # --project only filters the window scan; in session mode it was dropped
     # in silence, so `insights --project alpha` reported on whichever session

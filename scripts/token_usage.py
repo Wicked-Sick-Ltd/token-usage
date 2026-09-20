@@ -955,12 +955,22 @@ def iter_summaries(pricing, cutoff=None, project=None, exclude=None, progress=Fa
         yield s
 
 
-def run_history(by="project", since=None, project=None, warnings=None):
+def run_history(by="project", since=None, project=None, warnings=None, runtime="claude"):
     pricing = load_pricing(warnings)
     cutoff = since_cutoff(since)
-    missing_root = check_projects_root(warnings)
+    adapter, runtime_name = resolve_runtime_corpus(runtime, warnings=warnings)
+    skipped = []
+    if adapter.name == "claude":
+        missing_root = check_projects_root(warnings)
+        summary_iter = iter_summaries(pricing, cutoff=cutoff, project=project,
+                                      progress=True, skipped=skipped, warnings=warnings)
+    else:
+        missing_root = check_cursor_root(warnings)
+        summary_iter = iter_adapter_summaries(adapter, pricing, cutoff=cutoff,
+                                              project=project, progress=True,
+                                              skipped=skipped, warnings=warnings)
     rows = {}
-    unpriced, skipped = set(), []
+    unpriced = set()
 
     def add_row(key, usage_dict, cost, calls):
         r = rows.setdefault(key, {"key": key, "usage": empty_usage(),
@@ -971,8 +981,7 @@ def run_history(by="project", since=None, project=None, warnings=None):
             r["cost_usd"] = (r["cost_usd"] or 0.0) + cost
         r["calls"] += calls
 
-    for s in iter_summaries(pricing, cutoff=cutoff, project=project, progress=True,
-                            skipped=skipped, warnings=warnings):
+    for s in summary_iter:
         unpriced.update(unpriced_models(s.get("by_model", {}), pricing))
         if by == "project":
             add_row(s["project"], s["total"]["usage"], s["total"]["cost_usd"], 1)
@@ -990,9 +999,12 @@ def run_history(by="project", since=None, project=None, warnings=None):
                 add_row(label, agg["usage"], agg["cost_usd"], agg["invocations"])
 
     ordered = sorted(rows.values(), key=lambda r: (-(r["cost_usd"] or 0), r["key"]))
-    return {"by": by, "since": since, "project": project, "rows": ordered,
-            "unpriced_models": sorted(unpriced), "skipped_transcripts": skipped,
-            "projects_dir_missing": missing_root}
+    out = {"by": by, "since": since, "project": project, "rows": ordered,
+           "unpriced_models": sorted(unpriced), "skipped_transcripts": skipped,
+           "projects_dir_missing": missing_root}
+    if runtime_name != "claude":
+        out["runtime"] = runtime_name
+    return out
 
 
 def burn_rate_line(total_cost, since):
@@ -1099,23 +1111,35 @@ def render_history(data):
     return "\n".join(lines)
 
 
-def run_top_consumers(by="session", since="30d", project=None, limit=10, warnings=None):
+def run_top_consumers(by="session", since="30d", project=None, limit=10, warnings=None,
+                      runtime="claude"):
     """Costliest sessions (by="session") or command labels aggregated across
     sessions (by="command") in a window. Unpriced rows sort last."""
     pricing = load_pricing(warnings)
     cutoff = since_cutoff(since)
-    missing_root = check_projects_root(warnings)
-    unpriced, skipped = set(), []
+    adapter, runtime_name = resolve_runtime_corpus(runtime, warnings=warnings)
+    skipped = []
+    if adapter.name == "claude":
+        missing_root = check_projects_root(warnings)
+        summary_iter = iter_summaries(pricing, cutoff=cutoff, project=project,
+                                      skipped=skipped, warnings=warnings)
+    else:
+        missing_root = check_cursor_root(warnings)
+        summary_iter = iter_adapter_summaries(adapter, pricing, cutoff=cutoff,
+                                              project=project, skipped=skipped,
+                                              warnings=warnings)
+    unpriced = set()
     sessions, commands = [], {}
-    for s in iter_summaries(pricing, cutoff=cutoff, project=project, skipped=skipped,
-                            warnings=warnings):
+    for s in summary_iter:
         session_unpriced = unpriced_models(s.get("by_model", {}), pricing)
         unpriced.update(session_unpriced)
         if by == "session":
             # "partial": some of this session's usage ran on an unpriced
             # model, so cost_usd is a priced subtotal — the session ranks on
             # it, and a bare number would hide that.
-            sessions.append({"session_id": Path(s["path"]).stem, "path": s["path"],
+            sid = (s["project"] if adapter.name == "cursor"
+                   else Path(s["path"]).stem)
+            sessions.append({"session_id": sid, "path": s["path"],
                              "project": s["project"], "first_ts": s["first_ts"],
                              "usage": s["total"]["usage"],
                              "cost_usd": s["total"]["cost_usd"],
@@ -1143,6 +1167,8 @@ def run_top_consumers(by="session", since="30d", project=None, limit=10, warning
     data = {"by": by, "since": since, "project": project, "limit": limit,
             "rows": rows[:limit], "unpriced_models": sorted(unpriced),
             "skipped_transcripts": skipped, "projects_dir_missing": missing_root}
+    if runtime_name != "claude":
+        data["runtime"] = runtime_name
     if by == "session":
         # Counted over the whole window: unpriced sessions rank last, so the
         # limit is exactly what hides them.
@@ -1226,7 +1252,8 @@ def _median(xs):
     return xs[mid] if n % 2 else (xs[mid - 1] + xs[mid]) / 2
 
 
-def compute_baseline(pricing, project, days=30, exclude=None, warnings=None):
+def compute_baseline(pricing, project, days=30, exclude=None, warnings=None,
+                     runtime="claude"):
     """Per-project norms from the history index (median session cost; per-command
     median cost and cache-read ratio) over the trailing `days`, excluding the
     transcript at `exclude` (the session being analysed).
@@ -1237,10 +1264,19 @@ def compute_baseline(pricing, project, days=30, exclude=None, warnings=None):
     so a thinned corpus and a genuinely unremarkable session look identical
     without them."""
     cutoff = since_cutoff(f"{days}d")
-    missing_root = check_projects_root(warnings)
-    session_costs, commands, skipped = [], {}, []
-    for s in iter_summaries(pricing, cutoff=cutoff, exclude=exclude, skipped=skipped,
-                            warnings=warnings):
+    adapter, _ = resolve_runtime_corpus(runtime, warnings=warnings)
+    skipped = []
+    if adapter.name == "claude":
+        missing_root = check_projects_root(warnings)
+        summary_iter = iter_summaries(pricing, cutoff=cutoff, exclude=exclude,
+                                        skipped=skipped, warnings=warnings)
+    else:
+        missing_root = check_cursor_root(warnings)
+        summary_iter = iter_adapter_summaries(adapter, pricing, cutoff=cutoff,
+                                              exclude=exclude, skipped=skipped,
+                                              warnings=warnings)
+    session_costs, commands = [], {}
+    for s in summary_iter:
         if s["project"] != project:
             continue
         if s["total"]["cost_usd"] is not None:
@@ -1419,46 +1455,98 @@ def window_insights(summaries, cutoff, pricing, now=None, halves=None):
     return sort_findings(out)
 
 
-def run_insights(transcript=None, since=None, project=None, budget=None, warnings=None):
+def run_insights(transcript=None, since=None, project=None, budget=None, warnings=None,
+                 runtime="claude"):
     pricing = load_pricing(warnings)
+    warnings = warnings if warnings is not None else []
     if since:
         cutoff = since_cutoff(since)
-        missing_root = check_projects_root(warnings)
+        adapter, runtime_name = resolve_runtime_corpus(runtime, warnings=warnings)
         skipped = []
-        summaries = list(iter_summaries(pricing, cutoff=cutoff, project=project,
-                                        skipped=skipped, warnings=warnings))
+        if adapter.name == "claude":
+            missing_root = check_projects_root(warnings)
+            summaries = list(iter_summaries(pricing, cutoff=cutoff, project=project,
+                                            skipped=skipped, warnings=warnings))
+        else:
+            missing_root = check_cursor_root(warnings)
+            summaries = list(iter_adapter_summaries(adapter, pricing, cutoff=cutoff,
+                                                    project=project, skipped=skipped,
+                                                    warnings=warnings))
         # The trend rules compare the window's halves, so "how many sessions
         # matched" is not the whole story of what could be compared: report
         # the first half too, and let the renderer disclose a dead one.
         halves = window_halves(summaries, cutoff)
         first = halves[0]
         c1 = half_cost(first)
-        return {"mode": "window",
-                "findings": window_insights(summaries, cutoff, pricing, halves=halves),
-                # "first_half_spend" is the rules' own predicate, UNROUNDED:
-                # first_half_cost is rounded for the payload, and a first half
-                # under $5e-7 rounds to 0.0 while rules 7-8 still run on it.
-                "baseline": {"sessions": len(summaries), "since": since,
-                             "first_half_sessions": len(first),
-                             "first_half_cost": round(c1, 6),
-                             "first_half_spend": c1 > 0},
-                "skipped_transcripts": skipped,
-                "projects_dir_missing": missing_root}
-    t = resolve_transcript(transcript)
-    data = aggregate(parse_session(t), pricing)
-    baseline = compute_baseline(pricing, project=t.parent.name, exclude=str(t),
-                                warnings=warnings)
+        out = {"mode": "window",
+               "findings": window_insights(summaries, cutoff, pricing, halves=halves),
+               # "first_half_spend" is the rules' own predicate, UNROUNDED:
+               # first_half_cost is rounded for the payload, and a first half
+               # under $5e-7 rounds to 0.0 while rules 7-8 still run on it.
+               "baseline": {"sessions": len(summaries), "since": since,
+                            "first_half_sessions": len(first),
+                            "first_half_cost": round(c1, 6),
+                            "first_half_spend": c1 > 0},
+               "skipped_transcripts": skipped,
+               "projects_dir_missing": missing_root,
+               "warnings": warnings}
+        if runtime_name != "claude":
+            out["runtime"] = runtime_name
+        return out
+    if isinstance(transcript, CursorSession):
+        _validate_runtime_name(runtime)
+        if runtime == "auto":
+            runtime_name = "cursor"
+        else:
+            runtime_name = runtime
+        adapter = get_runtime_adapter(runtime_name)
+    else:
+        adapter, runtime_name = resolve_runtime(runtime, transcript_arg=transcript,
+                                                warnings=warnings)
+    if adapter.name == "claude":
+        t = resolve_transcript(transcript)
+        parsed = {"segments": parse_session(t), "measurement": "exact", "warnings": []}
+        exclude = str(t)
+        project_name = t.parent.name
+        transcript_path = str(t)
+    elif isinstance(transcript, CursorSession):
+        source = transcript
+        parsed = adapter.parse(source)
+        exclude = adapter.describe(source)
+        project_name = adapter.project(source)
+        transcript_path = exclude
+    else:
+        source = adapter.locate(transcript)
+        if source is None:
+            sys.exit("token-usage: no Cursor session found — pass a composer id, "
+                     "export path, or set TOKEN_USAGE_CURSOR_DIR")
+        parsed = adapter.parse(source)
+        exclude = adapter.describe(source)
+        project_name = adapter.project(source)
+        transcript_path = exclude
+    for w in parsed.get("warnings") or []:
+        if w not in warnings:
+            warnings.append(w)
+    measurement = parsed.get("measurement") or "activity_only"
+    data = aggregate(parsed["segments"], pricing)
+    data = apply_measurement_costs(data, measurement)
+    baseline = compute_baseline(pricing, project=project_name, exclude=exclude,
+                                warnings=warnings, runtime=runtime_name)
     # One canonical top-level key in both modes: render_insights footnotes it,
     # and a session-mode reader needs it most -- the baseline scan is the only
     # thing that makes session mode say anything at all.
     skipped = baseline.pop("skipped_transcripts")
     missing_root = baseline.pop("projects_dir_missing")
-    return {"mode": "session",
-            "findings": session_insights(data, baseline, budget=budget),
-            "baseline": baseline,
-            "skipped_transcripts": skipped,
-            "projects_dir_missing": missing_root,
-            "transcript_path": str(t)}
+    out = {"mode": "session",
+           "findings": session_insights(data, baseline, budget=budget),
+           "baseline": baseline,
+           "skipped_transcripts": skipped,
+           "projects_dir_missing": missing_root,
+           "transcript_path": transcript_path,
+           "runtime": runtime_name,
+           "measurement": measurement,
+           "warnings": warnings}
+    return out
 
 
 def insights_caveat(result):
@@ -2367,6 +2455,247 @@ def get_runtime_adapter(name):
         raise ValueError(f"unknown runtime {name!r}") from None
 
 
+RUNTIME_CHOICES = ("claude", "cursor", "auto")
+
+
+def _validate_runtime_name(name):
+    if name not in RUNTIME_CHOICES:
+        sys.exit(f"token-usage: invalid --runtime {name!r} — "
+                 f"use one of: {', '.join(RUNTIME_CHOICES)}")
+
+
+def check_cursor_root(warnings=None):
+    """Like check_projects_root, for Cursor's User data directory."""
+    root = cursor_user_dir()
+    db = root / "globalStorage" / "state.vscdb"
+    ledger = LEDGER_DIR / "cursor"
+    if (db.is_file() and os.access(db, os.R_OK)) or (
+            ledger.is_dir() and os.access(ledger, os.R_OK | os.X_OK)):
+        return None
+    warn(f"no readable Cursor session data at {root}", warnings)
+    return str(root)
+
+
+def apply_measurement_costs(data, measurement):
+    """Activity-only sessions count turns but never carry priced totals."""
+    if measurement != "activity_only":
+        return data
+    for agg in data["by_label"].values():
+        agg["cost_usd"] = None
+        for row in agg.get("models", []):
+            row["cost_usd"] = None
+        for row in agg.get("agents", []):
+            row["cost_usd"] = None
+    data["total"]["cost_usd"] = None
+    data["total"]["cache_savings_usd"] = None
+    for seg in data.get("segments", []):
+        seg["cost_usd"] = None
+    return data
+
+
+def _adapter_source_cache_key(adapter, source):
+    """Stable identity + freshness for adapter summary caches."""
+    if isinstance(source, CursorSession):
+        if source.source == "hook_ledger" and source.ledger_path:
+            p = source.ledger_path
+            return f"{adapter.name}:hook:{source.composer_id}:{p}"
+        if source.source == "cloud_export" and source.export_path:
+            p = source.export_path
+            return f"{adapter.name}:export:{p}"
+        if source.db_path:
+            return f"{adapter.name}:sqlite:{source.composer_id}:{source.db_path}"
+        return f"{adapter.name}:{source.composer_id}:{source.source}"
+    return f"{adapter.name}:{source}"
+
+
+def _adapter_source_stat(adapter, source):
+    if isinstance(source, CursorSession):
+        if source.source == "hook_ledger" and source.ledger_path:
+            return source.ledger_path.stat()
+        if source.source == "cloud_export" and source.export_path:
+            return source.export_path.stat()
+        if source.db_path and source.db_path.is_file():
+            return source.db_path.stat()
+    path = Path(source) if not isinstance(source, Path) else source
+    return path.stat()
+
+
+def _segments_by_day(segments, pricing, measurement):
+    by_day = {}
+    for seg in segments:
+        day = _local_day(seg.get("start_ts"))
+        models = seg["by_model"]
+        merge_by_model(by_day.setdefault(day, {}), models)
+    out = {}
+    for day, models in by_day.items():
+        cost = cost_usd(models, pricing)
+        if measurement == "activity_only":
+            cost = None
+        out[day] = {"usage": sum_buckets(models), "cost_usd": cost}
+    return out
+
+
+def summarize_adapter_source(adapter, source, pricing, warnings=None):
+    """One adapter session -> the same summary shape corpus scans expect."""
+    warnings = warnings if warnings is not None else []
+    parsed = adapter.parse(source)
+    for w in parsed.get("warnings") or []:
+        if w not in warnings:
+            warnings.append(w)
+    measurement = parsed.get("measurement") or "activity_only"
+    segments = parsed.get("segments") or []
+    if not segments:
+        raise UnreadableTranscript("no measurable activity")
+    data = aggregate(segments, pricing)
+    data = apply_measurement_costs(data, measurement)
+    st = _adapter_source_stat(adapter, source)
+    path = adapter.describe(source)
+    return {
+        "version": INDEX_VERSION,
+        "path": path,
+        "mtime_ns": st.st_mtime_ns,
+        "size": st.st_size,
+        "pricing": pricing_fingerprint(pricing),
+        "runtime": adapter.name,
+        "measurement": measurement,
+        "project": adapter.project(source),
+        "first_ts": next((s["start_ts"] for s in segments if s.get("start_ts")), None),
+        "by_label": {label: {"usage": agg["usage"], "cost_usd": agg["cost_usd"],
+                             "invocations": agg["invocations"],
+                             "unpriced": bool(unpriced_models(agg["by_model"], pricing))}
+                     for label, agg in data["by_label"].items()},
+        "by_model": data["total"]["by_model"],
+        "total": {"usage": data["total"]["usage"],
+                  "cost_usd": data["total"]["cost_usd"]},
+        "by_day": _segments_by_day(segments, pricing, measurement),
+    }
+
+
+def cached_adapter_summary(adapter, source, pricing, warnings=None):
+    import hashlib
+    global _CACHE_WRITE_WARNED
+    key = _adapter_source_cache_key(adapter, source)
+    cache_file = (index_dir() / adapter.name
+                  / (hashlib.sha1(key.encode()).hexdigest() + ".json"))
+    st = _adapter_source_stat(adapter, source)
+    if cache_file.exists():
+        try:
+            c = json.loads(cache_file.read_text(encoding="utf-8", errors="replace"))
+            if (isinstance(c, dict) and c.get("version") == INDEX_VERSION
+                    and c.get("mtime_ns") == st.st_mtime_ns
+                    and c.get("size") == st.st_size
+                    and c.get("pricing") == pricing_fingerprint(pricing)):
+                return c, True
+        except (ValueError, OSError):
+            pass
+    s = summarize_adapter_source(adapter, source, pricing, warnings)
+    try:
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        tmp = cache_file.with_suffix(".tmp")
+        tmp.write_text(json.dumps(s), encoding="utf-8")
+        tmp.replace(cache_file)
+    except OSError as e:
+        message = f"cannot write summary cache {cache_file.parent}: {e}"
+        if not _CACHE_WRITE_WARNED:
+            _CACHE_WRITE_WARNED = True
+            warn(message)
+        if warnings is not None and message not in warnings:
+            warnings.append(message)
+    return s, False
+
+
+def iter_adapter_summaries(adapter, pricing, cutoff=None, project=None, exclude=None,
+                           progress=False, skipped=None, warnings=None):
+    """Yield cached_adapter_summary() for every session the adapter discovers."""
+    parsed = 0
+    saw_any = False
+    for source in adapter.iter_sessions(project_dir=project):
+        saw_any = True
+        try:
+            s, hit = cached_adapter_summary(adapter, source, pricing, warnings)
+        except (OSError, ValueError, AttributeError) as e:
+            desc = adapter.describe(source)
+            warn(f"skipping unreadable Cursor session {desc}: {e}")
+            if skipped is not None:
+                skipped.append(desc)
+            continue
+        if progress and not hit:
+            parsed += 1
+            if parsed % 25 == 0:
+                print(f"token-usage: parsed {parsed} sessions…", file=sys.stderr)
+        if exclude and s["path"] == exclude:
+            continue
+        if cutoff and (s["first_ts"] or "") < cutoff:
+            continue
+        if project and project not in s["project"]:
+            continue
+        yield s
+    if not saw_any and adapter.name == "cursor":
+        root = cursor_user_dir()
+        db = root / "globalStorage" / "state.vscdb"
+        if not db.is_file():
+            warn(f"Cursor database not found at {db}", warnings)
+
+
+def _corpus_has_claude_sessions():
+    root = projects_dir()
+    if not root.is_dir() or not os.access(root, os.R_OK | os.X_OK):
+        return False
+    return any(root.glob("*/*.jsonl"))
+
+
+def _corpus_has_cursor_sessions(project_dir=None):
+    adapter = get_runtime_adapter("cursor")
+    for _ in adapter.iter_sessions(project_dir=project_dir):
+        return True
+    return False
+
+
+def resolve_runtime(name, transcript_arg=None, project_dir=None, warnings=None):
+    """Pick one adapter for a single-session command (report/json/insights)."""
+    _validate_runtime_name(name)
+    if name == "auto":
+        claude = None
+        cursor = None
+        if transcript_arg:
+            p = Path(transcript_arg)
+            if p.suffix.lower() == ".jsonl":
+                claude = locate_transcript(transcript_arg, project_dir=project_dir)
+            elif p.suffix.lower() == ".json" and p.is_file():
+                cursor = get_runtime_adapter("cursor").locate(
+                    transcript_arg, project_dir=project_dir)
+            else:
+                claude = locate_transcript(transcript_arg, project_dir=project_dir)
+                cursor = get_runtime_adapter("cursor").locate(
+                    transcript_arg, project_dir=project_dir)
+        else:
+            claude = locate_transcript(transcript_arg, project_dir=project_dir)
+            cursor = get_runtime_adapter("cursor").locate(
+                transcript_arg, project_dir=project_dir)
+        if claude and cursor:
+            sys.exit("token-usage: --runtime auto is ambiguous — both Claude and "
+                     "Cursor sessions match; pass --runtime claude or cursor")
+        if cursor:
+            return get_runtime_adapter("cursor"), "cursor"
+        return get_runtime_adapter("claude"), "claude"
+    return get_runtime_adapter(name), name
+
+
+def resolve_runtime_corpus(name, project_dir=None, warnings=None):
+    """Pick one adapter for corpus scans (history/top_consumers/window insights)."""
+    _validate_runtime_name(name)
+    if name != "auto":
+        return get_runtime_adapter(name), name
+    has_claude = _corpus_has_claude_sessions()
+    has_cursor = _corpus_has_cursor_sessions(project_dir=project_dir)
+    if has_claude and has_cursor:
+        sys.exit("token-usage: --runtime auto is ambiguous — both Claude and "
+                 "Cursor corpora have sessions; pass --runtime claude or cursor")
+    if has_cursor:
+        return get_runtime_adapter("cursor"), "cursor"
+    return get_runtime_adapter("claude"), "claude"
+
+
 def budget_from_env(warnings=None):
     """Session budget from TOKEN_USAGE_BUDGET_USD, or None when unset/unparseable.
     Shared by the CLI, the Stop hook and the MCP server so all three read the
@@ -2562,6 +2891,38 @@ def _run_hook(payload):
     return 0
 
 
+def _add_runtime_arg(parser):
+    parser.add_argument("--runtime", choices=RUNTIME_CHOICES, default="claude",
+                        help="which agent runtime to read (default: claude)")
+
+
+def _session_aggregate(adapter, runtime_name, transcript_arg, pricing, warnings):
+    """Parse one session and return (aggregate dict, measurement, path label)."""
+    if adapter.name == "claude":
+        transcript = resolve_transcript(transcript_arg)
+        parsed = {"segments": parse_session(transcript), "measurement": "exact",
+                  "warnings": []}
+        path_label = str(transcript)
+    else:
+        source = adapter.locate(transcript_arg)
+        if source is None:
+            sys.exit("token-usage: no Cursor session found — pass a composer id, "
+                     "cloud export .json, or configure TOKEN_USAGE_CURSOR_DIR")
+        parsed = adapter.parse(source)
+        path_label = adapter.describe(source)
+    for w in parsed.get("warnings") or []:
+        if w not in warnings:
+            warnings.append(w)
+    measurement = parsed.get("measurement") or "exact"
+    data = aggregate(parsed["segments"], pricing)
+    data = apply_measurement_costs(data, measurement)
+    data["transcript_path"] = path_label
+    data["runtime"] = runtime_name
+    data["measurement"] = measurement
+    data["warnings"] = warnings
+    return data
+
+
 def main():
     ap = argparse.ArgumentParser(prog="token-usage")
     sub = ap.add_subparsers(dest="cmd")
@@ -2572,6 +2933,7 @@ def main():
             p.add_argument("--agents", action="store_true")
             p.add_argument("--models", action="store_true")
         p.add_argument("--diff", nargs=2, metavar=("OLD", "NEW"), default=None)
+        _add_runtime_arg(p)
     sub.add_parser("hook")
     sub.add_parser("cursor-hook")
     h = sub.add_parser("history")
@@ -2580,17 +2942,20 @@ def main():
     h.add_argument("--project", default=None)
     h.add_argument("--json", action="store_true", dest="as_json")
     h.add_argument("--csv", action="store_true", dest="as_csv")
+    _add_runtime_arg(h)
     i = sub.add_parser("insights")
     i.add_argument("transcript", nargs="?", default=None)
     i.add_argument("--since", default=None)
     i.add_argument("--project", default=None)
     i.add_argument("--json", action="store_true", dest="as_json")
+    _add_runtime_arg(i)
     t = sub.add_parser("top_consumers")
     t.add_argument("--by", choices=("session", "command"), default="session")
     t.add_argument("--since", default="30d")
     t.add_argument("--project", default=None)
     t.add_argument("--limit", type=int, default=10)
     t.add_argument("--json", action="store_true", dest="as_json")
+    _add_runtime_arg(t)
     args = ap.parse_args()
 
     if args.cmd == "hook":
@@ -2600,7 +2965,8 @@ def main():
     if args.cmd == "history":
         if args.as_json and args.as_csv:
             sys.exit("token-usage: --json and --csv cannot be combined")
-        data = run_history(by=args.by, since=args.since, project=args.project)
+        data = run_history(by=args.by, since=args.since, project=args.project,
+                           runtime=args.runtime)
         if args.as_json:
             print(json.dumps(data, indent=1))
         elif args.as_csv:
@@ -2617,14 +2983,16 @@ def main():
             sys.exit("token-usage: --project applies to window mode (use --since)")
         budget = budget_from_env()
         result = run_insights(transcript=args.transcript, since=args.since,
-                              project=args.project, budget=budget)
+                              project=args.project, budget=budget,
+                              runtime=args.runtime)
         print(json.dumps(result, indent=1) if args.as_json else render_insights(result))
         return
     if args.cmd == "top_consumers":
         if args.limit < 1:
             sys.exit("token-usage: --limit must be >= 1")
         data = run_top_consumers(by=args.by, since=args.since,
-                                 project=args.project, limit=args.limit)
+                                 project=args.project, limit=args.limit,
+                                 runtime=args.runtime)
         print(json.dumps(data, indent=1) if args.as_json else render_top_consumers(data))
         return
     if getattr(args, "diff", None):
@@ -2635,9 +3003,12 @@ def main():
         d = diff_data(Path(args.diff[0]), Path(args.diff[1]), load_pricing())
         print(json.dumps(d, indent=1) if args.cmd == "json" else render_diff(d))
         return
-    transcript = resolve_transcript(getattr(args, "transcript", None))
-    data = aggregate(parse_session(transcript), load_pricing())
-    data["transcript_path"] = str(transcript)
+    warnings = []
+    pricing = load_pricing(warnings)
+    adapter, runtime_name = resolve_runtime(
+        args.runtime, transcript_arg=getattr(args, "transcript", None), warnings=warnings)
+    data = _session_aggregate(adapter, runtime_name, getattr(args, "transcript", None),
+                              pricing, warnings)
     if args.cmd == "json":
         print(json.dumps(data, indent=1))
     else:
