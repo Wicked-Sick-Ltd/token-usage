@@ -303,6 +303,22 @@ def warnings_note(warnings):
     return f"{len(warnings)} warning(s): " + "; ".join(warnings)
 
 
+def _dedupe_warnings_in_place(warnings):
+    """Keep warning order stable while dropping repeats.
+
+    Any surface that scans the same corpus more than once over one shared list
+    — a live refresh, a dashboard's four groupings — collects the same warning
+    once per pass, and a reader counting them sees that many problems."""
+    seen = set()
+    out = []
+    for w in warnings:
+        if w in seen:
+            continue
+        seen.add(w)
+        out.append(w)
+    warnings[:] = out
+
+
 def merge_by_model(dest, src):
     for model, bucket in src.items():
         d = dest.setdefault(model, empty_usage())
@@ -1323,6 +1339,10 @@ def dashboard_data(runtime="claude", since=None, project=None, project_dir=None,
     if runtime_name != "claude":
         out["runtime"] = runtime_name
     _enrich_dashboard_partials(out, scan, warnings)
+    # One page, five scans of the same corpus over one shared list: a missing
+    # root or an unreadable session announced itself once per scan, so the
+    # footnote read as five separate problems.
+    _dedupe_warnings_in_place(warnings)
     return out
 
 
@@ -1372,9 +1392,19 @@ def _dashboard_footnote_source(data):
 
 
 def _dashboard_activity_only(data):
+    """True only when EVERY scanned session was activity-only.
+
+    Blanking the cards and flattening the chart is the right answer for a
+    corpus nobody measured, and the wrong one for a corpus with a single
+    unmeasured session in it: the measured sessions really were measured, and
+    throwing their totals away to protect the reader from one weak session
+    tells them they spent nothing. A mixed scan keeps its numbers and
+    discloses the lower bound through the scan footnote, which counts the
+    sessions behind each level."""
     counts = data.get("measurements") or {}
-    if counts.get("activity_only"):
-        return True
+    measured = {level for level, n in counts.items() if n}
+    if measured:
+        return measured == {"activity_only"}
     return data["summary"].get("measurement") == "activity_only"
 
 
@@ -1420,12 +1450,12 @@ def _dashboard_svg_chart(by_day, activity_only):
         x = pad + i * bar_w + bar_w * 0.1
         w = bar_w * 0.8
         y = pad + plot_h - bar_h
-        label = html.escape(str(row["key"]))
         title = html.escape(f"{row['key']}: {fmt_cost(row['cost_usd'])}")
         parts.append(
             f'<rect x="{x:.1f}" y="{y:.1f}" width="{w:.1f}" height="{bar_h:.1f}" '
             f'class="bar"><title>{title}</title></rect>'
         )
+        label = html.escape(str(row["key"]))
         parts.append(
             f'<text x="{x + w / 2:.1f}" y="{height - 8}" text-anchor="middle" '
             f'class="axis">{label}</text>'
@@ -3977,18 +4007,6 @@ def run_live(transcript=None, runtime="claude", interval=2.0, iterations=None,
         if iterations is not None and done >= iterations:
             break
         sleep_fn(interval)
-
-
-def _dedupe_warnings_in_place(warnings):
-    """Keep warning order stable while dropping repeats across live refreshes."""
-    seen = set()
-    out = []
-    for w in warnings:
-        if w in seen:
-            continue
-        seen.add(w)
-        out.append(w)
-    warnings[:] = out
 
 
 def _session_aggregate(adapter, runtime_name, transcript_arg, pricing, warnings):
