@@ -887,6 +887,7 @@ def test_session_cost_claude_default_omits_runtime_key(mcp, tmp_path, monkeypatc
     _proj, s1, _s2 = seed(tmp_path, monkeypatch)
     data = json.loads(call(mcp, "session_cost", transcript=str(s1))[0])
     assert "runtime" not in data
+    assert "measurement" not in data
     assert data["resolved_via"] == "explicit"
 
 
@@ -915,6 +916,52 @@ def test_top_consumers_runtime_cursor(mcp, tmp_path, monkeypatch):
     data = json.loads(call(mcp, "top_consumers", runtime="cursor", since="2020-01-01")[0])
     assert data["runtime"] == "cursor"
     assert len(data["rows"]) >= 1
+
+
+def test_diff_runtime_auto_rejects_mixed_claude_and_cursor(mcp, tmp_path, monkeypatch):
+    from test_cursor_adapter import build_cursor_tree
+
+    _proj, s1, _s2 = seed(tmp_path, monkeypatch)
+    build_cursor_tree(tmp_path / "cursor-user")
+    monkeypatch.setenv("TOKEN_USAGE_CURSOR_DIR", str(tmp_path / "cursor-user"))
+    text, err = call(mcp, "diff", runtime="auto", old=str(s1), new="comp-usage-001")
+    assert err and "cannot mix" in text.lower()
+
+
+def test_diff_runtime_cursor_explicit(mcp, tmp_path, monkeypatch):
+    from test_cursor_adapter import build_cursor_tree
+
+    cursor_root = tmp_path / "cursor-user"
+    build_cursor_tree(cursor_root, composer_id="comp-a")
+    build_cursor_tree(cursor_root, composer_id="comp-b")
+    monkeypatch.setenv("TOKEN_USAGE_CURSOR_DIR", str(cursor_root))
+    monkeypatch.setenv("TOKEN_USAGE_LEDGER_DIR", str(tmp_path / "cache"))
+    data = json.loads(call(mcp, "diff", runtime="cursor",
+                           old="comp-a", new="comp-b")[0])
+    assert data["runtime"] == "cursor"
+    assert "rows" in data
+
+
+def test_history_runtime_auto_uses_claude_when_project_hint_excludes_cursor(
+    mcp, tmp_path, monkeypatch,
+):
+    from test_cursor_adapter import build_cursor_tree
+
+    seed(tmp_path, monkeypatch)
+    build_cursor_tree(tmp_path / "cursor-user")
+    monkeypatch.setenv("TOKEN_USAGE_CURSOR_DIR", str(tmp_path / "cursor-user"))
+    monkeypatch.setenv("TOKEN_USAGE_PROJECT_DIR", "/Users/x/alpha")
+    data = json.loads(call(mcp, "history", runtime="auto", since="2026-01-01")[0])
+    assert "runtime" not in data
+    assert len(data["rows"]) >= 1
+
+
+def test_insights_runtime_cursor_window_mode(mcp, tmp_path, monkeypatch):
+    seed_cursor(tmp_path, monkeypatch)
+    data = json.loads(call(mcp, "insights", runtime="cursor", since="2020-01-01")[0])
+    assert data["mode"] == "window"
+    assert data["runtime"] == "cursor"
+    assert isinstance(data["warnings"], list)
 
 
 def test_claude_project_dir_does_not_select_cursor_sessions(mcp, tmp_path, monkeypatch):

@@ -955,10 +955,15 @@ def iter_summaries(pricing, cutoff=None, project=None, exclude=None, progress=Fa
         yield s
 
 
-def run_history(by="project", since=None, project=None, warnings=None, runtime="claude"):
+def run_history(by="project", since=None, project=None, warnings=None, runtime="claude",
+                corpus_project_dir=None, corpus_resolution=None):
     pricing = load_pricing(warnings)
     cutoff = since_cutoff(since)
-    adapter, runtime_name = resolve_runtime_corpus(runtime, warnings=warnings)
+    if corpus_resolution is not None:
+        adapter, runtime_name = corpus_resolution
+    else:
+        adapter, runtime_name = resolve_runtime_corpus(
+            runtime, project_dir=corpus_project_dir, warnings=warnings)
     skipped = []
     if adapter.name == "claude":
         missing_root = check_projects_root(warnings)
@@ -1112,12 +1117,16 @@ def render_history(data):
 
 
 def run_top_consumers(by="session", since="30d", project=None, limit=10, warnings=None,
-                      runtime="claude"):
+                      runtime="claude", corpus_project_dir=None, corpus_resolution=None):
     """Costliest sessions (by="session") or command labels aggregated across
     sessions (by="command") in a window. Unpriced rows sort last."""
     pricing = load_pricing(warnings)
     cutoff = since_cutoff(since)
-    adapter, runtime_name = resolve_runtime_corpus(runtime, warnings=warnings)
+    if corpus_resolution is not None:
+        adapter, runtime_name = corpus_resolution
+    else:
+        adapter, runtime_name = resolve_runtime_corpus(
+            runtime, project_dir=corpus_project_dir, warnings=warnings)
     skipped = []
     if adapter.name == "claude":
         missing_root = check_projects_root(warnings)
@@ -1252,7 +1261,7 @@ def _median(xs):
 
 
 def compute_baseline(pricing, project, days=30, exclude=None, warnings=None,
-                     runtime="claude"):
+                     runtime="claude", corpus_project_dir=None):
     """Per-project norms from the history index (median session cost; per-command
     median cost and cache-read ratio) over the trailing `days`, excluding the
     transcript at `exclude` (the session being analysed).
@@ -1263,7 +1272,8 @@ def compute_baseline(pricing, project, days=30, exclude=None, warnings=None,
     so a thinned corpus and a genuinely unremarkable session look identical
     without them."""
     cutoff = since_cutoff(f"{days}d")
-    adapter, _ = resolve_runtime_corpus(runtime, warnings=warnings)
+    adapter, _ = resolve_runtime_corpus(runtime, project_dir=corpus_project_dir,
+                                        warnings=warnings)
     skipped = []
     if adapter.name == "claude":
         missing_root = check_projects_root(warnings)
@@ -1455,12 +1465,16 @@ def window_insights(summaries, cutoff, pricing, now=None, halves=None):
 
 
 def run_insights(transcript=None, since=None, project=None, budget=None, warnings=None,
-                 runtime="claude"):
+                 runtime="claude", corpus_project_dir=None, corpus_resolution=None):
     pricing = load_pricing(warnings)
     warnings = warnings if warnings is not None else []
     if since:
         cutoff = since_cutoff(since)
-        adapter, runtime_name = resolve_runtime_corpus(runtime, warnings=warnings)
+        if corpus_resolution is not None:
+            adapter, runtime_name = corpus_resolution
+        else:
+            adapter, runtime_name = resolve_runtime_corpus(
+                runtime, project_dir=corpus_project_dir, warnings=warnings)
         skipped = []
         if adapter.name == "claude":
             missing_root = check_projects_root(warnings)
@@ -1530,7 +1544,8 @@ def run_insights(transcript=None, since=None, project=None, budget=None, warning
     data = aggregate(parsed["segments"], pricing)
     data = apply_measurement_costs(data, measurement)
     baseline = compute_baseline(pricing, project=project_name, exclude=exclude,
-                                warnings=warnings, runtime=runtime_name)
+                                warnings=warnings, runtime=runtime_name,
+                                corpus_project_dir=corpus_project_dir)
     # One canonical top-level key in both modes: render_insights footnotes it,
     # and a session-mode reader needs it most -- the baseline scan is the only
     # thing that makes session mode say anything at all.

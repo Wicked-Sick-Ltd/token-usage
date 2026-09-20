@@ -420,11 +420,16 @@ def pick_session(runtime, path=None, session_id=None, warnings=None):
 
 
 def resolve_corpus_runtime(runtime, warnings=None):
+    """Corpus auto/claude/cursor resolution with MCP project-dir hint (runtime-local)."""
     project_dir = project_dir_from_env()
     try:
         return tu.resolve_runtime_corpus(runtime, project_dir=project_dir, warnings=warnings)
     except SystemExit as e:
         _runtime_exit_as_tool_error(e)
+
+
+def _corpus_kwargs(args, warnings):
+    return {"corpus_resolution": resolve_corpus_runtime(runtime_from_args(args), warnings)}
 
 
 def session_payload(adapter, runtime_name, source, via, pricing, warnings,
@@ -444,9 +449,9 @@ def session_payload(adapter, runtime_name, source, via, pricing, warnings,
     data = tu.apply_measurement_costs(data, measurement)
     data["transcript"] = data["transcript_path"] = path_label
     data["resolved_via"] = via
-    data["measurement"] = measurement
     if runtime_name != "claude":
         data["runtime"] = runtime_name
+        data["measurement"] = measurement
     return data
 
 
@@ -527,15 +532,21 @@ def _looks_like_path(value):
     return value.endswith(".jsonl") or any(sep in value for sep in seps)
 
 
-def _path_or_id(value, runtime):
-    """diff accepts either form per side: a path-shaped value is a path, else a session id."""
+def _diff_selector(value):
     if not value.strip():
         raise ToolError("old/new must not be blank")
     path = value if _looks_like_path(value) or value.endswith(".json") else None
     session_id = value if path is None else None
-    _adapter, _runtime_name, source, _via = pick_session(
-        runtime, path, session_id)
-    return _adapter, source
+    return path, session_id
+
+
+def _resolve_diff_side(value, runtime, warnings=None):
+    """One diff side: (adapter, source, resolved_runtime_name)."""
+    path, session_id = _diff_selector(value)
+    pick = "auto" if runtime == "auto" else runtime
+    adapter, runtime_name, source, _via = pick_session(
+        pick, path, session_id, warnings=warnings)
+    return adapter, source, runtime_name
 
 
 def _diff_aggregate(adapter, source, pricing, warnings):
@@ -571,10 +582,14 @@ def _diff_from_aggregates(a, b):
 def tool_diff(args):
     warnings = []
     runtime = runtime_from_args(args)
-    old_ad, old_src = _path_or_id(args["old"], runtime)
-    new_ad, new_src = _path_or_id(args["new"], runtime)
+    old_ad, old_src, _old_rn = _resolve_diff_side(args["old"], runtime, warnings)
+    new_ad, new_src, _new_rn = _resolve_diff_side(args["new"], runtime, warnings)
+    if old_ad.name != new_ad.name:
+        raise ToolError("diff cannot mix Claude and Cursor sessions"
+                        + ("; pass runtime claude or cursor"
+                           if runtime == "auto" else ""))
     pricing = tu.load_pricing(warnings)
-    if old_ad.name == "claude" and new_ad.name == "claude":
+    if old_ad.name == "claude":
         data = tu.diff_data(old_src, new_src, pricing)
     else:
         a = _diff_aggregate(old_ad, old_src, pricing, warnings)
@@ -590,7 +605,7 @@ def tool_history(args):
     check_since(args.get("since"))
     data = tu.run_history(by=args.get("by", "project"), since=args.get("since"),
                           project=args.get("project"), warnings=warnings,
-                          runtime=runtime_from_args(args))
+                          runtime=runtime_from_args(args), **_corpus_kwargs(args, warnings))
     return finish(data, tu.render_history, args.get("format"), warnings)
 
 
@@ -614,14 +629,15 @@ def tool_insights(args):
     if args.get("since"):
         data = tu.run_insights(since=args["since"], project=args.get("project"),
                                budget=budget, warnings=warnings,
-                               runtime=runtime_from_args(args))
+                               runtime=runtime_from_args(args),
+                               **_corpus_kwargs(args, warnings))
     else:
         runtime = runtime_from_args(args)
         adapter, runtime_name, source, via = pick_session(
             runtime, args.get("transcript"), args.get("session_id"), warnings=warnings)
         transcript_arg = str(source) if adapter.name == "claude" else source
         data = tu.run_insights(transcript=transcript_arg, budget=budget, warnings=warnings,
-                               runtime=runtime)
+                               runtime=runtime, corpus_project_dir=project_dir_from_env())
         data["transcript"] = (str(source) if adapter.name == "claude"
                               else adapter.describe(source))
         data["resolved_via"] = via
@@ -638,7 +654,8 @@ def tool_top_consumers(args):
     check_since(since)
     data = tu.run_top_consumers(by=args.get("by", "session"), since=since,
                                 project=args.get("project"), limit=args.get("limit", 10),
-                                warnings=warnings, runtime=runtime_from_args(args))
+                                warnings=warnings, runtime=runtime_from_args(args),
+                                **_corpus_kwargs(args, warnings))
     return finish(data, tu.render_top_consumers, args.get("format"), warnings)
 
 
