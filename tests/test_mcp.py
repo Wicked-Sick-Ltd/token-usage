@@ -1031,6 +1031,17 @@ def test_session_cost_auto_bogus_selector_is_a_clean_tool_error(mcp, tmp_path,
     assert "Traceback" not in capsys.readouterr().err
 
 
+def test_cursor_session_id_not_in_the_database_fails_closed(mcp, tmp_path, monkeypatch):
+    # The composer id was taken on trust, so an id from another machine
+    # produced an empty "session" instead of saying it does not exist.
+    seed_cursor(tmp_path, monkeypatch)
+    text, err = call(mcp, "session_cost", runtime="cursor",
+                     session_id="comp-from-another-machine")
+    assert err, text
+    assert "comp-from-another-machine" in text
+    assert "Refactor token parser" not in text
+
+
 def test_serve_exits_cleanly_when_stdin_is_none(mcp, monkeypatch):
     # A process started with stdin closed (`python mcp_server.py 0<&-`) gets
     # sys.stdin is None; both _resilient_stdin fallbacks handed that straight

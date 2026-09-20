@@ -385,3 +385,47 @@ def test_auto_corpus_probe_survives_a_corrupt_cursor_database(tmp_path):
     data = json.loads(r.stdout)
     assert "runtime" not in data
     assert len(data["rows"]) == 1
+
+
+def hook_ledger_corpus(tu, tmp_path, monkeypatch, project=None):
+    """A Cursor corpus whose only session is a dated hook ledger."""
+    from test_cursor_adapter import ledger_record, write_ledger
+
+    monkeypatch.setenv("TOKEN_USAGE_LEDGER_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("TOKEN_USAGE_CURSOR_DIR", str(tmp_path / "cursor-user"))
+    roots = [str(project)] if project else None
+    extra = {"workspace_roots": roots} if roots else {}
+    return write_ledger(tu, tmp_path / "cache", "conv-window", [
+        ledger_record("beforeSubmitPrompt", conversation_id="conv-window",
+                      ts="2026-06-12T10:00:00Z", prompt="ship the adapter", **extra),
+        ledger_record("stop", conversation_id="conv-window", ts="2026-06-12T10:00:30Z",
+                      model="claude-sonnet-4",
+                      tokens={"input_tokens": 500, "output_tokens": 100}, **extra),
+    ])
+
+
+def test_hook_ledger_session_respects_since_and_day_windows(tu, tmp_path, monkeypatch):
+    hook_ledger_corpus(tu, tmp_path, monkeypatch)
+    inside = tu.run_history(by="day", since="2026-01-01", runtime="cursor")
+    assert [r["key"] for r in inside["rows"]] == [tu._local_day("2026-06-12T10:00:00Z")]
+    assert inside["rows"][0]["usage"]["output"] == 100
+    outside = tu.run_history(by="day", since="2026-07-01", runtime="cursor")
+    assert outside["rows"] == []
+
+
+def test_hook_ledger_top_consumer_uses_the_conversation_id(tu, tmp_path, monkeypatch):
+    # The row used to be keyed by the hashed ledger filename stem, which is
+    # not an id anything else in the tool accepts.
+    hook_ledger_corpus(tu, tmp_path, monkeypatch)
+    data = tu.run_top_consumers(by="session", since="2026-01-01", runtime="cursor")
+    assert [r["session_id"] for r in data["rows"]] == ["conv-window"]
+    assert data["measurements"] == {"exact": 1}
+
+
+def test_hook_ledger_history_rolls_up_under_its_workspace_project(tu, tmp_path,
+                                                                  monkeypatch):
+    project = tmp_path / "alpha-repo"
+    project.mkdir()
+    hook_ledger_corpus(tu, tmp_path, monkeypatch, project=project)
+    data = tu.run_history(by="project", runtime="cursor")
+    assert [r["key"] for r in data["rows"]] == [tu.project_slug(str(project.resolve()))]
