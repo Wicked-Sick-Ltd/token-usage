@@ -1529,7 +1529,10 @@ def run_insights(transcript=None, since=None, project=None, budget=None, warning
         project_name = adapter.project(source)
         transcript_path = exclude
     else:
-        source = adapter.locate(transcript)
+        try:
+            source = adapter.locate(transcript)
+        except CursorExplicitSelectorError as e:
+            sys.exit(str(e))
         if source is None:
             sys.exit(CURSOR_CLI_SESSION_NOT_FOUND)
         parsed = adapter.parse(source)
@@ -1808,6 +1811,14 @@ CURSOR_CLI_SESSION_NOT_FOUND = (
     "TOKEN_USAGE_CURSOR_DIR). Composer IDs are accepted via MCP session_id only, "
     "not as a CLI positional argument."
 )
+
+
+class CursorExplicitSelectorError(Exception):
+    """Non-empty CLI/MCP path selector did not resolve to a Cloud export .json file."""
+
+
+def _cursor_fail_explicit_selector(message):
+    raise CursorExplicitSelectorError(f"token-usage: {message}")
 
 
 def cursor_user_dir():
@@ -2426,20 +2437,33 @@ class CursorAdapter(RuntimeAdapter):
     name = "cursor"
 
     def locate(self, arg=None, session_id=None, project_dir=None):
-        if arg:
-            path = Path(arg).expanduser()
-            if path.is_file():
-                if path.suffix.lower() == ".json":
-                    try:
-                        data = json.loads(path.read_text(encoding="utf-8",
-                                                         errors="replace"))
-                    except (OSError, ValueError):
-                        return None
-                    cid = (data.get("id") or data.get("conversation_id")
-                           or path.stem)
-                    return CursorSession(str(cid), "cloud_export",
-                                         export_path=path)
-                return None
+        if arg is not None and str(arg).strip():
+            explicit = str(arg).strip()
+            path = Path(explicit).expanduser()
+            if not path.is_file():
+                _cursor_fail_explicit_selector(
+                    f"Cursor export not found: {explicit!r} — expected an existing "
+                    ".json Cloud Agent export file (omit the selector for local "
+                    "discovery; composer IDs use MCP session_id only)"
+                )
+            if path.suffix.lower() != ".json":
+                _cursor_fail_explicit_selector(
+                    f"Cursor explicit selector must be a .json Cloud Agent export, "
+                    f"not {path.suffix!r} ({path})"
+                )
+            try:
+                data = json.loads(path.read_text(encoding="utf-8",
+                                                 errors="replace"))
+            except (OSError, ValueError):
+                _cursor_fail_explicit_selector(
+                    f"Cursor export is not readable JSON: {path}"
+                )
+            if not isinstance(data, dict):
+                _cursor_fail_explicit_selector(
+                    f"Cursor export must be a JSON object: {path}"
+                )
+            cid = (data.get("id") or data.get("conversation_id") or path.stem)
+            return CursorSession(str(cid), "cloud_export", export_path=path)
         if session_id:
             root = cursor_user_dir()
             db = _cursor_global_db_path(root)
@@ -3001,7 +3025,10 @@ def _session_aggregate(adapter, runtime_name, transcript_arg, pricing, warnings)
                   "warnings": []}
         path_label = str(transcript)
     else:
-        source = adapter.locate(transcript_arg)
+        try:
+            source = adapter.locate(transcript_arg)
+        except CursorExplicitSelectorError as e:
+            sys.exit(str(e))
         if source is None:
             sys.exit(CURSOR_CLI_SESSION_NOT_FOUND)
         parsed = adapter.parse(source)

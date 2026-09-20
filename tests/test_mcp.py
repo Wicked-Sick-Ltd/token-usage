@@ -869,6 +869,14 @@ def test_invalid_runtime_is_a_tool_error(mcp, tmp_path, monkeypatch):
     assert err and "runtime must be one of" in text
 
 
+def test_session_cost_cursor_explicit_bogus_transcript_fails_closed(mcp, tmp_path, monkeypatch):
+    seed_cursor(tmp_path, monkeypatch)
+    text, err = call(mcp, "session_cost", runtime="cursor",
+                     transcript="comp-not-a-file-on-disk")
+    assert err, text
+    assert "Refactor token parser" not in text
+
+
 def test_session_cost_runtime_cursor_discloses_fields(mcp, tmp_path, monkeypatch):
     seed_cursor(tmp_path, monkeypatch)
     text, err = call(mcp, "session_cost", runtime="cursor",

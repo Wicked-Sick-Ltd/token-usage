@@ -17,6 +17,9 @@ adheres to [Semantic Versioning](https://semver.org/).
 - **Cursor CLI session errors** — messages no longer imply a bare composer id works
   as a positional selector; document `.json` export paths, local discovery, and MCP
   `session_id`.
+- **Cursor explicit selector fallthrough** — a non-empty CLI/MCP `transcript` path
+  must resolve to an existing Cloud export `.json`; bogus paths no longer silently
+  analyze the latest local session. `session_id` composer lookup unchanged.
 
 ### Changed
 

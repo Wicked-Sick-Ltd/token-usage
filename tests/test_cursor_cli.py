@@ -73,6 +73,29 @@ def test_json_runtime_cursor_includes_runtime_fields(tmp_path):
     assert "by_label" in data
 
 
+def test_explicit_bogus_selector_fails_closed_not_latest_session(tmp_path):
+    cursor_root = tmp_path / "cursor-user"
+    build_cursor_tree(cursor_root)
+    bogus_selector = "comp-not-a-file-on-disk"
+    r = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "report",
+            "--runtime",
+            "cursor",
+            bogus_selector,
+        ],
+        capture_output=True,
+        text=True,
+        env=_env(tmp_path, cursor_root),
+        check=False,
+    )
+    assert r.returncode != 0, r.stdout
+    assert "Refactor token parser" not in r.stdout
+    assert ".json" in r.stderr.lower()
+
+
 def test_cursor_no_session_error_documents_json_or_discovery_not_composer_positional(
     tmp_path,
 ):
@@ -95,10 +118,9 @@ def test_cursor_no_session_error_documents_json_or_discovery_not_composer_positi
     )
     assert r.returncode != 0
     err = r.stderr.lower()
-    assert "not as a cli positional" in err
+    assert "export not found" in err
     assert ".json" in err
     assert "session_id" in err
-    assert "local discovery" in err
 
 
 def test_invalid_runtime_rejected(tmp_path):

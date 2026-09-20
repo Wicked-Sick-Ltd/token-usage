@@ -81,6 +81,17 @@ def test_cursor_adapter_registered(tu):
     assert adapter.name == "cursor"
 
 
+def test_locate_explicit_bogus_id_does_not_fall_through_to_latest(tu, tmp_path, monkeypatch):
+    cursor_root = tmp_path / "cursor-user"
+    build_cursor_tree(cursor_root)
+    monkeypatch.setenv("TOKEN_USAGE_CURSOR_DIR", str(cursor_root))
+    adapter = tu.get_runtime_adapter("cursor")
+    with pytest.raises(tu.CursorExplicitSelectorError):
+        adapter.locate("comp-not-a-file-on-disk")
+    latest = adapter.locate()
+    assert latest.composer_id == "comp-usage-001"
+
+
 def test_cursor_user_dir_override(tu, monkeypatch, tmp_path):
     monkeypatch.setenv("TOKEN_USAGE_CURSOR_DIR", str(tmp_path / "cursor-user"))
     assert tu.cursor_user_dir() == (tmp_path / "cursor-user").resolve()

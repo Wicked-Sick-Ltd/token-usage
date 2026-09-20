@@ -347,7 +347,10 @@ def pick_cursor_session(path=None, session_id=None, project_dir=None):
     if path and session_id:
         raise ToolError("pass transcript OR session_id, not both")
     if path:
-        source = adapter.locate(path.strip(), project_dir=project_dir)
+        try:
+            source = adapter.locate(path.strip(), project_dir=project_dir)
+        except tu.CursorExplicitSelectorError as e:
+            raise ToolError(str(e).replace("token-usage: ", "", 1)) from None
         if source is None:
             raise ToolError(f"transcript not found: {path}")
         return source, "explicit"
