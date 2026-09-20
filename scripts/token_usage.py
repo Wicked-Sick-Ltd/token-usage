@@ -1751,6 +1751,19 @@ def write_text_output(text, output_path):
     atomic_write_text(path, text)
 
 
+def write_output_or_exit(text, output_path):
+    """write_text_output at the CLI boundary.
+
+    A misspelled directory, an --output that names an existing directory, a
+    read-only volume: all user mistakes, and all of them used to unwind a
+    traceback ending somewhere in pathlib. Diagnose them the way every other
+    bad argument is diagnosed — one line naming the path and the reason."""
+    try:
+        write_text_output(text, output_path)
+    except OSError as e:
+        sys.exit(f"token-usage: cannot write {output_path}: {e.strerror or e}")
+
+
 EXPORT_SCHEMA = "token-usage.aggregate.v1"
 
 
@@ -4279,7 +4292,7 @@ def main():
                               project=args.project, project_dir=None,
                               warnings=warnings)
         html_text = render_dashboard(data)
-        write_text_output(html_text, args.output)
+        write_output_or_exit(html_text, args.output)
         return
     if args.cmd == "live":
         if args.interval <= 0:
@@ -4326,7 +4339,7 @@ def main():
                 runtime=args.runtime, warnings=warnings)
             records = history_export_records(
                 export_data, measurement_counts=measurement_counts)
-        write_text_output(render_jsonl(records), args.output)
+        write_output_or_exit(render_jsonl(records), args.output)
         return
     if getattr(args, "diff", None):
         if getattr(args, "transcript", None):

@@ -210,6 +210,90 @@ def test_write_text_output_survives_a_temp_file_that_is_already_gone(
         tu.write_text_output("<html>new</html>", out)
 
 
+def _unwritable_output(tmp_path):
+    """An --output path whose parent is a regular file.
+
+    Chosen over chmod because root ignores directory permissions, so a
+    permission-based fixture would silently pass rather than run."""
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory", encoding="utf-8")
+    return blocker / "out"
+
+
+@pytest.mark.parametrize("cmd", [
+    ["dashboard", "--since", "36500d"],
+    ["export", "--scope", "history", "--since", "36500d"],
+])
+def test_cli_unwritable_output_exits_cleanly(tu, tmp_path, monkeypatch, cmd):
+    # An unwritable --output is a user mistake, not a bug: it deserves the
+    # same one-line diagnosis every other bad argument gets, not a traceback
+    # ending in a pathlib frame.
+    seed_projects(tmp_path, monkeypatch)
+    target = _unwritable_output(tmp_path)
+    r = subprocess.run(
+        [sys.executable, str(SCRIPT), *cmd, "--output", str(target)],
+        capture_output=True, text=True, check=False,
+        env={**os.environ,
+             "TOKEN_USAGE_PROJECTS_DIR": str(tmp_path / "projects"),
+             "TOKEN_USAGE_LEDGER_DIR": str(tmp_path / "cache")},
+    )
+    assert r.returncode != 0
+    assert "Traceback" not in r.stderr
+    assert f"token-usage: cannot write {target}" in r.stderr
+    assert r.stdout == ""
+
+
+@pytest.mark.parametrize("cmd", [
+    ["dashboard", "--since", "36500d"],
+    ["export", "--scope", "history", "--since", "36500d"],
+])
+def test_cli_output_onto_a_directory_exits_cleanly(tu, tmp_path, monkeypatch, cmd):
+    seed_projects(tmp_path, monkeypatch)
+    target = tmp_path / "a-directory"
+    target.mkdir()
+    r = subprocess.run(
+        [sys.executable, str(SCRIPT), *cmd, "--output", str(target)],
+        capture_output=True, text=True, check=False,
+        env={**os.environ,
+             "TOKEN_USAGE_PROJECTS_DIR": str(tmp_path / "projects"),
+             "TOKEN_USAGE_LEDGER_DIR": str(tmp_path / "cache")},
+    )
+    assert r.returncode != 0
+    assert "Traceback" not in r.stderr
+    assert f"token-usage: cannot write {target}" in r.stderr
+
+
+def test_cli_unwritable_output_names_the_underlying_reason(tu, tmp_path, monkeypatch):
+    # "cannot write X" without the errno leaves the user guessing between a
+    # typo, a permission problem and a full disk.
+    seed_projects(tmp_path, monkeypatch)
+    target = _unwritable_output(tmp_path)
+    r = subprocess.run(
+        [sys.executable, str(SCRIPT), "dashboard", "--since", "36500d",
+         "--output", str(target)],
+        capture_output=True, text=True, check=False,
+        env={**os.environ,
+             "TOKEN_USAGE_PROJECTS_DIR": str(tmp_path / "projects"),
+             "TOKEN_USAGE_LEDGER_DIR": str(tmp_path / "cache")},
+    )
+    assert "Not a directory" in r.stderr or "File exists" in r.stderr
+
+
+def test_cli_dashboard_still_writes_a_good_output_path(tu, tmp_path, monkeypatch):
+    seed_projects(tmp_path, monkeypatch)
+    out = tmp_path / "nested" / "dash.html"
+    r = subprocess.run(
+        [sys.executable, str(SCRIPT), "dashboard", "--since", "36500d",
+         "--output", str(out)],
+        capture_output=True, text=True, check=False,
+        env={**os.environ,
+             "TOKEN_USAGE_PROJECTS_DIR": str(tmp_path / "projects"),
+             "TOKEN_USAGE_LEDGER_DIR": str(tmp_path / "cache")},
+    )
+    assert r.returncode == 0, r.stderr
+    assert out.read_text(encoding="utf-8").startswith("<!DOCTYPE html>")
+
+
 def test_write_text_output_stdout(tu, tmp_path, capsys):
     tu.write_text_output("<html>stdout</html>", "-")
     captured = capsys.readouterr()
