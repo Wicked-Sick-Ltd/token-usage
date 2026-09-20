@@ -593,9 +593,15 @@ def test_warning_dedup_scope_still_collects_every_occurrence(tu, capsys):
 
 
 def test_warning_dedup_scope_is_released_when_the_body_raises(tu, capsys):
-    with pytest.raises(ValueError), tu.deduped_warnings():
-        tu.warn("noted once")
-        raise ValueError("boom")
+    caught = None
+    try:
+        with tu.deduped_warnings():
+            tu.warn("noted once")
+            raise ValueError("boom")
+    except ValueError as exc:
+        caught = exc
+    assert caught is not None and str(caught) == "boom"
+    # Drain the in-scope warning so the post-release prints are counted alone.
     capsys.readouterr()
     tu.warn("noted once")
     tu.warn("noted once")

@@ -2932,6 +2932,9 @@ def _cursor_ledger_meta(path):
                 if conversation_id and roots and first_ts:
                     break
     except OSError:
+        # Missing or unreadable ledgers are expected (fresh install, vanished
+        # mid-scan). Fall through with filename-derived identity and whatever
+        # metadata we collected before the read failed.
         pass
     return (conversation_id or Path(path).stem), roots, first_ts
 
@@ -3101,6 +3104,8 @@ def _append_cursor_hook_line(ledger_path, record):
         try:
             os.chmod(parent, 0o700)
         except OSError:
+            # Best-effort permission hardening only; continue on platforms
+            # or filesystems where chmod is unsupported or denied.
             pass
     line = json.dumps(record, separators=(",", ":")) + "\n"
     with open(ledger_path, "a", encoding="utf-8") as handle:
@@ -3109,6 +3114,9 @@ def _append_cursor_hook_line(ledger_path, record):
         try:
             os.fsync(handle.fileno())
         except OSError:
+            # fsync is durability, not correctness: the line is already in
+            # the FILE* buffer (and flushed). Fail open so a hook never
+            # blocks the session on a filesystem that cannot sync.
             pass
 
 
@@ -3760,6 +3768,8 @@ def cached_adapter_summary(adapter, source, pricing, warnings=None):
                     and c.get("pricing") == pricing_fingerprint(pricing)):
                 return c, True
         except (ValueError, OSError):
+            # Unreadable or malformed cache is a miss: recompute the summary
+            # rather than failing the scan.
             pass
     s = summarize_adapter_source(adapter, source, pricing, warnings)
     try:
