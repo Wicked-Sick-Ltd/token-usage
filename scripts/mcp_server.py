@@ -2,7 +2,7 @@
 """token-usage MCP server — stdio JSON-RPC 2.0 front-end for token_usage.py.
 
 Exposes cost queries as MCP tools (session_cost, history, insights, diff,
-top_consumers). Claude Code starts it from the plugin's .mcp.json; Claude
+top_consumers). Claude Code starts it from the plugin's .claude-plugin/plugin.json; Claude
 desktop can register it as a local stdio server. Stdlib only, Python 3.9+.
 
 Framing: one JSON-RPC object per line on stdin/stdout. stdout carries
@@ -301,7 +301,7 @@ def serve(stdin=None, stdout=None):
 def project_dir_from_env():
     """The project dir to anchor default session resolution on, or None.
 
-    TOKEN_USAGE_PROJECT_DIR first (the plugin's .mcp.json sets it from
+    TOKEN_USAGE_PROJECT_DIR first (the plugin's .claude-plugin/plugin.json sets it from
     ${CLAUDE_PROJECT_DIR}), then CLAUDE_PROJECT_DIR itself, which Claude Code
     exports to stdio MCP servers from 2.1.139 — so a user-scope registration
     with no env block is anchored too. A value that is blank or still carries
