@@ -126,6 +126,8 @@ def test_tools_list_names_and_schema_shape(mcp):
         assert s["type"] == "object" and s["additionalProperties"] is False
         assert "format" in s["properties"]
         assert s["properties"]["format"]["enum"] == ["json", "markdown"]
+        rt = s["properties"]["runtime"]
+        assert rt["enum"] == ["claude", "cursor", "auto"]
     by_name = {t["name"]: t for t in tools}
     assert by_name["diff"]["inputSchema"]["required"] == ["old", "new"]
     assert by_name["history"]["inputSchema"]["properties"]["by"]["enum"] == \
@@ -846,6 +848,85 @@ def test_overflowing_since_is_a_tool_error_not_a_traceback(mcp, tmp_path, monkey
         assert err is True, tool
         assert "invalid since value '999999999999d'" in text, tool
     assert "Traceback" not in capsys.readouterr().err
+
+
+def seed_cursor(tmp_path, monkeypatch):
+    from test_cursor_adapter import build_cursor_tree
+
+    cursor_root = tmp_path / "cursor-user"
+    build_cursor_tree(cursor_root)
+    monkeypatch.setenv("TOKEN_USAGE_CURSOR_DIR", str(cursor_root))
+    monkeypatch.setenv("TOKEN_USAGE_LEDGER_DIR", str(tmp_path / "cache"))
+    monkeypatch.delenv("TOKEN_USAGE_PROJECT_DIR", raising=False)
+    monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+    monkeypatch.chdir(tmp_path)
+    return cursor_root
+
+
+def test_invalid_runtime_is_a_tool_error(mcp, tmp_path, monkeypatch):
+    seed(tmp_path, monkeypatch)
+    text, err = call(mcp, "history", runtime="gemini")
+    assert err and "runtime must be one of" in text
+
+
+def test_session_cost_runtime_cursor_discloses_fields(mcp, tmp_path, monkeypatch):
+    seed_cursor(tmp_path, monkeypatch)
+    text, err = call(mcp, "session_cost", runtime="cursor",
+                     session_id="comp-usage-001")
+    assert not err, text
+    data = json.loads(text)
+    assert data["runtime"] == "cursor"
+    assert data["resolved_via"] == "session_id"
+    assert data["measurement"] in ("partial", "exact", "activity_only")
+    assert isinstance(data["warnings"], list)
+    assert "composer:comp-usage-001" in data["transcript"]
+    assert data["by_label"]
+
+
+def test_session_cost_claude_default_omits_runtime_key(mcp, tmp_path, monkeypatch):
+    _proj, s1, _s2 = seed(tmp_path, monkeypatch)
+    data = json.loads(call(mcp, "session_cost", transcript=str(s1))[0])
+    assert "runtime" not in data
+    assert data["resolved_via"] == "explicit"
+
+
+def test_history_runtime_cursor(mcp, tmp_path, monkeypatch):
+    seed_cursor(tmp_path, monkeypatch)
+    data = json.loads(call(mcp, "history", runtime="cursor")[0])
+    assert data["runtime"] == "cursor"
+    assert data["warnings"] == []
+    assert len(data["rows"]) >= 1
+
+
+def test_insights_runtime_cursor_session_mode(mcp, tmp_path, monkeypatch):
+    seed_cursor(tmp_path, monkeypatch)
+    data = json.loads(call(mcp, "insights", runtime="cursor",
+                           session_id="comp-usage-001")[0])
+    assert data["mode"] == "session"
+    assert data["runtime"] == "cursor"
+    assert data["measurement"] in ("partial", "exact", "activity_only")
+    assert data["resolved_via"] == "session_id"
+    assert "composer:comp-usage-001" in data["transcript"]
+    assert isinstance(data["warnings"], list)
+
+
+def test_top_consumers_runtime_cursor(mcp, tmp_path, monkeypatch):
+    seed_cursor(tmp_path, monkeypatch)
+    data = json.loads(call(mcp, "top_consumers", runtime="cursor", since="2020-01-01")[0])
+    assert data["runtime"] == "cursor"
+    assert len(data["rows"]) >= 1
+
+
+def test_claude_project_dir_does_not_select_cursor_sessions(mcp, tmp_path, monkeypatch):
+    """Project env vars are hints within one runtime, not cross-runtime selectors."""
+    proj, s1, _s2 = seed(tmp_path, monkeypatch)
+    seed_cursor(tmp_path, monkeypatch)
+    monkeypatch.setenv("TOKEN_USAGE_PROJECT_DIR", "/Users/x/alpha")
+    data = json.loads(call(mcp, "session_cost", runtime="cursor",
+                           session_id="comp-usage-001")[0])
+    assert data["runtime"] == "cursor"
+    assert "composer:" in data["transcript"]
+    assert data["transcript"] != str(s1)
 
 
 def test_serve_exits_cleanly_when_stdin_is_none(mcp, monkeypatch):
