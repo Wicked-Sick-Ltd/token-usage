@@ -2194,14 +2194,17 @@ def run_insights(transcript=None, since=None, project=None, budget=None, warning
                             "first_half_cost": round(c1, 6),
                             "first_half_spend": c1 > 0},
                "skipped_transcripts": skipped,
-               "projects_dir_missing": missing_root,
-               "warnings": warnings}
+               "projects_dir_missing": missing_root}
+        # See the session branch below: a default Claude run keeps the shape it
+        # had before runtimes existed, and its warnings reach a CLI reader on
+        # stderr the way they always did.
         if runtime_name != "claude":
             out["runtime"] = runtime_name
             measurements = {}
             for s in summaries:
                 _count_measurement(measurements, s)
             out["measurements"] = measurements
+            out["warnings"] = warnings
         return out
     if isinstance(transcript, CursorSession):
         _validate_runtime_name(runtime)
@@ -2255,10 +2258,16 @@ def run_insights(transcript=None, since=None, project=None, budget=None, warning
            "baseline": baseline,
            "skipped_transcripts": skipped,
            "projects_dir_missing": missing_root,
-           "transcript_path": transcript_path,
-           "runtime": runtime_name,
-           "measurement": measurement,
-           "warnings": warnings}
+           "transcript_path": transcript_path}
+    # Same rule as the session `json` payload: a default Claude run predates
+    # runtimes and keeps the shape it always had. Cursor has to disclose both
+    # its runtime and its measurement, and carries the warnings behind them.
+    # The MCP envelope adds its own "warnings" key in one place (finish), so
+    # neither caller needs per-key cleanup here.
+    if runtime_name != "claude":
+        out["runtime"] = runtime_name
+        out["measurement"] = measurement
+        out["warnings"] = warnings
     return out
 
 

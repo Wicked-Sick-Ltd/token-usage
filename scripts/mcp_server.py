@@ -647,7 +647,7 @@ def tool_insights(args):
                                **_corpus_kwargs(args, warnings))
     else:
         runtime = runtime_from_args(args)
-        adapter, runtime_name, source, via = pick_session(
+        adapter, _runtime_name, source, via = pick_session(
             runtime, args.get("transcript"), args.get("session_id"), warnings=warnings)
         transcript_arg = str(source) if adapter.name == "claude" else source
         data = tu.run_insights(transcript=transcript_arg, budget=budget, warnings=warnings,
@@ -655,8 +655,6 @@ def tool_insights(args):
         data["transcript"] = (str(source) if adapter.name == "claude"
                               else adapter.describe(source))
         data["resolved_via"] = via
-        if runtime_name == "claude":
-            data.pop("runtime", None)
         footnotes = (guess_note(source, via) if adapter.name == "claude"
                      else guess_note_cursor(via))
     return finish(data, tu.render_insights, args.get("format"), warnings, footnotes)

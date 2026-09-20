@@ -339,6 +339,24 @@ def test_insights_window_mode(mcp, tmp_path, monkeypatch):
     assert err and "not both" in text
 
 
+def test_insights_claude_envelope_adds_warnings_without_popping_runtime(
+    mcp, tmp_path, monkeypatch,
+):
+    # The envelope's warnings key is added in one place (finish); a default
+    # Claude payload never carries runtime/measurement, so tool_insights has
+    # no per-key cleanup to do.
+    _proj, _s1, s2 = seed(tmp_path, monkeypatch)
+    data = json.loads(call(mcp, "insights", session_id="bbb-222")[0])
+    assert data["warnings"] == []
+    assert "runtime" not in data
+    assert "measurement" not in data
+    assert data["transcript"] == str(s2)
+    assert data["resolved_via"] == "session_id"
+    window = json.loads(call(mcp, "insights", since="2026-01-01")[0])
+    assert window["warnings"] == []
+    assert "runtime" not in window
+
+
 def test_insights_blank_transcript_is_rejected_even_with_since(mcp, tmp_path, monkeypatch):
     # A present-but-blank selector is a mistake in both modes: it must not be
     # silently ignored into window mode just because `since` is also set.
