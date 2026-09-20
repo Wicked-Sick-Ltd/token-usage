@@ -1479,8 +1479,6 @@ def render_dashboard(data, generated_at=None):
         if activity_only else ""
     )
     cost_card = _dashboard_metric_display(summary["cost_usd"], activity_only, token=False)
-    if activity_only:
-        cost_card = _DASHBOARD_UNMEASURED
     out_card = _dashboard_metric_display(u["output"], activity_only, token=True)
     in_card = _dashboard_metric_display(u["input"], activity_only, token=True)
     cache_card = _dashboard_metric_display(u["cache_read"], activity_only, token=True)
