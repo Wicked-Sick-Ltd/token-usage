@@ -31,7 +31,6 @@ import json
 import math
 import os
 import re
-import sqlite3
 import sys
 import urllib.parse
 from pathlib import Path
@@ -1764,7 +1763,7 @@ class RuntimeAdapter:
     def locate(self, arg=None, session_id=None, project_dir=None):
         raise NotImplementedError
 
-    def iter_sessions(self, project_dir=None):
+    def iter_sessions(self, project_dir=None, warnings=None):
         raise NotImplementedError
 
     def parse(self, source):
@@ -1783,7 +1782,7 @@ class ClaudeAdapter(RuntimeAdapter):
     def locate(self, arg=None, session_id=None, project_dir=None):
         return locate_transcript(arg, session_id=session_id, project_dir=project_dir)
 
-    def iter_sessions(self, project_dir=None):
+    def iter_sessions(self, project_dir=None, warnings=None):
         root = projects_dir()
         if project_dir is not None:
             slug_dir = root / project_slug(
@@ -1846,28 +1845,41 @@ def cursor_user_dir():
 
 def open_cursor_db(db_path):
     """Open a Cursor state.vscdb read-only (never mutate Cursor state)."""
+    import sqlite3
     path = Path(db_path).expanduser().resolve()
     uri = f"file:{urllib.parse.quote(str(path))}?mode=ro"
     return sqlite3.connect(uri, uri=True)
 
 
-def _cursor_kv_json(conn, key):
-    row = conn.execute(
-        "SELECT value FROM cursorDiskKV WHERE key = ?", (key,)
-    ).fetchone()
-    if not row or row[0] is None:
+def _cursor_decode_kv(raw):
+    """JSON value of one cursorDiskKV blob, or None when it is not JSON."""
+    if raw is None:
         return None
-    raw = row[0]
     if isinstance(raw, memoryview):
         raw = raw.tobytes()
-    if isinstance(raw, bytes):
-        text = raw.decode("utf-8", errors="replace")
-    else:
-        text = str(raw)
+    text = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else str(raw)
     try:
         return json.loads(text)
     except ValueError:
         return None
+
+
+def _cursor_kv_json(conn, key, warnings=None):
+    """One cursorDiskKV value, or None — including when the table is gone.
+
+    Cursor's schema is a private implementation detail: a renamed or dropped
+    `cursorDiskKV` is a shape we do not understand, not a crash to hand the
+    user, so it degrades to "nothing readable here" with a warning."""
+    import sqlite3
+    try:
+        row = conn.execute(
+            "SELECT value FROM cursorDiskKV WHERE key = ?", (key,)
+        ).fetchone()
+    except sqlite3.Error as exc:
+        warn(f"cannot read Cursor cursorDiskKV table ({exc}); "
+             "treating this database as empty", warnings)
+        return None
+    return _cursor_decode_kv(row[0]) if row else None
 
 
 class CursorSession:
@@ -1923,22 +1935,29 @@ def _cursor_folder_for_workspace(cursor_root, workspace_id):
     return _cursor_folder_uri_to_path(folder)
 
 
-def _cursor_project_path_for_composer(cursor_root, db_path, composer_id):
-    """Workspace folder for a composer row in the global database."""
-    if not db_path or not db_path.is_file():
+def _cursor_composer_record(db_path, composer_id, warnings=None):
+    """The composer row for `composer_id`, or None when it does not exist.
+
+    None is the fail-closed answer an explicit id needs: a database that has
+    no such composer must not resolve to some other session."""
+    import sqlite3
+    if not db_path or not Path(db_path).is_file():
         return None
     try:
         conn = open_cursor_db(db_path)
-    except sqlite3.Error:
+    except sqlite3.Error as exc:
+        warn(f"cannot open Cursor database read-only: {exc}", warnings)
         return None
     try:
-        data = _cursor_kv_json(conn, f"composerData:{composer_id}")
-        if not isinstance(data, dict):
-            return None
-        ws_id = data.get("workspaceStorageId") or data.get("workspaceId")
-        return _cursor_folder_for_workspace(cursor_root, ws_id)
+        data = _cursor_kv_json(conn, f"composerData:{composer_id}", warnings)
+        return data if isinstance(data, dict) else None
     finally:
         conn.close()
+
+
+def _cursor_composer_workspace_folder(cursor_root, composer):
+    ws_id = (composer or {}).get("workspaceStorageId") or (composer or {}).get("workspaceId")
+    return _cursor_folder_for_workspace(cursor_root, ws_id)
 
 
 def _cursor_workspace_ids_for_project(cursor_root, project_dir):
@@ -1965,13 +1984,27 @@ def _cursor_global_db_path(cursor_root):
     return cursor_root / "globalStorage" / "state.vscdb"
 
 
-def _cursor_list_composers(conn, workspace_ids=None):
+def _cursor_list_composers(conn, workspace_ids=None, warnings=None):
+    """(lastUpdated, composer_id, record) rows, newest first.
+
+    Only composerData rows are selected, and each row's value is decoded from
+    the result already in hand: scanning every key pulled every bubble blob in
+    the database through discovery and then re-queried each composer."""
+    import sqlite3
     rows = []
-    for key, value in conn.execute("SELECT key, value FROM cursorDiskKV"):
-        if not key.startswith("composerData:"):
+    try:
+        fetched = conn.execute(
+            "SELECT key, value FROM cursorDiskKV WHERE key LIKE 'composerData:%'"
+        ).fetchall()
+    except sqlite3.Error as exc:
+        warn(f"cannot read Cursor cursorDiskKV table ({exc}); "
+             "treating this database as empty", warnings)
+        return rows
+    for key, value in fetched:
+        if not str(key).startswith("composerData:"):
             continue
-        composer_id = key.split(":", 1)[1]
-        data = _cursor_kv_json(conn, key)
+        composer_id = str(key).split(":", 1)[1]
+        data = _cursor_decode_kv(value)
         if not isinstance(data, dict):
             continue
         ws_id = data.get("workspaceStorageId") or data.get("workspaceId")
@@ -2035,6 +2068,68 @@ def _sanitize_cursor_id(value):
     """Alphanumeric Cursor id for in-ledger references (generation/subagent)."""
     cleaned = re.sub(r"[^A-Za-z0-9_-]", "", str(value or ""))
     return cleaned or "unknown"
+
+
+def _cursor_ledger_paths():
+    """Hook ledgers, most recently written first.
+
+    Recency, not filename order: the basename starts with a truncated
+    conversation id, so sorting by name picked "the alphabetically first
+    conversation" as the latest session."""
+    root = cursor_ledger_root()
+    if not root.is_dir():
+        return []
+    dated = []
+    for path in root.glob("*.jsonl"):
+        try:
+            dated.append((path.stat().st_mtime_ns, path))
+        except OSError:      # vanished mid-scan
+            continue
+    dated.sort(key=lambda item: (-item[0], item[1].name))
+    return [path for _mtime, path in dated]
+
+
+def _cursor_ledger_meta(path):
+    """(conversation_id, workspace_roots, first_ts) for one hook ledger.
+
+    Ledgers written before the capture recorded the raw conversation id fall
+    back to the hashed filename stem — the only identity such a file has."""
+    conversation_id, roots, first_ts = None, [], None
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(ev, dict):
+                    continue
+                cid = ev.get("conversation_id")
+                if conversation_id is None and isinstance(cid, str) and cid:
+                    conversation_id = cid
+                if not roots and isinstance(ev.get("workspace_roots"), list):
+                    roots = [r for r in ev["workspace_roots"] if isinstance(r, str) and r]
+                ts = ev.get("ts")
+                if first_ts is None and isinstance(ts, str) and ts:
+                    first_ts = ts
+                if conversation_id and roots and first_ts:
+                    break
+    except OSError:
+        pass
+    return (conversation_id or Path(path).stem), roots, first_ts
+
+
+def _cursor_project_path_from_roots(roots):
+    """The workspace root a hook-captured conversation belongs to, or None."""
+    for root in roots or []:
+        try:
+            return Path(root).expanduser().resolve()
+        except OSError:
+            continue
+    return None
 
 
 def _cursor_ledger_filename(conversation_id):
@@ -2434,6 +2529,7 @@ def _cursor_parse_sqlite(session, warnings):
             "prompt": (prompt or "").strip()[:120], "subagents": [],
         })
 
+    import sqlite3
     db_path = session.db_path or _cursor_global_db_path(cursor_user_dir())
     try:
         conn = open_cursor_db(db_path)
@@ -2441,7 +2537,7 @@ def _cursor_parse_sqlite(session, warnings):
         warn(f"cannot open Cursor database read-only: {exc}", warnings)
         return segments, saw_tokens
     try:
-        composer = _cursor_kv_json(conn, f"composerData:{session.composer_id}")
+        composer = _cursor_kv_json(conn, f"composerData:{session.composer_id}", warnings)
         if not isinstance(composer, dict):
             warn(f"composer {session.composer_id!r} not found in Cursor database",
                  warnings)
@@ -2459,12 +2555,16 @@ def _cursor_parse_sqlite(session, warnings):
             if not bubble_id:
                 continue
             bubble = _cursor_kv_json(
-                conn, f"bubbleId:{session.composer_id}:{bubble_id}")
+                conn, f"bubbleId:{session.composer_id}:{bubble_id}", warnings)
             if bubble is None:
                 warn(f"missing Cursor bubble {bubble_id!r} for composer "
                      f"{session.composer_id!r}", warnings)
                 continue
-            btype = header.get("type", bubble.get("type"))
+            # Some Cursor versions leave the header's type null and only the
+            # bubble itself knows whether the turn was the user's.
+            btype = header.get("type")
+            if btype is None:
+                btype = bubble.get("type")
             ts = bubble.get("createdAt") or bubble.get("timestamp")
             if btype == CURSOR_USER_BUBBLE:
                 prompt = _cursor_bubble_text(bubble)
@@ -2568,36 +2668,63 @@ class CursorAdapter(RuntimeAdapter):
             cid = (data.get("id") or data.get("conversation_id") or path.stem)
             return CursorSession(str(cid), "cloud_export", export_path=path)
         if session_id:
+            # An explicit id outranks a project hint, and fails closed: a
+            # composer that is not in this database is not "the latest one".
+            wanted = str(session_id)
+            for session in self._iter_ledger_sessions():
+                if session.composer_id == wanted:
+                    return session
             root = cursor_user_dir()
             db = _cursor_global_db_path(root)
-            if db.is_file():
-                folder = _cursor_project_path_for_composer(root, db, str(session_id))
-                return CursorSession(str(session_id), "sqlite", db_path=db,
-                                     project_path=folder)
+            composer = _cursor_composer_record(db, wanted)
+            if composer is None:
+                return None
+            return CursorSession(wanted, "sqlite", db_path=db,
+                                 project_path=_cursor_composer_workspace_folder(
+                                     root, composer))
         for session in self.iter_sessions(project_dir=project_dir):
             return session
         return None
 
-    def iter_sessions(self, project_dir=None):
+    def _iter_ledger_sessions(self, project_dir=None, warnings=None):
+        """Hook-ledger sessions, newest first, keyed by their raw conversation id."""
+        target = (Path(project_dir).expanduser().resolve()
+                  if project_dir is not None else None)
+        for path in _cursor_ledger_paths():
+            conversation_id, roots, _first_ts = _cursor_ledger_meta(path)
+            project_path = _cursor_project_path_from_roots(roots)
+            if target is not None and project_path != target:
+                continue
+            yield CursorSession(conversation_id, "hook_ledger", ledger_path=path,
+                                project_path=project_path)
+
+    def iter_sessions(self, project_dir=None, warnings=None):
+        import sqlite3
         cursor_root = cursor_user_dir()
-        ledger_root = cursor_ledger_root()
-        if ledger_root.is_dir():
-            for path in sorted(ledger_root.glob("*.jsonl")):
-                yield CursorSession(path.stem, "hook_ledger", ledger_path=path)
+        # Hook ledgers first (they are the higher-confidence read path) and
+        # their conversation ids suppress Cursor's own composer row for the
+        # same conversation: one session, counted once.
+        from_ledger = set()
+        for session in self._iter_ledger_sessions(project_dir, warnings):
+            from_ledger.add(session.composer_id)
+            yield session
         db_path = _cursor_global_db_path(cursor_root)
         if not db_path.is_file():
             return
         workspace_ids = _cursor_workspace_ids_for_project(cursor_root, project_dir)
         try:
             conn = open_cursor_db(db_path)
-        except sqlite3.Error:
+        except sqlite3.Error as exc:
+            warn(f"cannot open Cursor database read-only: {exc}", warnings)
             return
         try:
             composers = _cursor_list_composers(
-                conn, workspace_ids if project_dir is not None else None)
+                conn, workspace_ids if project_dir is not None else None,
+                warnings=warnings)
             for _updated, composer_id, data in composers:
-                ws_id = data.get("workspaceStorageId") or data.get("workspaceId")
-                folder = _cursor_folder_for_workspace(cursor_root, ws_id)
+                if composer_id in from_ledger:
+                    continue
+                folder = _cursor_composer_workspace_folder(cursor_root, data)
                 yield CursorSession(composer_id, "sqlite", db_path=db_path,
                                     project_path=folder)
         finally:
@@ -2634,6 +2761,9 @@ class CursorAdapter(RuntimeAdapter):
             if source.source == "cloud_export" and source.export_path:
                 return project_slug(source.export_path.stem)
             if source.source == "hook_ledger":
+                # Only reached when the ledger recorded no workspace root:
+                # every hook-captured session used to land here, so a whole
+                # machine's Cursor work rolled up under one fake project.
                 return "cursor-hooks"
             return project_slug(f"cursor:{source.composer_id}")
         return str(source)
@@ -2642,6 +2772,8 @@ class CursorAdapter(RuntimeAdapter):
         if isinstance(source, CursorSession):
             if source.source == "cloud_export" and source.export_path:
                 return source.export_path.name
+            if source.source == "hook_ledger":
+                return f"conversation:{source.composer_id}"
             return f"composer:{source.composer_id}"
         return str(source)
 
