@@ -41,6 +41,7 @@ Claude Code tells you session totals (`/cost`, OTel metrics) and tools like ccus
   exposes `session_cost`, `history`, `insights`, `diff` and `top_consumers` as tools.
   Claude Code starts it automatically with the plugin; Claude desktop can register the
   same script. JSON by default, `format: "markdown"` for the rendered tables.
+  Dashboard, live, and export stay CLI-only (local file writes; not exposed via MCP).
 - **Top consumers** — `top_consumers --by session|command` lists the costliest sessions
   or command labels in a window, the question `history` could not answer directly. A row
   whose cost is only a priced subtotal (some of its usage ran on an unpriced model) is
@@ -179,12 +180,37 @@ python3 scripts/token_usage.py json --runtime cursor /path/to/cloud-export.json
 
 python3 scripts/token_usage.py history --runtime cursor --by day --since 7d
 python3 scripts/token_usage.py insights --runtime cursor
+
+# Self-contained HTML dashboard from indexed history (inline CSS/SVG only — no CDN)
+python3 scripts/token_usage.py dashboard [--since 30d] [--project SUBSTRING] \
+  [--output token-usage-dashboard.html] [--runtime claude|cursor|auto]
+
+# Terminal live view — repolls the current or explicit session (Ctrl-C exits 0)
+python3 scripts/token_usage.py live [TRANSCRIPT] [--interval 2] [--iterations N] \
+  [--agents] [--models] [--runtime claude|cursor|auto]
+
+# Structured JSONL aggregates for external spend tooling (not OTLP wire format)
+python3 scripts/token_usage.py export [--scope session|history] [--by project|day|command|model] \
+  [--since 30d] [--project SUBSTRING] [--output usage.jsonl] [--runtime claude|cursor|auto]
+python3 scripts/token_usage.py export [TRANSCRIPT] --scope session --output -
 ```
 
 `--runtime` accepts `claude` (default), `cursor`, or `auto`. `auto` picks one runtime
 when unambiguous and never mixes Claude transcripts with Cursor composers in one call.
 
 With no argument, `report` and `json` pick the most recent session for the current directory's project; failing that, the Cowork sandbox mount; failing that too, the newest transcript under **any** project on the machine. That last step means running these outside a directory with its own Claude Code history can pick up a different project's most recent session rather than reporting "not found" — pass an explicit transcript path when it matters which session gets analysed.
+
+### Dashboard (`dashboard`)
+
+Builds a single portable HTML file from the same indexed history as `history`. Summary cards, an inline SVG daily-cost chart, and top project/activity/model tables are embedded with inline CSS only — no `<script>`, remote assets, CDN, iframe, or network calls. Labels, warnings, and measurement notes are HTML-escaped. Default output is `token-usage-dashboard.html`; `--output -` writes HTML to stdout (progress stays on stderr). With no matching history, the page still renders an honest empty state. Cursor `partial` or activity-only corpora disclose when cost/token cards are unmeasured rather than showing misleading zeros.
+
+### Live mode (`live`)
+
+Polls every `--interval` seconds (default 2), re-rendering the session report each tick. With no `[TRANSCRIPT]`, each iteration re-runs normal latest-session discovery. Interactive terminals clear with ANSI `\x1b[2J\x1b[H`; redirected stdout uses timestamp separators instead. `--iterations N` runs a finite loop for scripts and tests. **Ctrl-C exits 0.** There is no file watcher or background daemon.
+
+### Structured export (`export`)
+
+Emits one RFC-8259 JSON object per line with schema `token-usage.aggregate.v1` and OTel-style metric names (for example `gen_ai.usage.output_tokens`, `gen_ai.estimated_cost.usd`). This is a stable local interchange format — **not** OTLP protobuf/HTTP. Default scope is `history` (grouped by project); `--scope session` emits one `total` row plus one row per activity label. `gen_ai.estimated_cost.usd` is JSON `null` when unpriced or unmeasured. Lines include project slugs, command labels, and model IDs — redact before sharing. File output uses atomic replace; stdout streams directly.
 
 ### Budget nudges
 
@@ -202,7 +228,15 @@ When the session's estimated cost crosses the threshold the Stop hook emits a `s
 
 ### Statusline (optional)
 
-`examples/statusline.sh` reads the live ledger and renders e.g. `⏶ 214k out · $33.87 · top: /code-review`. Wire it up with `/statusline` or merge it into your existing statusline script. Requires `jq`.
+`examples/statusline.sh` reads the per-session live ledger (from stdin `session_id`) and renders e.g. `⏶ 214k out · $33.87 · top: /code-review`. Wire it up with `/statusline` or merge it into your existing statusline script. Requires `jq`.
+
+On Windows (or anywhere with PowerShell 7+), `examples/statusline.ps1` is dependency-free: it reads `$env:TOKEN_USAGE_LEDGER_DIR/latest.json`, or `~/.cache/token-usage/latest.json` when unset, formats output tokens, estimated cost, and the top `by_label` activity, and **exits silently** (code 0, no output) when the ledger is missing or malformed. Example statusline command:
+
+```text
+pwsh -NoProfile -File C:/path/to/token-usage/examples/statusline.ps1
+```
+
+CI on Linux validates `statusline.ps1` structurally only; it does not execute PowerShell unless `pwsh` is installed.
 
 ### MCP server
 

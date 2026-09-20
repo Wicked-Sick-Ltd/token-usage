@@ -40,6 +40,22 @@ adheres to [Semantic Versioning](https://semver.org/).
   privacy, and a future Gemini/Codex adapter contract.
 - **README** — Cursor Plugin and manual MCP install, `--runtime cursor` CLI examples,
   and a concise v1 can/cannot measure section for Cursor.
+- **`dashboard` CLI** — self-contained HTML from indexed history (inline CSS and SVG,
+  no CDN or `<script>`); `--since`, `--project`, `--output`, and `--runtime`.
+- **`live` CLI** — polling terminal refresh of the current session report;
+  `--interval`, `--iterations`, `--agents`, `--models`; Ctrl-C exits 0.
+- **`export` CLI** — RFC-8259 JSONL with schema `token-usage.aggregate.v1` and
+  OTel-style metric names (local interchange, not OTLP wire format); session and
+  history scopes with atomic file output.
+- **`examples/statusline.ps1`** — dependency-free PowerShell statusline reading
+  `TOKEN_USAGE_LEDGER_DIR/latest.json` or `~/.cache/token-usage/latest.json`;
+  silent on missing or malformed ledgers.
+- **README (0.7 surfaces)** — dashboard/live/export usage, privacy/redaction notes,
+  Windows statusline setup, and MCP scope (dashboard/export remain CLI-only).
+- **Roadmap disclosures** — HTTP/SSE MCP transport and true OTLP mapping deferred
+  to 0.7.1+; user-configurable insight thresholds YAGNI; fleet aggregation and
+  LLM-generated insights out of scope; Gemini/Codex via the adapter contract in
+  `docs/cursor-adapter.md`.
 
 ### Changed
 

@@ -150,3 +150,33 @@ Users who do not install the Cursor Plugin can register the same stdio server in
 `runtime: "cursor"` on MCP tools or `--runtime cursor` on the CLI. No root
 `mcp.json` in this repository — Claude Code would treat it as project-scope
 config inside a checkout.
+
+## Dashboard, live, and export (0.7)
+
+These CLI paths reuse the same runtime adapters and measurement disclosures as
+`report` / `history`. They are **local file operations** — no network, CDN, or
+telemetry — and are intentionally **not** exposed through the stdio MCP server
+(arbitrary output paths would widen the write surface).
+
+| Command | Role | Cursor notes |
+| --- | --- | --- |
+| `dashboard` | Static HTML archive of indexed history | Activity-only or `partial` corpora disclose unmeasured cost/token cards |
+| `live` | Polling refresh of one session report | Same session discovery and measurement warnings as `report` |
+| `export` | JSONL aggregates (`token-usage.aggregate.v1`) | `measurement` and `warnings` preserved; redact labels before sharing |
+
+Export uses OTel-style **metric names**, not OTLP protobuf/HTTP. A future OTLP
+exporter can map this stable schema without breaking JSONL consumers.
+
+## Roadmap after 0.7
+
+| Topic | Status |
+| --- | --- |
+| Authenticated HTTP/SSE MCP transport | **0.7.1+** — needs binding, auth, origin policy, concurrency, shutdown, and stream resumption design |
+| True OTLP wire export | **0.7.1+** — maps from `token-usage.aggregate.v1`, not a separate invented schema |
+| User-configurable insight thresholds | **Deferred (YAGNI)** — fixed rules stay predictable |
+| Fleet / multi-machine aggregation | **Out of scope** |
+| LLM-generated insights | **Out of scope** — `insights` stays rule-based arithmetic |
+| Gemini, Codex, other runtimes | **Future adapters** — implement `RuntimeAdapter` per the contract above; dashboard/export need no runtime-specific code once summaries are canonical |
+
+Windows statusline parity lives in `examples/statusline.ps1` (reads
+`latest.json` under `TOKEN_USAGE_LEDGER_DIR` or `~/.cache/token-usage/`).
