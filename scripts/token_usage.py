@@ -38,7 +38,6 @@ from pathlib import Path
 
 COMMAND_RE = re.compile(r"<command-name>([^<]+)</command-name>")
 OTHER_LABEL = "(no command)"
-LEDGER_DIR = Path(os.environ.get("TOKEN_USAGE_LEDGER_DIR", Path.home() / ".cache" / "token-usage"))
 
 # Per-MTok USD rates. Cache read = 0.1x input unless the entry carries an explicit
 # "cache_read" rate (Fable/Mythos 5.1 bill hits at $0.25/MTok, i.e. 0.025x);
@@ -751,9 +750,18 @@ def check_projects_root(warnings=None):
     return str(root)
 
 
-def index_dir():
+def ledger_dir():
+    """Root of the session ledger, summary index and Cursor hook ledgers.
+
+    Read on every call rather than bound at import: the Cursor hook ledger is
+    also a session *corpus*, so a process (or a test) that changes
+    TOKEN_USAGE_LEDGER_DIR must not keep scanning the previous root."""
     return Path(os.environ.get("TOKEN_USAGE_LEDGER_DIR",
-                               Path.home() / ".cache" / "token-usage")) / "index"
+                               Path.home() / ".cache" / "token-usage"))
+
+
+def index_dir():
+    return ledger_dir() / "index"
 
 
 def pricing_fingerprint(pricing):
@@ -2018,6 +2026,11 @@ def _cursor_token_flat(token_count):
 _CURSOR_COMPLETION_HOOKS = frozenset({"stop", "afterAgentResponse"})
 
 
+def cursor_ledger_root():
+    """Directory holding the Cursor hook ledgers (one JSONL per conversation)."""
+    return ledger_dir() / "cursor"
+
+
 def _sanitize_cursor_id(value):
     """Alphanumeric Cursor id for in-ledger references (generation/subagent)."""
     cleaned = re.sub(r"[^A-Za-z0-9_-]", "", str(value or ""))
@@ -2116,7 +2129,7 @@ def _cursor_hook_record_from_payload(payload):
 
 
 def _cursor_hook_ledger_path(conversation_id):
-    return LEDGER_DIR / "cursor" / f"{_cursor_ledger_filename(conversation_id)}.jsonl"
+    return cursor_ledger_root() / f"{_cursor_ledger_filename(conversation_id)}.jsonl"
 
 
 def _append_cursor_hook_line(ledger_path, record):
@@ -2477,7 +2490,7 @@ class CursorAdapter(RuntimeAdapter):
 
     def iter_sessions(self, project_dir=None):
         cursor_root = cursor_user_dir()
-        ledger_root = LEDGER_DIR / "cursor"
+        ledger_root = cursor_ledger_root()
         if ledger_root.is_dir():
             for path in sorted(ledger_root.glob("*.jsonl")):
                 yield CursorSession(path.stem, "hook_ledger", ledger_path=path)
@@ -2581,7 +2594,7 @@ def check_cursor_root(warnings=None):
     """Like check_projects_root, for Cursor's User data directory."""
     root = cursor_user_dir()
     db = root / "globalStorage" / "state.vscdb"
-    ledger = LEDGER_DIR / "cursor"
+    ledger = cursor_ledger_root()
     if (db.is_file() and os.access(db, os.R_OK)) or (
             ledger.is_dir() and os.access(ledger, os.R_OK | os.X_OK)):
         return None
@@ -2907,16 +2920,17 @@ def _prior_budget_multiple(ledger):
 
 
 def _write_ledger(ledger, data):
-    LEDGER_DIR.mkdir(parents=True, exist_ok=True)
+    root = ledger_dir()
+    root.mkdir(parents=True, exist_ok=True)
     # Per-process temp names: concurrent SubagentStop hooks must never
     # interleave writes into a shared temp file.
     tmp = ledger.with_suffix(f".{os.getpid()}.tmp")
     tmp.write_text(json.dumps(data, indent=1), encoding="utf-8")
     tmp.replace(ledger)
-    link_tmp = LEDGER_DIR / f".latest.{os.getpid()}.tmp"
+    link_tmp = root / f".latest.{os.getpid()}.tmp"
     try:
         link_tmp.symlink_to(ledger)
-        link_tmp.replace(LEDGER_DIR / "latest.json")
+        link_tmp.replace(root / "latest.json")
     except OSError:
         link_tmp.unlink(missing_ok=True)
 
@@ -2976,7 +2990,7 @@ def _run_hook(payload):
     data = aggregate(parse_session(transcript), load_pricing())
     data["session_id"] = session_id
     data["transcript_path"] = str(transcript)
-    ledger = LEDGER_DIR / f"{session_id}.json"
+    ledger = ledger_dir() / f"{session_id}.json"
 
     prior_multiple = _prior_budget_multiple(ledger)
     limit = budget_from_env()

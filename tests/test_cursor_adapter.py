@@ -76,6 +76,23 @@ def session_for(composer_id, source="sqlite", path=None):
     }
 
 
+def ledger_record(hook, conversation_id="conv-1", generation_id="gen-1",
+                  ts="2026-06-12T10:00:00Z", **extra):
+    record = {"hook": hook, "generation_id": generation_id, "ts": ts,
+              "conversation_id": conversation_id}
+    record.update(extra)
+    return record
+
+
+def write_ledger(tu, ledger_root, conversation_id, records):
+    """Write one Cursor hook ledger the way the hook command would name it."""
+    path = (Path(ledger_root) / "cursor"
+            / f"{tu._cursor_ledger_filename(conversation_id)}.jsonl")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
+    return path
+
+
 def test_cursor_adapter_registered(tu):
     adapter = tu.get_runtime_adapter("cursor")
     assert adapter.name == "cursor"
@@ -281,3 +298,35 @@ def test_missing_bubble_degrades_with_warning(tu, tmp_path, monkeypatch):
     result = adapter.parse(tu.CursorSession("comp-usage-001", "sqlite", db_path))
     assert any("ghost-bubble" in w for w in result["warnings"])
     assert result["measurement"] in ("partial", "activity_only")
+
+
+def test_ledger_dir_env_is_honored_in_process(tu, tmp_path, monkeypatch):
+    # LEDGER_DIR used to bind at import, so an in-process test read the
+    # developer's own ~/.cache/token-usage/cursor instead of its fixture.
+    monkeypatch.setenv("TOKEN_USAGE_LEDGER_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("TOKEN_USAGE_CURSOR_DIR", str(tmp_path / "cursor-user"))
+    path = write_ledger(tu, tmp_path / "cache", "conv-env", [
+        ledger_record("beforeSubmitPrompt", conversation_id="conv-env",
+                      prompt="env ledger"),
+    ])
+    sessions = list(tu.get_runtime_adapter("cursor").iter_sessions())
+    assert [(s.source, s.ledger_path) for s in sessions] == [("hook_ledger", path)]
+
+
+def test_external_home_ledger_cannot_alter_fixture_expectations(tu, tmp_path, monkeypatch):
+    # A real user's ledger under $HOME must never join a fixture-scoped scan:
+    # the suite pins TOKEN_USAGE_LEDGER_DIR at a tmp dir for every test.
+    home = tmp_path / "home"
+    write_ledger(tu, home / ".cache" / "token-usage", "real-user-conversation", [
+        ledger_record("beforeSubmitPrompt", conversation_id="real-user-conversation",
+                      prompt="private work"),
+        ledger_record("stop", conversation_id="real-user-conversation",
+                      model="claude-sonnet-4",
+                      tokens={"input_tokens": 999999, "output_tokens": 999999}),
+    ])
+    monkeypatch.setenv("HOME", str(home))
+    cursor_root = tmp_path / "cursor-user"
+    build_cursor_tree(cursor_root)
+    monkeypatch.setenv("TOKEN_USAGE_CURSOR_DIR", str(cursor_root))
+    sessions = list(tu.get_runtime_adapter("cursor").iter_sessions())
+    assert [s.composer_id for s in sessions] == ["comp-usage-001"]

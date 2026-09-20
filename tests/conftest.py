@@ -28,6 +28,16 @@ def _isolated_pricing_overlay(monkeypatch, tmp_path_factory):
 
 
 @pytest.fixture(autouse=True)
+def _isolated_ledger_dir(monkeypatch, tmp_path_factory):
+    # The Cursor hook ledger root doubles as a session corpus, so a developer's
+    # own ~/.cache/token-usage/cursor would otherwise join every fixture-scoped
+    # scan. Pinned for the whole suite; a test that wants its own ledger sets
+    # TOKEN_USAGE_LEDGER_DIR afterwards (monkeypatch keeps the later value).
+    monkeypatch.setenv("TOKEN_USAGE_LEDGER_DIR",
+                       str(tmp_path_factory.mktemp("ledger-isolated")))
+
+
+@pytest.fixture(autouse=True)
 def _no_cowork_mounts(monkeypatch):
     # Transcript discovery falls through to the Cowork sandbox mounts, which on
     # a real Cowork host hold a live transcript this suite must never see.
