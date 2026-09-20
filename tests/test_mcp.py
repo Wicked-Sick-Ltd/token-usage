@@ -919,7 +919,7 @@ def test_top_consumers_runtime_cursor(mcp, tmp_path, monkeypatch):
 
 def test_claude_project_dir_does_not_select_cursor_sessions(mcp, tmp_path, monkeypatch):
     """Project env vars are hints within one runtime, not cross-runtime selectors."""
-    proj, s1, _s2 = seed(tmp_path, monkeypatch)
+    _proj, s1, _s2 = seed(tmp_path, monkeypatch)
     seed_cursor(tmp_path, monkeypatch)
     monkeypatch.setenv("TOKEN_USAGE_PROJECT_DIR", "/Users/x/alpha")
     data = json.loads(call(mcp, "session_cost", runtime="cursor",
