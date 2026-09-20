@@ -5,6 +5,7 @@ import re
 import subprocess
 import sys
 
+import pytest
 from conftest import SCRIPT, assistant, usage, user, write_jsonl
 from test_cursor_adapter import build_cursor_tree
 from test_cursor_cli import zero_token_tree
@@ -142,6 +143,71 @@ def test_write_text_output_atomic_file(tu, tmp_path):
     tu.write_text_output("<html>ok</html>", out)
     assert out.read_text(encoding="utf-8") == "<html>ok</html>"
     assert not list(tmp_path.glob("*.tmp"))
+
+
+def _fail_on_tmp(monkeypatch, method, message):
+    """Make Path.<method> raise for the temp file only, leaving the rest alone."""
+    import pathlib
+    original = getattr(pathlib.Path, method)
+
+    def patched(self, *a, **kw):
+        if self.name.endswith(".tmp"):
+            raise OSError(message)
+        return original(self, *a, **kw)
+
+    monkeypatch.setattr(pathlib.Path, method, patched)
+
+
+def test_write_text_output_removes_the_temp_file_when_the_write_fails(
+        tu, tmp_path, monkeypatch):
+    # A full disk fails part way through the write, so the temp file exists on
+    # disk holding a truncated dashboard. The caller hears about the failure,
+    # but that debris must not be left in the user's output directory.
+    import pathlib
+    out = tmp_path / "dash.html"
+    original = pathlib.Path.write_text
+
+    def patched(self, data, *a, **kw):
+        if self.name.endswith(".tmp"):
+            original(self, data[:5], *a, **kw)
+            raise OSError("No space left on device")
+        return original(self, data, *a, **kw)
+
+    monkeypatch.setattr(pathlib.Path, "write_text", patched)
+    with pytest.raises(OSError, match="No space left on device"):
+        tu.write_text_output("<html>ok</html>", out)
+    assert not list(tmp_path.glob("*.tmp"))
+    assert not out.exists()
+
+
+def test_write_text_output_removes_the_temp_file_when_the_replace_fails(
+        tu, tmp_path, monkeypatch):
+    out = tmp_path / "dash.html"
+    out.write_text("<html>previous</html>", encoding="utf-8")
+    _fail_on_tmp(monkeypatch, "replace", "Permission denied")
+    with pytest.raises(OSError):
+        tu.write_text_output("<html>new</html>", out)
+    assert not list(tmp_path.glob("*.tmp"))
+    # Atomic replacement: a failed write leaves the prior output intact.
+    assert out.read_text(encoding="utf-8") == "<html>previous</html>"
+
+
+def test_write_text_output_survives_a_temp_file_that_is_already_gone(
+        tu, tmp_path, monkeypatch):
+    # Cleanup must not turn one failure into a different, more confusing one.
+    import pathlib
+    out = tmp_path / "dash.html"
+    original_unlink = pathlib.Path.unlink
+
+    def patched(self, *a, **kw):
+        if self.name.endswith(".tmp"):
+            raise FileNotFoundError(self)
+        return original_unlink(self, *a, **kw)
+
+    _fail_on_tmp(monkeypatch, "replace", "Permission denied")
+    monkeypatch.setattr(pathlib.Path, "unlink", patched)
+    with pytest.raises(OSError, match="Permission denied"):
+        tu.write_text_output("<html>new</html>", out)
 
 
 def test_write_text_output_stdout(tu, tmp_path, capsys):

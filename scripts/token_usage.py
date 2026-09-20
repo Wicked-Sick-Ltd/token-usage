@@ -319,6 +319,29 @@ def _dedupe_warnings_in_place(warnings):
     warnings[:] = out
 
 
+def atomic_write_text(path, text):
+    """Replace `path` with `text` in one step, leaving no temp file behind.
+
+    The temp name carries the pid because concurrent writers — parallel
+    SubagentStop hooks, two scans warming the same cache entry — must never
+    interleave through one shared temp file."""
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        tmp.replace(path)
+    except OSError:
+        # The replace is what makes this atomic, so failing before it leaves
+        # any prior content untouched — but also leaves a truncated temp file
+        # beside it, in directories (the index, the ledger) written on every
+        # run. Clear the debris and raise the real failure; a cleanup problem
+        # must not mask the one the caller needs to see.
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
 def merge_by_model(dest, src):
     for model, bucket in src.items():
         d = dest.setdefault(model, empty_usage())
@@ -937,9 +960,7 @@ def cached_summary(path, pricing, warnings=None):
     # per process and hand back the freshly parsed summary anyway.
     try:
         cache_file.parent.mkdir(parents=True, exist_ok=True)
-        tmp = cache_file.with_suffix(".tmp")
-        tmp.write_text(json.dumps(s), encoding="utf-8")
-        tmp.replace(cache_file)
+        atomic_write_text(cache_file, json.dumps(s))
     except OSError as e:
         # Once per process on stderr, but every caller's `warnings` list gets
         # it: an MCP caller never sees stderr, and a long-lived server would
@@ -1658,9 +1679,7 @@ def write_text_output(text, output_path):
         return
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-    tmp.write_text(text, encoding="utf-8")
-    tmp.replace(path)
+    atomic_write_text(path, text)
 
 
 EXPORT_SCHEMA = "token-usage.aggregate.v1"
@@ -3664,9 +3683,7 @@ def cached_adapter_summary(adapter, source, pricing, warnings=None):
     s = summarize_adapter_source(adapter, source, pricing, warnings)
     try:
         cache_file.parent.mkdir(parents=True, exist_ok=True)
-        tmp = cache_file.with_suffix(".tmp")
-        tmp.write_text(json.dumps(s), encoding="utf-8")
-        tmp.replace(cache_file)
+        atomic_write_text(cache_file, json.dumps(s))
     except OSError as e:
         message = f"cannot write summary cache {cache_file.parent}: {e}"
         if not _CACHE_WRITE_WARNED:
@@ -3895,11 +3912,7 @@ def _prior_budget_multiple(ledger):
 def _write_ledger(ledger, data):
     root = ledger_dir()
     root.mkdir(parents=True, exist_ok=True)
-    # Per-process temp names: concurrent SubagentStop hooks must never
-    # interleave writes into a shared temp file.
-    tmp = ledger.with_suffix(f".{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(data, indent=1), encoding="utf-8")
-    tmp.replace(ledger)
+    atomic_write_text(ledger, json.dumps(data, indent=1))
     link_tmp = root / f".latest.{os.getpid()}.tmp"
     try:
         link_tmp.symlink_to(ledger)

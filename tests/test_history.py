@@ -339,6 +339,29 @@ def test_unwritable_cache_dir_still_returns_rows(tu, tmp_path, monkeypatch, caps
     assert err.count("cannot write summary cache") == 1      # one warning per process
 
 
+def test_cache_write_failure_leaves_no_temp_file_in_the_index(tu, tmp_path, monkeypatch,
+                                                              capsys):
+    # A cache write that dies part way through still hands back freshly parsed
+    # rows and warns once — but the index directory is long-lived, so a
+    # truncated temp file there would accumulate scan after scan.
+    import pathlib
+    seed_projects(tmp_path, monkeypatch)
+    monkeypatch.setattr(tu, "_CACHE_WRITE_WARNED", False)
+    original = pathlib.Path.write_text
+
+    def patched(self, data, *a, **kw):
+        if self.name.endswith(".tmp"):
+            original(self, data[:3], *a, **kw)
+            raise OSError("No space left on device")
+        return original(self, data, *a, **kw)
+
+    monkeypatch.setattr(pathlib.Path, "write_text", patched)
+    data = tu.run_history(by="project")
+    assert len(data["rows"]) == 2                         # correctness is unaffected
+    assert list(tu.index_dir().rglob("*.tmp")) == []
+    assert capsys.readouterr().err.count("cannot write summary cache") == 1
+
+
 def test_window_insights_and_baseline_disclose_skipped_transcripts(tu, tmp_path, monkeypatch):
     proj = seed_projects(tmp_path, monkeypatch)
     (proj / "-Users-x-repo-two" / "junk.jsonl").mkdir()

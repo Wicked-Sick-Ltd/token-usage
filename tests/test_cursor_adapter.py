@@ -189,6 +189,34 @@ def test_global_recent_sessions_without_project(tu, tmp_path, monkeypatch):
     assert [s.composer_id for s in sessions[:2]] == ["comp-recent-a", "comp-recent-b"]
 
 
+def test_cursor_cache_write_failure_leaves_no_temp_file(tu, tmp_path, monkeypatch):
+    # The Cursor adapter warms its own summary cache through a second call
+    # site; a truncated temp file there accumulates in the index just as it
+    # would on the Claude side.
+    import pathlib
+    cursor_root = tmp_path / "cursor-user"
+    db_path = build_cursor_tree(cursor_root)
+    monkeypatch.setenv("TOKEN_USAGE_CURSOR_DIR", str(cursor_root))
+    monkeypatch.setattr(tu, "_CACHE_WRITE_WARNED", False)
+    adapter = tu.get_runtime_adapter("cursor")
+    source = tu.CursorSession("comp-usage-001", "sqlite", db_path)
+    original = pathlib.Path.write_text
+
+    def patched(self, data, *a, **kw):
+        if self.name.endswith(".tmp"):
+            original(self, data[:3], *a, **kw)
+            raise OSError("No space left on device")
+        return original(self, data, *a, **kw)
+
+    monkeypatch.setattr(pathlib.Path, "write_text", patched)
+    warnings = []
+    summary, cached = tu.cached_adapter_summary(adapter, source, tu.load_pricing(),
+                                                warnings)
+    assert cached is False and summary["total"]["usage"]["output"] > 0
+    assert list(tu.index_dir().rglob("*.tmp")) == []
+    assert any("cannot write summary cache" in w for w in warnings)
+
+
 def test_parse_extracts_title_model_and_partial_tokens(tu, tmp_path, monkeypatch):
     cursor_root = tmp_path / "cursor-user"
     db_path = build_cursor_tree(cursor_root)
