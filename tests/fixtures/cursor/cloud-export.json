@@ -1,0 +1,30 @@
+{
+  "id": "cloud-run-001",
+  "title": "Cloud agent documentation pass",
+  "model": "claude-sonnet-4",
+  "createdAt": "2026-06-13T12:00:00.000Z",
+  "messages": [
+    {
+      "role": "user",
+      "text": "Summarize the adapter design for Cursor Cloud Agents.",
+      "timestamp": "2026-06-13T12:00:00.000Z"
+    },
+    {
+      "role": "assistant",
+      "text": "Cloud exports expose messages and tool calls but no public usage totals.",
+      "timestamp": "2026-06-13T12:00:30.000Z",
+      "model": "claude-sonnet-4"
+    },
+    {
+      "role": "user",
+      "text": "Do not guess tokens from message length.",
+      "timestamp": "2026-06-13T12:01:00.000Z"
+    },
+    {
+      "role": "assistant",
+      "text": "Activity-only segments with zero buckets.",
+      "timestamp": "2026-06-13T12:01:20.000Z",
+      "model": "claude-sonnet-4"
+    }
+  ]
+}

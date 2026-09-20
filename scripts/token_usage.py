@@ -29,7 +29,9 @@ import json
 import math
 import os
 import re
+import sqlite3
 import sys
+import urllib.parse
 from pathlib import Path
 
 COMMAND_RE = re.compile(r"<command-name>([^<]+)</command-name>")
@@ -1691,8 +1693,384 @@ class ClaudeAdapter(RuntimeAdapter):
         return f"{path.parent.name}/{path.name}"
 
 
+CURSOR_NO_ACTIVITY = "(no activity)"
+CURSOR_USER_BUBBLE = 1
+CURSOR_ASSISTANT_BUBBLE = 2
+
+
+def cursor_user_dir():
+    """Cursor Desktop User data root (override with TOKEN_USAGE_CURSOR_DIR)."""
+    override = os.environ.get("TOKEN_USAGE_CURSOR_DIR")
+    if override:
+        return Path(override).expanduser().resolve()
+    if sys.platform == "darwin":
+        return (Path.home() / "Library" / "Application Support" / "Cursor" / "User").resolve()
+    if sys.platform == "win32":
+        appdata = os.environ.get("APPDATA")
+        if appdata:
+            return (Path(appdata) / "Cursor" / "User").resolve()
+        return (Path.home() / "AppData" / "Roaming" / "Cursor" / "User").resolve()
+    return (Path.home() / ".config" / "Cursor" / "User").resolve()
+
+
+def open_cursor_db(db_path):
+    """Open a Cursor state.vscdb read-only (never mutate Cursor state)."""
+    path = Path(db_path).expanduser().resolve()
+    uri = f"file:{urllib.parse.quote(str(path))}?mode=ro"
+    return sqlite3.connect(uri, uri=True)
+
+
+def _cursor_kv_json(conn, key):
+    row = conn.execute(
+        "SELECT value FROM cursorDiskKV WHERE key = ?", (key,)
+    ).fetchone()
+    if not row or row[0] is None:
+        return None
+    raw = row[0]
+    if isinstance(raw, memoryview):
+        raw = raw.tobytes()
+    if isinstance(raw, bytes):
+        text = raw.decode("utf-8", errors="replace")
+    else:
+        text = str(raw)
+    try:
+        return json.loads(text)
+    except ValueError:
+        return None
+
+
+class CursorSession:
+    """One Cursor conversation source (SQLite composer, export, or hook ledger)."""
+
+    __slots__ = ("composer_id", "db_path", "export_path", "ledger_path", "source")
+
+    def __init__(self, composer_id, source, db_path=None, export_path=None,
+                 ledger_path=None):
+        self.composer_id = composer_id
+        self.source = source
+        self.db_path = Path(db_path).resolve() if db_path else None
+        self.export_path = Path(export_path).resolve() if export_path else None
+        self.ledger_path = Path(ledger_path).resolve() if ledger_path else None
+
+
+def _cursor_folder_uri_to_path(folder_uri):
+    if not folder_uri:
+        return None
+    parsed = urllib.parse.urlparse(folder_uri)
+    if parsed.scheme != "file":
+        return None
+    path = urllib.parse.unquote(parsed.path)
+    if sys.platform == "win32" and path.startswith("/") and len(path) > 2 and path[2] == ":":
+        path = path[1:]
+    try:
+        return Path(path).expanduser().resolve()
+    except OSError:
+        return None
+
+
+def _cursor_workspace_ids_for_project(cursor_root, project_dir):
+    if project_dir is None:
+        return None
+    target = Path(project_dir).expanduser().resolve()
+    matched = []
+    ws_root = cursor_root / "workspaceStorage"
+    if not ws_root.is_dir():
+        return matched
+    for ws_json in ws_root.glob("*/workspace.json"):
+        try:
+            data = json.loads(ws_json.read_text(encoding="utf-8", errors="replace"))
+        except (OSError, ValueError):
+            continue
+        folder = data.get("folder") or data.get("configuration", {}).get("folder")
+        ws_path = _cursor_folder_uri_to_path(folder)
+        if ws_path == target:
+            matched.append(ws_json.parent.name)
+    return matched
+
+
+def _cursor_global_db_path(cursor_root):
+    return cursor_root / "globalStorage" / "state.vscdb"
+
+
+def _cursor_list_composers(conn, workspace_ids=None):
+    rows = []
+    for key, value in conn.execute("SELECT key, value FROM cursorDiskKV"):
+        if not key.startswith("composerData:"):
+            continue
+        composer_id = key.split(":", 1)[1]
+        data = _cursor_kv_json(conn, key)
+        if not isinstance(data, dict):
+            continue
+        ws_id = data.get("workspaceStorageId") or data.get("workspaceId")
+        if workspace_ids is not None and ws_id not in workspace_ids:
+            continue
+        updated = data.get("lastUpdatedAt") or data.get("createdAt") or 0
+        rows.append((updated, composer_id, data))
+    rows.sort(key=lambda r: (-r[0], r[1]))
+    return rows
+
+
+def _cursor_activity_label(title, prompt):
+    if title:
+        return str(title).strip()
+    prompt = (prompt or "").strip()
+    if prompt:
+        return prompt[:120]
+    return CURSOR_NO_ACTIVITY
+
+
+def _cursor_token_flat(token_count):
+    """Conservative normalization of Cursor bubble tokenCount; never infer."""
+    if not isinstance(token_count, dict):
+        return None
+    inp = token_count.get("inputTokens")
+    if inp is None:
+        inp = token_count.get("input_tokens")
+    out = token_count.get("outputTokens")
+    if out is None:
+        out = token_count.get("output_tokens")
+    cache_read = token_count.get("cacheReadTokens")
+    if cache_read is None:
+        cache_read = token_count.get("cache_read_tokens")
+    cache_write = token_count.get("cacheWriteTokens")
+    if cache_write is None:
+        cache_write = token_count.get("cache_write_tokens")
+    flat = {
+        "input": int(inp) if isinstance(inp, (int, float)) and inp > 0 else 0,
+        "output": int(out) if isinstance(out, (int, float)) and out > 0 else 0,
+        "cache_read": (int(cache_read) if isinstance(cache_read, (int, float))
+                       and cache_read > 0 else 0),
+        "cache_5m": 0,
+        "cache_1h": 0,
+    }
+    if cache_write and isinstance(cache_write, (int, float)) and cache_write > 0:
+        flat["cache_5m"] = int(cache_write)
+    if any(flat[k] for k in ("input", "output", "cache_read", "cache_5m", "cache_1h")):
+        return flat
+    return None
+
+
+def _cursor_bubble_text(bubble):
+    if not isinstance(bubble, dict):
+        return ""
+    text = bubble.get("text")
+    if isinstance(text, str):
+        return text
+    rich = bubble.get("richText")
+    if isinstance(rich, str):
+        return rich
+    return ""
+
+
+def _cursor_bubble_model(bubble, composer):
+    if isinstance(bubble, dict):
+        for key in ("modelType", "model", "modelName"):
+            val = bubble.get(key)
+            if val:
+                return str(val)
+    cfg = (composer or {}).get("modelConfig") or {}
+    return str(cfg.get("modelName") or cfg.get("model") or "unknown")
+
+
+def _cursor_parse_sqlite(session, warnings):
+    segments = []
+    saw_tokens = False
+
+    def new_segment(label, ts, prompt=""):
+        segments.append({
+            "label": label, "start_ts": ts, "by_model": {},
+            "prompt": (prompt or "").strip()[:120], "subagents": [],
+        })
+
+    db_path = session.db_path or _cursor_global_db_path(cursor_user_dir())
+    try:
+        conn = open_cursor_db(db_path)
+    except sqlite3.Error as exc:
+        warn(f"cannot open Cursor database read-only: {exc}", warnings)
+        return segments, saw_tokens
+    try:
+        composer = _cursor_kv_json(conn, f"composerData:{session.composer_id}")
+        if not isinstance(composer, dict):
+            warn(f"composer {session.composer_id!r} not found in Cursor database",
+                 warnings)
+            return segments, saw_tokens
+        title = composer.get("name") or composer.get("title") or ""
+        headers = (composer.get("fullConversationHeadersOnly")
+                   or composer.get("conversationHeaders")
+                   or [])
+        if not isinstance(headers, list):
+            headers = []
+        for header in headers:
+            if not isinstance(header, dict):
+                continue
+            bubble_id = header.get("bubbleId") or header.get("id")
+            if not bubble_id:
+                continue
+            bubble = _cursor_kv_json(
+                conn, f"bubbleId:{session.composer_id}:{bubble_id}")
+            if bubble is None:
+                warn(f"missing Cursor bubble {bubble_id!r} for composer "
+                     f"{session.composer_id!r}", warnings)
+                continue
+            btype = header.get("type", bubble.get("type"))
+            ts = bubble.get("createdAt") or bubble.get("timestamp")
+            if btype == CURSOR_USER_BUBBLE:
+                prompt = _cursor_bubble_text(bubble)
+                label = _cursor_activity_label(
+                    title if not segments else "", prompt)
+                new_segment(label, ts, prompt)
+            elif btype == CURSOR_ASSISTANT_BUBBLE:
+                if not segments:
+                    new_segment(_cursor_activity_label(title, ""), ts)
+                seg = segments[-1]
+                model = _cursor_bubble_model(bubble, composer)
+                bucket = seg["by_model"].setdefault(model, empty_usage())
+                flat = _cursor_token_flat(bubble.get("tokenCount"))
+                if flat:
+                    saw_tokens = True
+                    add_flat(bucket, flat)
+                else:
+                    bucket["requests"] += 1
+    finally:
+        conn.close()
+    return segments, saw_tokens
+
+
+def _cursor_parse_cloud_export(session, warnings):
+    segments = []
+    try:
+        data = json.loads(session.export_path.read_text(encoding="utf-8",
+                                                        errors="replace"))
+    except (OSError, ValueError) as exc:
+        warn(f"cannot read Cursor cloud export: {exc}", warnings)
+        return segments
+    title = data.get("title") or data.get("name") or ""
+    messages = data.get("messages") or []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        ts = msg.get("timestamp") or msg.get("createdAt")
+        text = msg.get("text") or msg.get("content") or ""
+        if isinstance(text, list):
+            text = text_of(text)
+        if role == "user":
+            label = _cursor_activity_label(title if not segments else "", text)
+            new = {
+                "label": label, "start_ts": ts, "by_model": {},
+                "prompt": str(text).strip()[:120], "subagents": [],
+            }
+            segments.append(new)
+        elif role == "assistant":
+            if not segments:
+                segments.append({
+                    "label": _cursor_activity_label(title, ""),
+                    "start_ts": ts, "by_model": {}, "prompt": "",
+                    "subagents": [],
+                })
+            seg = segments[-1]
+            model = str(msg.get("model") or data.get("model") or "unknown")
+            bucket = seg["by_model"].setdefault(model, empty_usage())
+            usage = msg.get("usage") or msg.get("tokenUsage")
+            flat = None
+            if isinstance(usage, dict):
+                flat = normalize_usage(usage)
+                if not any(flat[k] for k in flat):
+                    flat = None
+            if flat:
+                add_flat(bucket, flat)
+            else:
+                bucket["requests"] += 1
+    return segments
+
+
+class CursorAdapter(RuntimeAdapter):
+    name = "cursor"
+
+    def locate(self, arg=None, session_id=None, project_dir=None):
+        if arg:
+            path = Path(arg).expanduser()
+            if path.is_file():
+                if path.suffix.lower() == ".json":
+                    try:
+                        data = json.loads(path.read_text(encoding="utf-8",
+                                                         errors="replace"))
+                    except (OSError, ValueError):
+                        return None
+                    cid = (data.get("id") or data.get("conversation_id")
+                           or path.stem)
+                    return CursorSession(str(cid), "cloud_export",
+                                         export_path=path)
+                return None
+        if session_id:
+            db = _cursor_global_db_path(cursor_user_dir())
+            if db.is_file():
+                return CursorSession(str(session_id), "sqlite", db_path=db)
+        for session in self.iter_sessions(project_dir=project_dir):
+            return session
+        return None
+
+    def iter_sessions(self, project_dir=None):
+        cursor_root = cursor_user_dir()
+        ledger_root = LEDGER_DIR / "cursor"
+        if ledger_root.is_dir():
+            for path in sorted(ledger_root.glob("*.jsonl")):
+                yield CursorSession(path.stem, "hook_ledger", ledger_path=path)
+        db_path = _cursor_global_db_path(cursor_root)
+        if not db_path.is_file():
+            return
+        workspace_ids = _cursor_workspace_ids_for_project(cursor_root, project_dir)
+        try:
+            conn = open_cursor_db(db_path)
+        except sqlite3.Error:
+            return
+        try:
+            composers = _cursor_list_composers(
+                conn, workspace_ids if project_dir is not None else None)
+            for _updated, composer_id, _data in composers:
+                yield CursorSession(composer_id, "sqlite", db_path=db_path)
+        finally:
+            conn.close()
+
+    def parse(self, source):
+        warnings = []
+        if isinstance(source, (str, Path)):
+            source = self.locate(str(source))
+        if source is None:
+            warn("no Cursor session to parse", warnings)
+            return {"segments": [], "measurement": "activity_only",
+                    "warnings": warnings}
+        if source.source == "cloud_export":
+            segments = _cursor_parse_cloud_export(source, warnings)
+            measurement = "activity_only"
+        elif source.source == "hook_ledger":
+            warn("Cursor hook ledger parsing is not available yet", warnings)
+            segments = []
+            measurement = "activity_only"
+        else:
+            segments, saw_tokens = _cursor_parse_sqlite(source, warnings)
+            measurement = "partial" if saw_tokens else "activity_only"
+        return {"segments": segments, "measurement": measurement,
+                "warnings": warnings}
+
+    def project(self, source):
+        if isinstance(source, CursorSession):
+            if source.source == "cloud_export" and source.export_path:
+                return source.export_path.stem
+            return source.composer_id
+        return str(source)
+
+    def describe(self, source):
+        if isinstance(source, CursorSession):
+            if source.source == "cloud_export" and source.export_path:
+                return source.export_path.name
+            return f"composer:{source.composer_id}"
+        return str(source)
+
+
 _RUNTIME_ADAPTERS = {
     "claude": ClaudeAdapter(),
+    "cursor": CursorAdapter(),
 }
 
 
