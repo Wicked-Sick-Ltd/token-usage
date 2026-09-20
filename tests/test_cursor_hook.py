@@ -21,9 +21,17 @@ def run_cursor_hook(payload, tmp_path, extra_env=None):
     )
 
 
-def ledger_path(tmp_path, conversation_id):
-    safe = "".join(c for c in str(conversation_id) if c.isalnum() or c in "_-") or "unknown"
-    return tmp_path / "ledger" / "cursor" / f"{safe}.jsonl"
+def ledger_path(tmp_path, conversation_id, tu=None):
+    if tu is None:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("token_usage", SCRIPT)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        basename = mod._cursor_ledger_filename(conversation_id)
+    else:
+        basename = tu._cursor_ledger_filename(conversation_id)
+    return tmp_path / "ledger" / "cursor" / f"{basename}.jsonl"
 
 
 def read_ledger_lines(path):
@@ -62,7 +70,7 @@ def test_before_submit_writes_truncated_prompt(tmp_path):
         tmp_path,
     )
     assert r.returncode == 0
-    assert r.stdout.strip() == ""
+    assert json.loads(r.stdout) == {}
     lines = read_ledger_lines(ledger_path(tmp_path, "conv-abc"))
     assert len(lines) == 1
     assert lines[0]["hook"] == "beforeSubmitPrompt"
@@ -112,8 +120,29 @@ def test_unsafe_conversation_id_sanitized(tmp_path):
         tmp_path,
     )
     assert r.returncode == 0
-    assert ledger_path(tmp_path, "../evil/id").is_file()
+    assert json.loads(r.stdout) == {}
+    path = ledger_path(tmp_path, "../evil/id")
+    assert path.is_file()
+    assert ".." not in path.name
     assert not (tmp_path / "ledger" / "cursor" / ".." / "evil").exists()
+
+
+def test_conversation_ids_that_sanitize_same_stay_distinct(tmp_path):
+    a, b = "acme/foo", "acme@foo"
+    run_cursor_hook(
+        base_payload(conversation_id=a, prompt="a", hook_event_name="beforeSubmitPrompt"),
+        tmp_path,
+    )
+    run_cursor_hook(
+        base_payload(conversation_id=b, prompt="b", hook_event_name="beforeSubmitPrompt"),
+        tmp_path,
+    )
+    path_a = ledger_path(tmp_path, a)
+    path_b = ledger_path(tmp_path, b)
+    assert path_a != path_b
+    assert path_a.is_file() and path_b.is_file()
+    assert read_ledger_lines(path_a)[0]["prompt"] == "a"
+    assert read_ledger_lines(path_b)[0]["prompt"] == "b"
 
 
 def test_malformed_stdin_exits_zero(tmp_path):
@@ -126,7 +155,14 @@ def test_malformed_stdin_exits_zero(tmp_path):
         check=False,
     )
     assert r.returncode == 0
+    assert json.loads(r.stdout) == {}
     assert list((tmp_path / "ledger" / "cursor").glob("*.jsonl")) == []
+
+
+def test_cursor_hook_always_emits_empty_json_object(tmp_path):
+    r = run_cursor_hook(base_payload(prompt="x"), tmp_path)
+    assert r.returncode == 0
+    assert json.loads(r.stdout) == {}
 
 
 def test_unwritable_ledger_exits_zero(tmp_path):
@@ -139,6 +175,59 @@ def test_unwritable_ledger_exits_zero(tmp_path):
     )
     assert r.returncode == 0
     assert list(ledger_root.glob("*.jsonl")) == []
+
+
+def test_completion_tokenless_then_token_bearing_uses_later(tu, tmp_path, monkeypatch):
+    monkeypatch.setenv("TOKEN_USAGE_LEDGER_DIR", str(tmp_path / "ledger"))
+    conv = "conv-upgrade"
+    for hook, extra in (
+        ("stop", {"status": "completed"}),
+        ("afterAgentResponse", {"input_tokens": 50, "output_tokens": 5}),
+    ):
+        run_cursor_hook(
+            base_payload(
+                conversation_id=conv,
+                generation_id="gen-up",
+                hook_event_name=hook,
+                **extra,
+            ),
+            tmp_path,
+        )
+    path = ledger_path(tmp_path, conv)
+    result = tu.get_runtime_adapter("cursor").parse(
+        tu.CursorSession(conv, "hook_ledger", ledger_path=path)
+    )
+    bucket = result["segments"][0]["by_model"]["claude-sonnet-4"]
+    assert bucket["input"] == 50
+    assert bucket["output"] == 5
+    assert bucket["requests"] == 1
+
+
+def test_completion_token_bearing_then_tokenless_does_not_double(tu, tmp_path, monkeypatch):
+    monkeypatch.setenv("TOKEN_USAGE_LEDGER_DIR", str(tmp_path / "ledger"))
+    conv = "conv-first-tokens"
+    for hook, extra in (
+        ("afterAgentResponse", {"input_tokens": 50, "output_tokens": 5}),
+        ("stop", {"status": "completed"}),
+    ):
+        run_cursor_hook(
+            base_payload(
+                conversation_id=conv,
+                generation_id="gen-ft",
+                hook_event_name=hook,
+                **extra,
+            ),
+            tmp_path,
+        )
+    path = ledger_path(tmp_path, conv)
+    bucket = (
+        tu.get_runtime_adapter("cursor")
+        .parse(tu.CursorSession(conv, "hook_ledger", ledger_path=path))["segments"][0]
+        ["by_model"]["claude-sonnet-4"]
+    )
+    assert bucket["input"] == 50
+    assert bucket["output"] == 5
+    assert bucket["requests"] == 1
 
 
 def test_duplicate_completion_usage_deduped_on_parse(tu, tmp_path, monkeypatch):
@@ -247,3 +336,78 @@ def test_subagent_events_recorded(tu, tmp_path, monkeypatch):
     assert len(result["segments"][0]["subagents"]) == 1
     assert result["segments"][0]["subagents"][0]["type"] == "explore"
     assert result["segments"][0]["subagents"][0]["by_model"]["claude-sonnet-4"]["output"] == 99
+
+
+def test_subagent_id_reused_across_generations(tu, tmp_path, monkeypatch):
+    monkeypatch.setenv("TOKEN_USAGE_LEDGER_DIR", str(tmp_path / "ledger"))
+    conv = "conv-reuse-sub"
+    run_cursor_hook(
+        base_payload(
+            conversation_id=conv,
+            generation_id="gen-one",
+            hook_event_name="beforeSubmitPrompt",
+            prompt="turn one",
+        ),
+        tmp_path,
+    )
+    run_cursor_hook(
+        base_payload(
+            conversation_id=conv,
+            generation_id="gen-one",
+            hook_event_name="subagentStart",
+            subagent_id="sub-1",
+            subagent_type="explore",
+            task="first task",
+        ),
+        tmp_path,
+    )
+    run_cursor_hook(
+        base_payload(
+            conversation_id=conv,
+            generation_id="gen-one",
+            hook_event_name="subagentStop",
+            subagent_id="sub-1",
+            output_tokens=11,
+        ),
+        tmp_path,
+    )
+    run_cursor_hook(
+        base_payload(
+            conversation_id=conv,
+            generation_id="gen-two",
+            hook_event_name="beforeSubmitPrompt",
+            prompt="turn two",
+        ),
+        tmp_path,
+    )
+    run_cursor_hook(
+        base_payload(
+            conversation_id=conv,
+            generation_id="gen-two",
+            hook_event_name="subagentStart",
+            subagent_id="sub-1",
+            subagent_type="shell",
+            task="second task",
+        ),
+        tmp_path,
+    )
+    run_cursor_hook(
+        base_payload(
+            conversation_id=conv,
+            generation_id="gen-two",
+            hook_event_name="subagentStop",
+            subagent_id="sub-1",
+            output_tokens=22,
+        ),
+        tmp_path,
+    )
+    path = ledger_path(tmp_path, conv)
+    segs = (
+        tu.get_runtime_adapter("cursor")
+        .parse(tu.CursorSession(conv, "hook_ledger", ledger_path=path))["segments"]
+    )
+    assert len(segs) == 2
+    assert segs[0]["subagents"][0]["type"] == "explore"
+    assert segs[0]["subagents"][0]["by_model"]["claude-sonnet-4"]["output"] == 11
+    assert segs[1]["subagents"][0]["type"] == "shell"
+    assert segs[1]["subagents"][0]["by_model"]["claude-sonnet-4"]["output"] == 22

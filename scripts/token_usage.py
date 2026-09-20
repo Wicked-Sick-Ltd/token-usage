@@ -26,6 +26,7 @@ Stdlib only. Python 3.9+.
 """
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -1855,9 +1856,25 @@ _CURSOR_COMPLETION_HOOKS = frozenset({"stop", "afterAgentResponse"})
 
 
 def _sanitize_cursor_id(value):
-    """Filesystem-safe Cursor conversation/generation/subagent id."""
+    """Alphanumeric Cursor id for in-ledger references (generation/subagent)."""
     cleaned = re.sub(r"[^A-Za-z0-9_-]", "", str(value or ""))
     return cleaned or "unknown"
+
+
+def _cursor_ledger_filename(conversation_id):
+    """Deterministic ledger basename: readable prefix plus short hash of the raw id."""
+    raw = str(conversation_id or "")
+    prefix = re.sub(r"[^A-Za-z0-9_-]", "", raw)[:48] or "unknown"
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:8]
+    return f"{prefix}_{digest}"
+
+
+def _cursor_hook_usage_has_tokens(usage):
+    if not isinstance(usage, dict):
+        return False
+    return any(
+        usage.get(k) for k in ("input", "output", "cache_read", "cache_5m", "cache_1h")
+    )
 
 
 def _cursor_hook_usage_from_payload(payload):
@@ -1936,7 +1953,7 @@ def _cursor_hook_record_from_payload(payload):
 
 
 def _cursor_hook_ledger_path(conversation_id):
-    return LEDGER_DIR / "cursor" / f"{_sanitize_cursor_id(conversation_id)}.jsonl"
+    return LEDGER_DIR / "cursor" / f"{_cursor_ledger_filename(conversation_id)}.jsonl"
 
 
 def _append_cursor_hook_line(ledger_path, record):
@@ -1971,9 +1988,14 @@ def _run_cursor_hook(payload):
 def run_cursor_hook():
     """Cursor hooks entry point: always exit 0, append-only ledger updates."""
     try:
-        return _run_cursor_hook(_hook_payload())
+        rc = _run_cursor_hook(_hook_payload())
+        print(json.dumps({}))
+        _flush_stdout()
+        return rc
     except Exception as e:  # noqa: BLE001
         _hook_warn(f"cursor-hook: {type(e).__name__}: {e}")
+        print(json.dumps({}))
+        _flush_stdout()
         return 0
 
 
@@ -2019,6 +2041,23 @@ def _cursor_parse_hook_ledger(session, warnings):
             gen_order.append(gen)
         return gen_meta[gen]
 
+    def record_completion(meta, ev):
+        usage = ev.get("usage")
+        has_tokens = _cursor_hook_usage_has_tokens(usage)
+        if meta["usage"] is not None:
+            return
+        if has_tokens:
+            if ev.get("model"):
+                meta["model"] = str(ev.get("model"))
+            meta["usage"] = usage
+            meta["completion_done"] = True
+            return True
+        if not meta["completion_done"]:
+            if ev.get("model"):
+                meta["model"] = str(ev.get("model"))
+            meta["completion_done"] = True
+        return False
+
     for ev in events:
         gen = ev.get("generation_id")
         hook = ev.get("hook") or ""
@@ -2032,7 +2071,7 @@ def _cursor_parse_hook_ledger(session, warnings):
                 meta["label"] = meta["prompt"]
         elif hook == "subagentStart":
             sid = ev.get("subagent_id") or "unknown"
-            subagents[sid] = {
+            subagents[(gen, sid)] = {
                 "type": ev.get("subagent_type") or "agent",
                 "description": str(ev.get("task") or "").strip()[:120],
                 "model": ev.get("subagent_model") or "unknown",
@@ -2041,8 +2080,9 @@ def _cursor_parse_hook_ledger(session, warnings):
             }
         elif hook == "subagentStop":
             sid = ev.get("subagent_id") or "unknown"
+            sub_key = (gen, sid)
             sub = subagents.setdefault(
-                sid,
+                sub_key,
                 {
                     "type": ev.get("subagent_type") or "agent",
                     "description": "",
@@ -2059,7 +2099,7 @@ def _cursor_parse_hook_ledger(session, warnings):
             parent = sub.get("parent_gen") or gen
             parent_meta = meta_for(parent)
             bucket = empty_usage()
-            if isinstance(usage, dict) and any(usage.get(k) for k in usage if k != "requests"):
+            if _cursor_hook_usage_has_tokens(usage):
                 saw_tokens = True
                 for key in ("input", "output", "cache_read", "cache_5m", "cache_1h"):
                     if key in usage:
@@ -2074,17 +2114,8 @@ def _cursor_parse_hook_ledger(session, warnings):
                 "by_model": {model: bucket},
             })
         elif hook in _CURSOR_COMPLETION_HOOKS:
-            if meta["completion_done"]:
-                continue
-            meta["completion_done"] = True
-            if ev.get("model"):
-                meta["model"] = str(ev.get("model"))
-            usage = ev.get("usage")
-            if isinstance(usage, dict) and any(
-                usage.get(k) for k in ("input", "output", "cache_read", "cache_5m", "cache_1h")
-            ):
+            if record_completion(meta, ev):
                 saw_tokens = True
-                meta["usage"] = usage
 
     for gen in gen_order:
         meta = gen_meta[gen]
