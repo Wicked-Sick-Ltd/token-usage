@@ -903,7 +903,9 @@ def test_session_cost_runtime_cursor_discloses_fields(mcp, tmp_path, monkeypatch
     data = json.loads(text)
     assert data["runtime"] == "cursor"
     assert data["resolved_via"] == "session_id"
-    assert data["measurement"] in ("partial", "exact", "activity_only")
+    # The fixture is deterministic: bubbles carry usage but no per-request
+    # breakdown. Listing every level the field can hold asserted nothing.
+    assert data["measurement"] == "partial"
     assert isinstance(data["warnings"], list)
     assert "composer:comp-usage-001" in data["transcript"]
     assert data["by_label"]

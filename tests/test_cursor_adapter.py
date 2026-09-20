@@ -403,7 +403,9 @@ def test_missing_bubble_degrades_with_warning(tu, tmp_path, monkeypatch):
     adapter = tu.get_runtime_adapter("cursor")
     result = adapter.parse(tu.CursorSession("comp-usage-001", "sqlite", db_path))
     assert any("ghost-bubble" in w for w in result["warnings"])
-    assert result["measurement"] in ("partial", "activity_only")
+    # The only assistant bubble is the missing one, so nothing reported usage.
+    # "partial or activity_only" accepted either answer and caught neither.
+    assert result["measurement"] == "activity_only"
 
 
 def test_ledger_dir_env_is_honored_in_process(tu, tmp_path, monkeypatch):
