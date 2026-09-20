@@ -1,5 +1,47 @@
-"""User pricing overlay: three-layer per-key merge, malformed files non-fatal."""
+"""Bundled data/pricing.json plus user overlay; malformed files non-fatal."""
 import json
+import os
+import shutil
+import subprocess
+import sys
+
+import pytest
+from conftest import SCRIPT, assistant, usage, user, write_jsonl
+
+# Isolated bundled table for load_pricing tests — not the live file, and not an
+# in-code DEFAULT_PRICING copy. Distinctive enough that a stale fallback would
+# still look like these numbers if someone reintroduced one with the live rates.
+BUNDLED_FIXTURE = {
+    "claude-fable-5-1": {"input": 10.0, "output": 50.0, "cache_read": 0.25},
+    "claude-fable-5": {"input": 10.0, "output": 50.0},
+    "claude-haiku-4-5": {"input": 1.0, "output": 5.0},
+    "claude-sonnet-5": {"input": 2.0, "output": 10.0},
+    "claude-sonnet-4-5": {"input": 3.0, "output": 15.0},
+}
+
+
+def _install_bundled(tu, tmp_path, monkeypatch, payload):
+    path = tmp_path / "bundled" / "pricing.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if payload is None:
+        pass
+    elif isinstance(payload, bytes):
+        path.write_bytes(payload)
+    elif isinstance(payload, str):
+        path.write_text(payload)
+    else:
+        path.write_text(json.dumps(payload))
+    monkeypatch.setattr(tu, "bundled_pricing_path", lambda: path)
+    return path
+
+
+@pytest.fixture(autouse=True)
+def _isolated_bundled_pricing(tu, tmp_path, monkeypatch, request):
+    # Hook subprocess tests copy the script into a tree of their own; the
+    # packaging test must see the real plugin file.
+    if request.node.name.startswith(("test_plugin_ships", "test_hook_exits")):
+        return
+    _install_bundled(tu, tmp_path, monkeypatch, BUNDLED_FIXTURE)
 
 
 def test_user_pricing_path_respects_xdg(tu, monkeypatch, tmp_path):
@@ -92,14 +134,14 @@ def test_overlay_rejects_non_numeric_cache_read(tu, monkeypatch, tmp_path, capsy
 def test_unpriced_models_helper(tu):
     by_model = {"claude-fable-5": tu.empty_usage(),
                 "claude-mystery-9": dict(tu.empty_usage(), output=100)}
-    assert tu.unpriced_models(by_model, tu.DEFAULT_PRICING) == ["claude-mystery-9"]
-    assert tu.unpriced_models({"claude-fable-5": tu.empty_usage()}, tu.DEFAULT_PRICING) == []
+    assert tu.unpriced_models(by_model, BUNDLED_FIXTURE) == ["claude-mystery-9"]
+    assert tu.unpriced_models({"claude-fable-5": tu.empty_usage()}, BUNDLED_FIXTURE) == []
 
 
 def test_unpriced_models_skips_zero_usage_pseudo_model(tu):
     by_model = {"claude-fable-5": dict(tu.empty_usage(), output=100),
                 "<synthetic>": tu.empty_usage()}
-    assert tu.unpriced_models(by_model, tu.DEFAULT_PRICING) == []
+    assert tu.unpriced_models(by_model, BUNDLED_FIXTURE) == []
 
 
 def test_report_footnote_for_unpriced_model(tu, tmp_path):
@@ -213,3 +255,127 @@ def test_costs_stay_json_serialisable_with_a_poisoned_overlay(tu, monkeypatch, t
     assert cost == 50.0
     assert json.loads(json.dumps({"cost_usd": cost}, allow_nan=False))["cost_usd"] == 50.0
     capsys.readouterr()
+
+
+def test_no_in_code_default_pricing_table(tu):
+    assert not hasattr(tu, "DEFAULT_PRICING")
+
+
+def test_plugin_ships_bundled_pricing_json(tu):
+    path = tu.bundled_pricing_path()
+    assert path.is_file(), path
+    assert path == SCRIPT.parent.parent / "data" / "pricing.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert isinstance(data, dict) and data
+    assert all(tu._valid_rates(v) for v in data.values())
+    root = SCRIPT.parent.parent
+    assert (root / "data" / "pricing.json").is_file()
+    assert (root / "scripts" / "token_usage.py").is_file()
+    assert (root / ".claude-plugin" / "plugin.json").is_file()
+
+
+def test_missing_bundled_warns_and_leaves_models_unpriced(tu, tmp_path, monkeypatch):
+    missing = tmp_path / "absent" / "pricing.json"
+    monkeypatch.setattr(tu, "bundled_pricing_path", lambda: missing)
+    warnings = []
+    pricing = tu.load_pricing(warnings)
+    assert pricing == {}
+    assert warnings == [f"bundled pricing table missing: {missing}"]
+    assert tu.rates_for("claude-fable-5", pricing) is None
+    by_model = {"claude-fable-5": dict(tu.empty_usage(), output=100)}
+    assert tu.unpriced_models(by_model, pricing) == ["claude-fable-5"]
+    assert tu.cost_usd(by_model, pricing) is None
+
+
+def test_malformed_bundled_warns_and_leaves_models_unpriced(tu, tmp_path, monkeypatch):
+    path = _install_bundled(tu, tmp_path, monkeypatch, "{not json")
+    warnings = []
+    pricing = tu.load_pricing(warnings)
+    assert pricing == {}
+    assert warnings == [f"ignoring malformed pricing file {path}"]
+    assert tu.rates_for("claude-fable-5", pricing) is None
+
+
+def test_bundled_non_dict_leaves_models_unpriced(tu, tmp_path, monkeypatch):
+    path = _install_bundled(tu, tmp_path, monkeypatch, "[1, 2]")
+    warnings = []
+    assert tu.load_pricing(warnings) == {}
+    assert warnings == [f"ignoring malformed pricing file {path}"]
+
+
+def test_invalid_bundled_entry_is_unpriced_not_stale(tu, tmp_path, monkeypatch):
+    _install_bundled(tu, tmp_path, monkeypatch, {
+        "claude-fable-5": {"input": "cheap", "output": 50.0},
+        "claude-haiku-4-5": {"input": 1.0, "output": 5.0},
+    })
+    warnings = []
+    pricing = tu.load_pricing(warnings)
+    assert "claude-fable-5" not in pricing
+    assert pricing == {"claude-haiku-4-5": {"input": 1.0, "output": 5.0}}
+    assert any("claude-fable-5" in w for w in warnings)
+
+
+def test_overlay_applies_when_bundled_is_missing(tu, tmp_path, monkeypatch):
+    missing = tmp_path / "absent" / "pricing.json"
+    monkeypatch.setattr(tu, "bundled_pricing_path", lambda: missing)
+    p = tmp_path / "cfg" / "token-usage" / "pricing.json"
+    p.parent.mkdir(parents=True)
+    p.write_text(json.dumps({"claude-only-overlay": {"input": 1.0, "output": 2.0}}))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    warnings = []
+    pricing = tu.load_pricing(warnings)
+    assert pricing == {"claude-only-overlay": {"input": 1.0, "output": 2.0}}
+    assert any("bundled pricing table missing" in w for w in warnings)
+    assert "claude-fable-5" not in pricing
+
+
+def test_load_pricing_never_raises_on_missing_or_malformed_bundled(tu, tmp_path, monkeypatch):
+    monkeypatch.setattr(tu, "bundled_pricing_path", lambda: tmp_path / "nope.json")
+    assert tu.load_pricing() == {}
+    _install_bundled(tu, tmp_path, monkeypatch, "{")
+    assert tu.load_pricing() == {}
+
+
+def _run_hook_from_plugin_tree(plugin_root, tmp_path, transcript):
+    env = {**os.environ, "TOKEN_USAGE_LEDGER_DIR": str(tmp_path / "ledger")}
+    env.pop("TOKEN_USAGE_BUDGET_USD", None)
+    return subprocess.run(
+        [sys.executable, str(plugin_root / "scripts" / "token_usage.py"), "hook"],
+        input=json.dumps({"session_id": "s1", "transcript_path": str(transcript)}),
+        capture_output=True, text=True, env=env, check=False,
+    )
+
+
+def test_hook_exits_zero_when_bundled_pricing_is_missing(tmp_path):
+    plugin = tmp_path / "plugin"
+    (plugin / "scripts").mkdir(parents=True)
+    shutil.copy(SCRIPT, plugin / "scripts" / "token_usage.py")
+    t = write_jsonl(plugin / "t.jsonl", [
+        user("2026-07-01T10:00:00Z", command="/go"),
+        assistant("2026-07-01T10:00:05Z", usage(out=100), request_id="r1"),
+    ])
+    r = _run_hook_from_plugin_tree(plugin, tmp_path, t)
+    assert r.returncode == 0, r.stderr
+    assert "bundled pricing table missing" in r.stderr
+    ledger = json.loads((tmp_path / "ledger" / "s1.json").read_text())
+    assert ledger["total"]["unpriced_models"] == ["claude-fable-5"]
+    assert ledger["total"]["cost_usd"] is None
+
+
+def test_hook_exits_zero_when_bundled_pricing_is_malformed(tmp_path):
+    plugin = tmp_path / "plugin"
+    (plugin / "scripts").mkdir(parents=True)
+    (plugin / "data").mkdir()
+    shutil.copy(SCRIPT, plugin / "scripts" / "token_usage.py")
+    (plugin / "data" / "pricing.json").write_text("{not json")
+    t = write_jsonl(plugin / "t.jsonl", [
+        user("2026-07-01T10:00:00Z", command="/go"),
+        assistant("2026-07-01T10:00:05Z", usage(out=100), request_id="r1"),
+    ])
+    r = _run_hook_from_plugin_tree(plugin, tmp_path, t)
+    assert r.returncode == 0, r.stderr
+    assert "ignoring malformed pricing file" in r.stderr
+    ledger = json.loads((tmp_path / "ledger" / "s1.json").read_text())
+    assert ledger["total"]["unpriced_models"] == ["claude-fable-5"]
+    assert ledger["total"]["cost_usd"] is None
+
