@@ -315,7 +315,9 @@ Costs are **API-price estimates** from the bundled `data/pricing.json` (rates as
   sends completion token fields), read-only Desktop SQLite composers/bubbles, or an
   explicit Cloud Agent export path.
 - Cross-session `history`, `insights`, and `top_consumers` with `measurement` and
-  `warnings` in JSON — same aggregate shapes as Claude.
+  `warnings` in JSON — same aggregate shapes as Claude. Markdown names a
+  `partial` or activity-only measurement, so zero buckets are never mistaken for
+  genuinely free usage.
 - API-price estimates from `data/pricing.json` (not subscription billing).
 
 **Cannot:**

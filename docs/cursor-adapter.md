@@ -18,7 +18,14 @@ Hook payloads (when present) include stable `conversation_id`, per-turn
 may also carry cumulative `input_tokens`, `output_tokens`, `cache_read_tokens`,
 and `cache_write_tokens`. Those token fields are **optional** and are not yet
 documented on the main hooks reference page; treat them as best-effort when
-present.
+present. They are stored **verbatim**: subtracting the cache buckets out of a
+cumulative `input_tokens` happens at parse time, where a payload whose cache
+exceeds its input can be reported as `partial` instead of silently clamped.
+
+Ledger records also carry the workspace roots, which give a hook-captured
+session its project identity (`history --by project`, `--project`, and
+`project_dir` discovery); a session whose payloads carried none falls back to
+the `cursor-hooks` project.
 
 The hook command is **fail-open**: it appends to a local ledger and never blocks
 the agent. Prompt text in the ledger is truncated to the same 120-character
@@ -39,8 +46,11 @@ Cursor Desktop stores VS Code–derived state under:
 through `workspaceStorage/*/workspace.json`.
 
 This schema is **not** a public API. `CursorAdapter` opens the database
-**read-only** with stdlib `sqlite3`, never migrates or writes. Per-bubble
-`tokenCount` values are described by Cursor staff as often zero and not billing
+**read-only** with stdlib `sqlite3`, never migrates or writes. Discovery selects
+only `composerData:%` rows, so a scan never pulls every bubble blob through
+memory, and a missing or renamed `cursorDiskKV` degrades to an empty,
+warned-about read rather than a traceback. Per-bubble `tokenCount` values are
+described by Cursor staff as often zero and not billing
 truth ([forum discussion](https://forum.cursor.com/t/cursordiskkv-table-records-always-show-0-for-tokencount/155984)).
 
 Override the root in tests with `TOKEN_USAGE_CURSOR_DIR`.
@@ -74,11 +84,17 @@ title → bounded first-user-prompt summary → `(no activity)`.
 
 ## Read path confidence (CursorAdapter)
 
-1. **Hook ledger** — `~/.cache/token-usage/cursor/<conversation_id>.jsonl`
-   (override with `TOKEN_USAGE_LEDGER_DIR`). Prospective **exact** attribution when
-   completion hooks include token fields; dedupe by `generation_id`.
-2. **Desktop SQLite** — historical composers/bubbles; `exact`, `partial`, or
-   `activity_only` depending on `tokenCount` and bubble shape.
+1. **Hook ledger** — `~/.cache/token-usage/cursor/<sanitised-prefix>_<hash>.jsonl`
+   (override with `TOKEN_USAGE_LEDGER_DIR`). The filename hashes the raw
+   conversation id for path safety, so each record also stores that id verbatim;
+   it is what deduplicates a hook-captured conversation against Cursor's own
+   composer row for the same conversation, and what `session_id` resolves.
+   Prospective **exact** attribution when completion hooks include token fields
+   (**partial** when a payload's cache buckets exceed its reported input, which
+   is disclosed rather than clamped); dedupe by `generation_id`.
+2. **Desktop SQLite** — historical composers/bubbles; `partial` when any
+   `tokenCount` is usable and `activity_only` otherwise. It never claims
+   `exact`: per-bubble counts are best-effort, not a billing source.
 3. **Explicit Cloud export JSON** — activity and any present usage fields only.
 
 CLI and MCP accept `--runtime` / `runtime`: `claude` (default), `cursor`, or
@@ -98,8 +114,10 @@ CLI and MCP accept `--runtime` / `runtime`: `claude` (default), `cursor`, or
 - Subscription credits, invoice totals, or plan-tier billing.
 - Reliable per-bubble tokens from SQLite when `tokenCount` is zero or missing.
 - Retrospective exact usage before hooks were installed.
-- Parent hook totals **include subagents** — child usage is exact only when child
-  events are captured and linked.
+- Cursor's parent completion hook reports the parent turn only, so a subagent is
+  measured only when its own `subagentStop` event is captured and linked. Each
+  captured child is merged into its spawning segment exactly once, and the
+  per-agent rows stay subsets of that segment's total.
 - Marginal token cost of individual `@` attachments.
 - Guaranteed Cloud export token totals.
 

@@ -18,8 +18,10 @@ stays on disk in the user's home directory unless they copy reports elsewhere.
 
 - Optional hook commands in `hooks/hooks-cursor.json` (also bundled by
   `.cursor-plugin/plugin.json`) append to
-  `~/.cache/token-usage/cursor/<conversation_id>.jsonl` — fail-open, truncated
-  prompts only.
+  `~/.cache/token-usage/cursor/<sanitised-prefix>_<hash>.jsonl` — fail-open,
+  truncated prompts only. The directory is created owner-only where the
+  filesystem supports it; records carry the raw conversation id, the workspace
+  roots and a UTC timestamp, never assistant output.
 - Reads Cursor Desktop `state.vscdb` **read-only** when building historical
   reports (`TOKEN_USAGE_CURSOR_DIR` overrides the User data root in tests).
 - Accepts explicit Cloud Agent export JSON paths supplied by the user; does not

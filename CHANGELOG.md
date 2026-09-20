@@ -6,7 +6,72 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Cursor runtime support** — token-usage is no longer Claude-only. A
+  `RuntimeAdapter` seam (`ClaudeAdapter`, `CursorAdapter`) discovers, parses and
+  describes sessions per runtime; Claude Code remains the default and its
+  numbers are unchanged.
+- **`--runtime {claude,cursor,auto}`** on `report`, `json`, `history`,
+  `insights` and `top_consumers`. `auto` picks one corpus only when it is
+  unambiguous and never mixes Claude transcripts with Cursor conversations in a
+  single call.
+- **MCP `runtime` argument** on `session_cost`, `history`, `insights`, `diff`
+  and `top_consumers`, with `runtime`, `measurement` and `warnings` in the
+  results and the same disclosures in markdown.
+- **`token-usage cursor-hook`** — a fail-open Cursor hook command
+  (`hooks/hooks-cursor.json`) for `beforeSubmitPrompt`, `stop`,
+  `afterAgentResponse`, `subagentStart` and `subagentStop`. It always exits 0,
+  prints `{}`, and never blocks the agent.
+- **Cursor hook ledger** — append-only JSONL under
+  `~/.cache/token-usage/cursor/` (override with `TOKEN_USAGE_LEDGER_DIR`)
+  holding the raw conversation id, UTC timestamps, workspace roots, truncated
+  prompt previews and the hook's raw token fields. It is the highest-confidence
+  Cursor read path, ahead of read-only Desktop SQLite and explicit Cloud Agent
+  export JSON.
+
 ### Fixed
+
+- **Cursor sessions counted twice** — a conversation captured by hooks and also
+  present as a Cursor composer row is one session: ledger records now carry the
+  raw `conversation_id`, which deduplicates them (ledger wins) and doubles as
+  the session id the CLI and MCP report.
+- **Destructive Cursor hook token capture** — raw `input_tokens` /
+  `output_tokens` / `cache_read_tokens` / `cache_write_tokens` are stored
+  verbatim and normalized at parse time. Cache is subtracted only when
+  `input >= cache_read + cache_write`; otherwise the measured input is kept, a
+  warning is emitted, and the session is downgraded to `partial` instead of
+  being clamped to zero.
+- **Cursor subagent usage missing from parent totals** — each captured child is
+  merged into its spawning segment exactly once (per-agent rows remain subsets),
+  so a turn that delegated all of its work no longer reports zero and vanishes.
+- **Cursor `--project` returned nothing** — the project slug substring filter
+  and the filesystem discovery hint were one argument. They are separate now,
+  with Claude-compatible substring semantics.
+- **Undated Cursor hook sessions** — hook segments take their generation's first
+  event timestamp, so `--since`, `--by day`, history, top consumers and insights
+  windows include them.
+- **Cursor SQLite schema drift** — a missing or renamed `cursorDiskKV` warns and
+  degrades to an empty/activity-only read instead of raising `sqlite3.Error`,
+  and `--runtime auto` probes no longer fail an otherwise-valid Claude query.
+- **`--runtime auto` traceback** — a selector the Cursor adapter rejects is
+  reported as that adapter's own message when nothing else matched, never as a
+  `CursorExplicitSelectorError` traceback (CLI) or stack trace (MCP).
+- **Cursor measurement hidden in markdown** — report, history, top consumers,
+  insights and their MCP markdown name a `partial` or activity-only measurement
+  and the warnings behind it, so zero buckets cannot read as free usage; corpus
+  JSON carries per-level `measurements` counts.
+- **Cursor session identity** — hook sessions take their project from the
+  recorded workspace roots instead of all becoming `cursor-hooks`, ledgers are
+  ordered by recency rather than filename, an MCP `session_id` that exists in no
+  ledger and no composer row fails closed, and an adapter session name renders
+  as `composer:<id>` rather than `/composer:<id>`.
+- **Cursor discovery cost and privacy** — discovery selects only
+  `composerData:%` rows (it used to read every bubble blob and then re-query
+  each key), the ledger root is read lazily so a changed
+  `TOKEN_USAGE_LEDGER_DIR` takes effect, the ledger directory is created
+  owner-only where supported, and `sqlite3` is imported where it is used so the
+  hook path never loads it.
 
 - **Cursor hooks schema** — `hooks/hooks-cursor.json` now uses Cursor's documented
   `version: 1` flat entries (`command`/`timeout` per event, no nested `hooks` wrapper).
