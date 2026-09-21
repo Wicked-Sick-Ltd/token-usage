@@ -7,7 +7,9 @@ import pytest
 
 SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "token_usage.py"
 
-# Loaded once at collection. Module-level constants (e.g. LEDGER_DIR) bind at import — in-process tests must monkeypatch module attributes, not env vars.
+# Loaded once at collection. Roots that a test may need to move (the ledger and
+# Cursor data dirs) are read per call, so env vars are enough; anything still
+# bound at import has to be monkeypatched as a module attribute instead.
 _spec = importlib.util.spec_from_file_location("token_usage", SCRIPT)
 # Public so module-level test helpers (not just the `tu` fixture) can
 # monkeypatch the very same module object the MCP server imports.
@@ -25,6 +27,29 @@ def _isolated_pricing_overlay(monkeypatch, tmp_path_factory):
     # Keep the suite hermetic: never read the developer's real user overlay.
     monkeypatch.setenv("XDG_CONFIG_HOME",
                        str(tmp_path_factory.mktemp("xdg-isolated")))
+
+
+@pytest.fixture(autouse=True)
+def _isolated_ledger_dir(monkeypatch, tmp_path_factory):
+    # The Cursor hook ledger root doubles as a session corpus, so a developer's
+    # own ~/.cache/token-usage/cursor would otherwise join every fixture-scoped
+    # scan. Pinned for the whole suite; a test that wants its own ledger sets
+    # TOKEN_USAGE_LEDGER_DIR afterwards (monkeypatch keeps the later value).
+    monkeypatch.setenv("TOKEN_USAGE_LEDGER_DIR",
+                       str(tmp_path_factory.mktemp("ledger-isolated")))
+
+
+@pytest.fixture(autouse=True)
+def _isolated_cursor_dir(monkeypatch, tmp_path_factory):
+    # Cursor's User directory is a session corpus too, so a developer running
+    # the suite with Cursor installed would otherwise have their own
+    # composers joined to every fixture-scoped scan — and subprocess CLI tests
+    # build their env from os.environ, so this has to be an env var. Pinned
+    # for the whole suite at a path that does not exist; a test that wants its
+    # own root sets TOKEN_USAGE_CURSOR_DIR afterwards (monkeypatch keeps the
+    # later value).
+    monkeypatch.setenv("TOKEN_USAGE_CURSOR_DIR",
+                       str(tmp_path_factory.mktemp("cursor-isolated") / "User"))
 
 
 @pytest.fixture(autouse=True)

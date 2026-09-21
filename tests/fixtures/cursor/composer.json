@@ -1,0 +1,14 @@
+{
+  "composerId": "comp-usage-001",
+  "name": "Refactor token parser",
+  "createdAt": 1718193600000,
+  "lastUpdatedAt": 1718197200000,
+  "workspaceStorageId": "ws-project-alpha",
+  "modelConfig": {"modelName": "claude-sonnet-4"},
+  "fullConversationHeadersOnly": [
+    {"bubbleId": "user-1", "type": 1},
+    {"bubbleId": "asst-1", "type": 2},
+    {"bubbleId": "user-2", "type": 1},
+    {"bubbleId": "asst-2", "type": 2}
+  ]
+}

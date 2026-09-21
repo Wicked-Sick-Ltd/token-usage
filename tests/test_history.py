@@ -339,6 +339,29 @@ def test_unwritable_cache_dir_still_returns_rows(tu, tmp_path, monkeypatch, caps
     assert err.count("cannot write summary cache") == 1      # one warning per process
 
 
+def test_cache_write_failure_leaves_no_temp_file_in_the_index(tu, tmp_path, monkeypatch,
+                                                              capsys):
+    # A cache write that dies part way through still hands back freshly parsed
+    # rows and warns once — but the index directory is long-lived, so a
+    # truncated temp file there would accumulate scan after scan.
+    import pathlib
+    seed_projects(tmp_path, monkeypatch)
+    monkeypatch.setattr(tu, "_CACHE_WRITE_WARNED", False)
+    original = pathlib.Path.write_text
+
+    def patched(self, data, *a, **kw):
+        if self.name.endswith(".tmp"):
+            original(self, data[:3], *a, **kw)
+            raise OSError("No space left on device")
+        return original(self, data, *a, **kw)
+
+    monkeypatch.setattr(pathlib.Path, "write_text", patched)
+    data = tu.run_history(by="project")
+    assert len(data["rows"]) == 2                         # correctness is unaffected
+    assert list(tu.index_dir().rglob("*.tmp")) == []
+    assert capsys.readouterr().err.count("cannot write summary cache") == 1
+
+
 def test_window_insights_and_baseline_disclose_skipped_transcripts(tu, tmp_path, monkeypatch):
     proj = seed_projects(tmp_path, monkeypatch)
     (proj / "-Users-x-repo-two" / "junk.jsonl").mkdir()
@@ -533,3 +556,109 @@ def test_huge_since_is_an_error_not_an_overflow_traceback(tmp_path):
     assert r.returncode == 1
     assert "Traceback" not in r.stderr
     assert "invalid --since value '999999999999d'" in r.stderr
+
+
+def test_cursor_history_two_composers(tu, tmp_path, monkeypatch):
+    from test_cursor_adapter import build_cursor_tree
+
+    cursor_root = tmp_path / "cursor-user"
+    build_cursor_tree(
+        cursor_root,
+        composer_id="comp-alpha",
+        workspace_id="ws-alpha",
+        project_folder=str((tmp_path / "alpha").resolve()),
+    )
+    build_cursor_tree(
+        cursor_root,
+        composer_id="comp-beta",
+        workspace_id="ws-beta",
+        project_folder=str((tmp_path / "beta").resolve()),
+    )
+    monkeypatch.setenv("TOKEN_USAGE_CURSOR_DIR", str(cursor_root))
+    monkeypatch.setenv("TOKEN_USAGE_LEDGER_DIR", str(tmp_path / "cache"))
+
+    data = tu.run_history(by="project", runtime="cursor")
+    assert data["runtime"] == "cursor"
+    alpha_slug = tu.project_slug(str((tmp_path / "alpha").resolve()))
+    beta_slug = tu.project_slug(str((tmp_path / "beta").resolve()))
+    keys = {r["key"] for r in data["rows"]}
+    assert keys == {alpha_slug, beta_slug}
+    assert sum(r["calls"] for r in data["rows"]) == 2
+
+
+def test_cursor_history_groups_composers_in_one_workspace(tu, tmp_path, monkeypatch):
+    from test_cursor_adapter import build_cursor_tree
+
+    cursor_root = tmp_path / "cursor-user"
+    repo = (tmp_path / "mono-repo").resolve()
+    repo.mkdir()
+    build_cursor_tree(
+        cursor_root,
+        composer_id="comp-a",
+        workspace_id="ws-mono",
+        project_folder=str(repo),
+    )
+    build_cursor_tree(
+        cursor_root,
+        composer_id="comp-b",
+        workspace_id="ws-mono",
+        project_folder=str(repo),
+    )
+    monkeypatch.setenv("TOKEN_USAGE_CURSOR_DIR", str(cursor_root))
+    monkeypatch.setenv("TOKEN_USAGE_LEDGER_DIR", str(tmp_path / "cache"))
+
+    data = tu.run_history(by="project", runtime="cursor")
+    assert len(data["rows"]) == 1
+    assert data["rows"][0]["key"] == tu.project_slug(str(repo))
+    assert data["rows"][0]["calls"] == 2
+
+
+def test_auto_corpus_resolves_cursor_when_only_cursor_has_sessions(tu, tmp_path, monkeypatch):
+    from test_cursor_adapter import build_cursor_tree
+
+    cursor_root = tmp_path / "cursor-user"
+    build_cursor_tree(cursor_root)
+    monkeypatch.setenv("TOKEN_USAGE_CURSOR_DIR", str(cursor_root))
+    monkeypatch.setenv("TOKEN_USAGE_LEDGER_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("TOKEN_USAGE_PROJECTS_DIR", str(tmp_path / "empty-projects"))
+
+    _adapter, name = tu.resolve_runtime_corpus("auto")
+    assert name == "cursor"
+    assert _adapter.name == "cursor"
+
+
+def test_auto_corpus_not_ambiguous_when_claude_dir_has_only_unreadable_jsonl(
+        tu, tmp_path, monkeypatch):
+    from test_cursor_adapter import build_cursor_tree
+
+    proj = tmp_path / "projects"
+    (proj / "slug").mkdir(parents=True)
+    (proj / "slug" / "junk.jsonl").write_bytes(b"\xff\xfe\n")
+    cursor_root = tmp_path / "cursor-user"
+    build_cursor_tree(cursor_root)
+    monkeypatch.setenv("TOKEN_USAGE_PROJECTS_DIR", str(proj))
+    monkeypatch.setenv("TOKEN_USAGE_CURSOR_DIR", str(cursor_root))
+    monkeypatch.setenv("TOKEN_USAGE_LEDGER_DIR", str(tmp_path / "cache"))
+
+    _adapter, name = tu.resolve_runtime_corpus("auto")
+    assert name == "cursor"
+
+
+def test_cursor_top_consumers_sessions(tu, tmp_path, monkeypatch):
+    from test_cursor_adapter import build_cursor_tree
+
+    cursor_root = tmp_path / "cursor-user"
+    build_cursor_tree(cursor_root, composer_id="comp-one")
+    build_cursor_tree(
+        cursor_root,
+        composer_id="comp-two",
+        workspace_id="ws-two",
+        project_folder=str((tmp_path / "two").resolve()),
+    )
+    monkeypatch.setenv("TOKEN_USAGE_CURSOR_DIR", str(cursor_root))
+    monkeypatch.setenv("TOKEN_USAGE_LEDGER_DIR", str(tmp_path / "cache"))
+
+    data = tu.run_top_consumers(by="session", since="36500d", runtime="cursor", limit=5)
+    assert data["runtime"] == "cursor"
+    assert len(data["rows"]) == 2
+    assert {r["session_id"] for r in data["rows"]} == {"comp-one", "comp-two"}

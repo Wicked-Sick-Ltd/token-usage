@@ -330,6 +330,46 @@ def test_insights_cli_rejects_transcript_plus_since(tu, tmp_path):
     assert out.returncode != 0 and "--since" in out.stderr
 
 
+def test_cursor_session_rejects_mismatched_runtime(tu, tmp_path, monkeypatch):
+    from test_cursor_adapter import build_cursor_tree
+
+    cursor_root = tmp_path / "cursor-user"
+    build_cursor_tree(cursor_root, composer_id="comp-zero")
+    monkeypatch.setenv("TOKEN_USAGE_CURSOR_DIR", str(cursor_root))
+    monkeypatch.setenv("TOKEN_USAGE_LEDGER_DIR", str(tmp_path / "cache"))
+    session = next(tu.get_runtime_adapter("cursor").iter_sessions())
+    import pytest
+    with pytest.raises(SystemExit, match="CursorSession.*cursor"):
+        tu.run_insights(transcript=session, runtime="claude")
+
+
+def test_cursor_insights_activity_only_no_cost_findings(tu, tmp_path, monkeypatch):
+    from test_cursor_adapter import build_cursor_tree
+
+    cursor_root = tmp_path / "cursor-user"
+    zero_headers = [
+        {"bubbleId": "zero-user", "type": 1},
+        {"bubbleId": "zero-asst", "type": 2},
+    ]
+    build_cursor_tree(
+        cursor_root,
+        composer_id="comp-zero",
+        bubble_headers=zero_headers,
+    )
+    monkeypatch.setenv("TOKEN_USAGE_CURSOR_DIR", str(cursor_root))
+    monkeypatch.setenv("TOKEN_USAGE_LEDGER_DIR", str(tmp_path / "cache"))
+
+    adapter = tu.get_runtime_adapter("cursor")
+    session = next(adapter.iter_sessions())
+    r = tu.run_insights(transcript=session, runtime="cursor")
+    assert r["runtime"] == "cursor"
+    assert r.get("measurement") == "activity_only"
+    cost_rules = {"cost-outlier", "budget-pace", "spend-trend", "top-mover", "adhoc-dominance"}
+    assert cost_rules.isdisjoint({f["rule"] for f in r["findings"]})
+    parsed = adapter.parse(session)
+    assert sum(tu.sum_buckets(s["by_model"])["requests"] for s in parsed["segments"]) >= 1
+
+
 def test_insights_cli_rejects_project_without_since(tu, tmp_path):
     # --project only filters the window scan; in session mode it was dropped
     # in silence, so `insights --project alpha` reported on whichever session
@@ -569,3 +609,92 @@ def test_window_caveat_distinguishes_no_sessions_from_no_spend(tu):
     assert caveat(first_half_cost=0.0) == ("(baseline: no spend in the window's first half; "
                                            "the trend rules need both halves)")
     assert caveat(first_half_cost=1.5) == ""
+
+
+CLAUDE_SESSION_INSIGHT_KEYS = {
+    "mode", "findings", "baseline", "skipped_transcripts",
+    "projects_dir_missing", "transcript_path",
+}
+CLAUDE_WINDOW_INSIGHT_KEYS = {
+    "mode", "findings", "baseline", "skipped_transcripts", "projects_dir_missing",
+}
+
+
+def test_default_claude_session_insights_keeps_its_pre_runtime_shape(tu, tmp_path,
+                                                                     monkeypatch):
+    # Routing Claude through the adapter seam added runtime, measurement and
+    # warnings to a payload that never carried them. `json` was already put
+    # back; `insights` drifted the same way.
+    monkeypatch.setenv("TOKEN_USAGE_PROJECTS_DIR", str(tmp_path / "projects"))
+    monkeypatch.setenv("TOKEN_USAGE_LEDGER_DIR", str(tmp_path / "cache"))
+    current = _session(tmp_path, "current", 1000)
+    r = tu.run_insights(transcript=current)
+    assert set(r) == CLAUDE_SESSION_INSIGHT_KEYS
+    assert r["transcript_path"] == str(current)
+
+
+def test_default_claude_window_insights_keeps_its_pre_runtime_shape(tu, tmp_path,
+                                                                    monkeypatch):
+    monkeypatch.setenv("TOKEN_USAGE_PROJECTS_DIR", str(tmp_path / "projects"))
+    monkeypatch.setenv("TOKEN_USAGE_LEDGER_DIR", str(tmp_path / "cache"))
+    _session(tmp_path, "s0", 1000)
+    r = tu.run_insights(since="36500d")
+    assert set(r) == CLAUDE_WINDOW_INSIGHT_KEYS
+
+
+def test_claude_insights_warnings_still_reach_stderr(tu, tmp_path, monkeypatch, capsys):
+    # Dropping "warnings" from the payload must not silence the warning: the
+    # CLI reader has always been told on stderr.
+    monkeypatch.setenv("TOKEN_USAGE_PROJECTS_DIR", str(tmp_path / "missing"))
+    monkeypatch.setenv("TOKEN_USAGE_LEDGER_DIR", str(tmp_path / "cache"))
+    warnings = []
+    r = tu.run_insights(since="36500d", warnings=warnings)
+    assert "warnings" not in r
+    assert any("projects directory" in w for w in warnings)
+    assert "no readable Claude Code projects directory" in capsys.readouterr().err
+
+
+def test_cursor_session_insights_still_disclose_runtime_and_measurement(
+    tu, tmp_path, monkeypatch,
+):
+    from test_cursor_adapter import build_cursor_tree
+
+    cursor_root = tmp_path / "cursor-user"
+    build_cursor_tree(cursor_root)
+    monkeypatch.setenv("TOKEN_USAGE_CURSOR_DIR", str(cursor_root))
+    monkeypatch.setenv("TOKEN_USAGE_LEDGER_DIR", str(tmp_path / "cache"))
+    session = next(tu.get_runtime_adapter("cursor").iter_sessions())
+    r = tu.run_insights(transcript=session, runtime="cursor")
+    assert r["runtime"] == "cursor"
+    assert r["measurement"] == "partial"
+    assert isinstance(r["warnings"], list)
+
+
+def test_cursor_window_insights_still_disclose_runtime_and_measurements(
+    tu, tmp_path, monkeypatch,
+):
+    from test_cursor_adapter import build_cursor_tree
+
+    cursor_root = tmp_path / "cursor-user"
+    build_cursor_tree(cursor_root)
+    monkeypatch.setenv("TOKEN_USAGE_CURSOR_DIR", str(cursor_root))
+    monkeypatch.setenv("TOKEN_USAGE_LEDGER_DIR", str(tmp_path / "cache"))
+    r = tu.run_insights(since="2020-01-01", runtime="cursor")
+    assert r["runtime"] == "cursor"
+    assert r["measurements"]
+    assert isinstance(r["warnings"], list)
+
+
+def test_insights_cli_json_default_claude_shape(tu, tmp_path):
+    t = write_jsonl(tmp_path / "projects" / "p" / "s.jsonl", [
+        user("2026-07-01T10:00:00Z", command="/go"),
+        assistant("2026-07-01T10:00:05Z", usage(out=100), request_id="r1"),
+    ])
+    env = {**os.environ,
+           "TOKEN_USAGE_PROJECTS_DIR": str(tmp_path / "projects"),
+           "TOKEN_USAGE_LEDGER_DIR": str(tmp_path / "cache")}
+    out = subprocess.run([sys.executable, "scripts/token_usage.py", "insights",
+                          str(t), "--json"],
+                         capture_output=True, text=True, env=env, check=False)
+    assert out.returncode == 0, out.stderr
+    assert set(jsonlib.loads(out.stdout)) == CLAUDE_SESSION_INSIGHT_KEYS

@@ -28,10 +28,16 @@ FORMAT = {"type": "string", "enum": ["json", "markdown"],
                          "transcript, resolved_via and warnings. "
                          "markdown: the rendered table/text."}
 SESSION_SELECTORS = {
-    "transcript": {"type": "string", "description": "Path to a session .jsonl transcript."},
+    "transcript": {"type": "string",
+                   "description": "Session source: Claude .jsonl transcript, or Cursor cloud "
+                                  "export .json when runtime is cursor."},
     "session_id": {"type": "string",
-                   "description": "Claude Code session id; searched across every project."},
+                   "description": "Claude Code session id (claude) or Cursor composer id "
+                                  "(cursor); searched across the selected runtime."},
 }
+RUNTIME = {"type": "string", "enum": list(tu.RUNTIME_CHOICES),
+           "description": "Agent runtime to read (default: claude). auto picks one corpus "
+                          "when unambiguous; never mixes Claude and Cursor in one call."}
 SINCE = {"type": "string", "minLength": 1,
          "description": "Window start: Nd (e.g. 7d) or YYYY-MM-DD."}
 PROJECT = {"type": "string", "minLength": 1,
@@ -41,7 +47,8 @@ INSIGHTS_PROJECT = dict(PROJECT, description=PROJECT["description"]
 
 
 def _schema(properties, required=None):
-    s = {"type": "object", "properties": dict(properties, format=FORMAT),
+    s = {"type": "object",
+         "properties": dict(properties, runtime=RUNTIME, format=FORMAT),
          "additionalProperties": False}
     if required:
         s["required"] = list(required)
@@ -319,6 +326,138 @@ def check_since(value, key="since"):
         raise ToolError(str(e.code).replace("token-usage: ", "", 1)) from None
 
 
+def runtime_from_args(args):
+    return args.get("runtime") or "claude"
+
+
+def _runtime_exit_as_tool_error(exc):
+    message = exc.code if isinstance(exc.code, str) and exc.code else None
+    if message:
+        raise ToolError(message.replace("token-usage: ", "", 1)) from None
+    raise ToolError("runtime resolution failed") from None
+
+
+def pick_cursor_session(path=None, session_id=None, project_dir=None):
+    """(CursorSession, rung) for cursor runtime, or ToolError."""
+    adapter = tu.get_runtime_adapter("cursor")
+    if path is not None and not path.strip():
+        raise ToolError("transcript must not be blank")
+    if session_id is not None and not session_id.strip():
+        raise ToolError("session_id must not be blank")
+    if path and session_id:
+        raise ToolError("pass transcript OR session_id, not both")
+    if path:
+        try:
+            source = adapter.locate(path.strip(), project_dir=project_dir)
+        except tu.CursorExplicitSelectorError as e:
+            raise ToolError(str(e).replace("token-usage: ", "", 1)) from None
+        if source is None:
+            raise ToolError(f"transcript not found: {path}")
+        return source, "explicit"
+    if session_id:
+        source = adapter.locate(session_id=session_id.strip(), project_dir=project_dir)
+        if source is None:
+            raise ToolError(f"no Cursor session for id {session_id!r}")
+        return source, "session_id"
+    source = adapter.locate(project_dir=project_dir)
+    if source is None:
+        root = tu.cursor_user_dir()
+        raise ToolError(f"no Cursor session found under {root}; pass transcript or session_id")
+    return source, "project_dir" if project_dir else "any_project"
+
+
+def pick_session_auto(path=None, session_id=None, project_dir=None, warnings=None):
+    """Resolve runtime=auto for a session tool; (adapter, runtime_name, source, rung)."""
+    if path and session_id:
+        raise ToolError("pass transcript OR session_id, not both")
+    if session_id and not str(session_id).strip():
+        raise ToolError("session_id must not be blank")
+    if path and not str(path).strip():
+        raise ToolError("transcript must not be blank")
+    transcript_arg = path.strip() if path else None
+    if session_id and not transcript_arg:
+        claude_t, _ = tu.locate_transcript_with_source(session_id=session_id.strip(),
+                                                       project_dir=project_dir)
+        try:
+            cursor_s = tu.get_runtime_adapter("cursor").locate(
+                session_id=session_id.strip(), project_dir=project_dir)
+        except (OSError, ValueError, AttributeError):
+            cursor_s = None
+        if claude_t and cursor_s:
+            raise ToolError("runtime auto is ambiguous — both Claude and Cursor sessions "
+                            "match; pass runtime claude or cursor")
+        if cursor_s:
+            return tu.get_runtime_adapter("cursor"), "cursor", cursor_s, "session_id"
+        if claude_t:
+            return tu.get_runtime_adapter("claude"), "claude", claude_t, "session_id"
+        raise ToolError(f"no transcript for session id {session_id!r} under {tu.projects_dir()}")
+    try:
+        adapter, runtime_name = tu.resolve_runtime(
+            "auto", transcript_arg=transcript_arg, project_dir=project_dir, warnings=warnings)
+    except SystemExit as e:
+        _runtime_exit_as_tool_error(e)
+    if adapter.name == "claude":
+        if transcript_arg:
+            t, via = tu.locate_transcript_with_source(transcript_arg, project_dir=project_dir)
+            if not t:
+                raise ToolError(f"transcript not found: {transcript_arg}")
+            return adapter, runtime_name, t, via
+        t, via = pick_transcript(None, None)  # uses discovery + env
+        return adapter, runtime_name, t, via
+    source, via = pick_cursor_session(transcript_arg, session_id, project_dir=project_dir)
+    return adapter, runtime_name, source, via
+
+
+def pick_session(runtime, path=None, session_id=None, warnings=None):
+    """(adapter, runtime_name, source, rung) — source is Path (claude) or CursorSession."""
+    if path and session_id:
+        raise ToolError("pass transcript OR session_id, not both")
+    project_dir = project_dir_from_env()
+    if runtime == "auto":
+        return pick_session_auto(path, session_id, project_dir=project_dir, warnings=warnings)
+    if runtime == "cursor":
+        source, via = pick_cursor_session(path, session_id, project_dir=project_dir)
+        return tu.get_runtime_adapter("cursor"), "cursor", source, via
+    t, via = pick_transcript(path, session_id)
+    return tu.get_runtime_adapter("claude"), "claude", t, via
+
+
+def resolve_corpus_runtime(runtime, warnings=None):
+    """Corpus auto/claude/cursor resolution with MCP project-dir hint (runtime-local)."""
+    project_dir = project_dir_from_env()
+    try:
+        return tu.resolve_runtime_corpus(runtime, project_dir=project_dir, warnings=warnings)
+    except SystemExit as e:
+        _runtime_exit_as_tool_error(e)
+
+
+def _corpus_kwargs(args, warnings):
+    return {"corpus_resolution": resolve_corpus_runtime(runtime_from_args(args), warnings)}
+
+
+def session_payload(adapter, runtime_name, source, via, pricing, warnings,
+                    extra_markdown_flags=()):
+    """Aggregate one session for session_cost-style tools."""
+    if adapter.name == "claude":
+        parsed = {"segments": tu.parse_session(source), "measurement": "exact", "warnings": []}
+        path_label = str(source)
+    else:
+        parsed = adapter.parse(source)
+        path_label = adapter.describe(source)
+    for w in parsed.get("warnings") or []:
+        if w not in warnings:
+            warnings.append(w)
+    measurement = tu.measurement_for_adapter(adapter, parsed)
+    data = tu.aggregate(parsed["segments"], pricing)
+    data = tu.apply_measurement_costs(data, measurement)
+    data["transcript"] = data["transcript_path"] = path_label
+    data["resolved_via"] = via
+    if runtime_name != "claude":
+        data["runtime"] = runtime_name
+        data["measurement"] = measurement
+    return data
+
+
 def pick_transcript(path=None, session_id=None):
     """(transcript, rung) for a session selector, or ToolError saying what was
     tried. Resolution order: see token_usage.locate_transcript_with_source
@@ -351,29 +490,52 @@ def guess_note(transcript, via):
     discovery guessed it."""
     if via not in ("cwd", "any_project"):
         return []
+    parent = transcript.parent.name if hasattr(transcript, "parent") else str(transcript)
     return [("Note: no project dir was supplied; this is the newest transcript under "
-             f"{transcript.parent.name}, which may not be the session you meant.")]
+             f"{parent}, which may not be the session you meant.")]
+
+
+def guess_note_cursor(via):
+    if via not in ("any_project",):
+        return []
+    return [("Note: no project dir was supplied; this is the newest Cursor session found, "
+             "which may not be the session you meant.")]
 
 
 def finish(data, render, fmt, warnings, footnotes=()):
     """JSON payload (always carrying "warnings"), or the rendered markdown with
-    each footnote — the warnings included — as its own block."""
+    each footnote — the warnings included — as its own block.
+
+    Warnings the render already discloses are not repeated: saying them twice
+    reads like twice as many problems. That is decided by looking for the
+    measurement disclosure's own warnings note, not by asking whether each
+    warning's text appears somewhere in the markdown — a short warning is a
+    substring of some table header, project slug or model id by accident, and
+    matching that way drops it while nothing in the render calls it a warning."""
     data["warnings"] = warnings
     if fmt != "markdown":
         return json.dumps(data)
-    return "\n\n".join([render(data), *footnotes, *(f"Warning: {w}" for w in warnings)])
+    rendered = render(data)
+    note = tu.warnings_note(warnings)
+    named = bool(note) and note in rendered
+    return "\n\n".join([rendered, *footnotes,
+                        *([] if named else (f"Warning: {w}" for w in warnings))])
 
 
 def tool_session_cost(args):
     warnings = []
-    t, via = pick_transcript(args.get("transcript"), args.get("session_id"))
-    data = tu.aggregate(tu.parse_session(t), tu.load_pricing(warnings))
-    data["transcript"] = data["transcript_path"] = str(t)
-    data["resolved_via"] = via
+    runtime = runtime_from_args(args)
+    adapter, runtime_name, source, via = pick_session(
+        runtime, args.get("transcript"), args.get("session_id"), warnings=warnings)
+    data = session_payload(adapter, runtime_name, source, via, tu.load_pricing(warnings),
+                           warnings)
+    note_target = source if adapter.name == "claude" else adapter.describe(source)
     return finish(data,
                   lambda d: tu.render_report(d, show_agents=bool(args.get("agents")),
                                              show_models=bool(args.get("models"))),
-                  args.get("format"), warnings, guess_note(t, via))
+                  args.get("format"), warnings,
+                  guess_note(note_target, via) if adapter.name == "claude"
+                  else guess_note_cursor(via))
 
 
 def _looks_like_path(value):
@@ -384,19 +546,77 @@ def _looks_like_path(value):
     return value.endswith(".jsonl") or any(sep in value for sep in seps)
 
 
-def _path_or_id(value):
-    """diff accepts either form per side: a path-shaped value is a path, else a session id."""
+def _diff_selector(value):
     if not value.strip():
         raise ToolError("old/new must not be blank")
-    if _looks_like_path(value):
-        return pick_transcript(path=value)[0]
-    return pick_transcript(session_id=value)[0]
+    path = value if _looks_like_path(value) or value.endswith(".json") else None
+    session_id = value if path is None else None
+    return path, session_id
+
+
+def _resolve_diff_side(value, runtime, warnings=None):
+    """One diff side: (adapter, source, resolved_runtime_name)."""
+    path, session_id = _diff_selector(value)
+    pick = "auto" if runtime == "auto" else runtime
+    adapter, runtime_name, source, _via = pick_session(
+        pick, path, session_id, warnings=warnings)
+    return adapter, source, runtime_name
+
+
+def _diff_aggregate(adapter, source, pricing, warnings):
+    """(aggregate, measurement) for one side of a diff."""
+    if adapter.name == "claude":
+        return tu.aggregate(tu.parse_session(source), pricing), "exact"
+    parsed = adapter.parse(source)
+    for w in parsed.get("warnings") or []:
+        if w not in warnings:
+            warnings.append(w)
+    measurement = tu.measurement_for_adapter(adapter, parsed)
+    data = tu.aggregate(parsed["segments"], pricing)
+    return tu.apply_measurement_costs(data, measurement), measurement
+
+
+def _diff_from_aggregates(a, b):
+    rows = []
+    for label in sorted(set(a["by_label"]) | set(b["by_label"])):
+        ra, rb = a["by_label"].get(label), b["by_label"].get(label)
+        ca = ra["cost_usd"] if ra else None
+        cb = rb["cost_usd"] if rb else None
+        oa = ra["usage"]["output"] if ra else 0
+        ob = rb["usage"]["output"] if rb else 0
+        unpriceable = (ra is not None and ca is None) or (rb is not None and cb is None)
+        delta_cost = None if unpriceable else (cb if rb else 0.0) - (ca if ra else 0.0)
+        rows.append({"label": label, "a_cost": ca, "b_cost": cb,
+                     "a_output": oa, "b_output": ob,
+                     "delta_cost": delta_cost,
+                     "delta_output": ob - oa})
+    rows.sort(key=lambda r: (-abs(r["delta_cost"] or 0.0), r["label"]))
+    return {"a_total": a["total"], "b_total": b["total"], "rows": rows}
 
 
 def tool_diff(args):
     warnings = []
-    old, new = _path_or_id(args["old"]), _path_or_id(args["new"])
-    data = tu.diff_data(old, new, tu.load_pricing(warnings))
+    runtime = runtime_from_args(args)
+    old_ad, old_src, _old_rn = _resolve_diff_side(args["old"], runtime, warnings)
+    new_ad, new_src, _new_rn = _resolve_diff_side(args["new"], runtime, warnings)
+    if old_ad.name != new_ad.name:
+        raise ToolError("diff cannot mix Claude and Cursor sessions"
+                        + ("; pass runtime claude or cursor"
+                           if runtime == "auto" else ""))
+    pricing = tu.load_pricing(warnings)
+    if old_ad.name == "claude":
+        data = tu.diff_data(old_src, new_src, pricing)
+        measurement = "exact"
+    else:
+        a, a_measurement = _diff_aggregate(old_ad, old_src, pricing, warnings)
+        b, b_measurement = _diff_aggregate(new_ad, new_src, pricing, warnings)
+        data = _diff_from_aggregates(a, b)
+        # The comparison inherits its weakest side: a Δ measured against an
+        # activity-only session is itself activity-only.
+        measurement = tu.worst_measurement(a_measurement, b_measurement)
+    if runtime != "claude":
+        data["runtime"] = runtime if runtime != "auto" else old_ad.name
+        data["measurement"] = measurement
     return finish(data, tu.render_diff, args.get("format"), warnings)
 
 
@@ -404,7 +624,8 @@ def tool_history(args):
     warnings = []
     check_since(args.get("since"))
     data = tu.run_history(by=args.get("by", "project"), since=args.get("since"),
-                          project=args.get("project"), warnings=warnings)
+                          project=args.get("project"), warnings=warnings,
+                          runtime=runtime_from_args(args), **_corpus_kwargs(args, warnings))
     return finish(data, tu.render_history, args.get("format"), warnings)
 
 
@@ -427,13 +648,21 @@ def tool_insights(args):
     footnotes = []
     if args.get("since"):
         data = tu.run_insights(since=args["since"], project=args.get("project"),
-                               budget=budget, warnings=warnings)
+                               budget=budget, warnings=warnings,
+                               runtime=runtime_from_args(args),
+                               **_corpus_kwargs(args, warnings))
     else:
-        t, via = pick_transcript(args.get("transcript"), args.get("session_id"))
-        data = tu.run_insights(transcript=str(t), budget=budget, warnings=warnings)
-        data["transcript"] = str(t)
+        runtime = runtime_from_args(args)
+        adapter, _runtime_name, source, via = pick_session(
+            runtime, args.get("transcript"), args.get("session_id"), warnings=warnings)
+        transcript_arg = str(source) if adapter.name == "claude" else source
+        data = tu.run_insights(transcript=transcript_arg, budget=budget, warnings=warnings,
+                               runtime=runtime, corpus_project_dir=project_dir_from_env())
+        data["transcript"] = (str(source) if adapter.name == "claude"
+                              else adapter.describe(source))
         data["resolved_via"] = via
-        footnotes = guess_note(t, via)
+        footnotes = (guess_note(source, via) if adapter.name == "claude"
+                     else guess_note_cursor(via))
     return finish(data, tu.render_insights, args.get("format"), warnings, footnotes)
 
 
@@ -443,7 +672,8 @@ def tool_top_consumers(args):
     check_since(since)
     data = tu.run_top_consumers(by=args.get("by", "session"), since=since,
                                 project=args.get("project"), limit=args.get("limit", 10),
-                                warnings=warnings)
+                                warnings=warnings, runtime=runtime_from_args(args),
+                                **_corpus_kwargs(args, warnings))
     return finish(data, tu.render_top_consumers, args.get("format"), warnings)
 
 

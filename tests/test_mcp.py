@@ -5,7 +5,7 @@ import os
 import subprocess
 import sys
 
-from conftest import SERVER, TOKEN_USAGE, assistant, usage, user, write_jsonl
+from conftest import SCRIPT, SERVER, TOKEN_USAGE, assistant, usage, user, write_jsonl
 
 PLUGIN_ROOT = SERVER.parent.parent
 
@@ -126,6 +126,8 @@ def test_tools_list_names_and_schema_shape(mcp):
         assert s["type"] == "object" and s["additionalProperties"] is False
         assert "format" in s["properties"]
         assert s["properties"]["format"]["enum"] == ["json", "markdown"]
+        rt = s["properties"]["runtime"]
+        assert rt["enum"] == ["claude", "cursor", "auto"]
     by_name = {t["name"]: t for t in tools}
     assert by_name["diff"]["inputSchema"]["required"] == ["old", "new"]
     assert by_name["history"]["inputSchema"]["properties"]["by"]["enum"] == \
@@ -335,6 +337,24 @@ def test_insights_window_mode(mcp, tmp_path, monkeypatch):
     assert data["mode"] == "window" and data["baseline"]["sessions"] == 2
     text, err = call(mcp, "insights", since="7d", session_id="bbb-222")
     assert err and "not both" in text
+
+
+def test_insights_claude_envelope_adds_warnings_without_popping_runtime(
+    mcp, tmp_path, monkeypatch,
+):
+    # The envelope's warnings key is added in one place (finish); a default
+    # Claude payload never carries runtime/measurement, so tool_insights has
+    # no per-key cleanup to do.
+    _proj, _s1, s2 = seed(tmp_path, monkeypatch)
+    data = json.loads(call(mcp, "insights", session_id="bbb-222")[0])
+    assert data["warnings"] == []
+    assert "runtime" not in data
+    assert "measurement" not in data
+    assert data["transcript"] == str(s2)
+    assert data["resolved_via"] == "session_id"
+    window = json.loads(call(mcp, "insights", since="2026-01-01")[0])
+    assert window["warnings"] == []
+    assert "runtime" not in window
 
 
 def test_insights_blank_transcript_is_rejected_even_with_since(mcp, tmp_path, monkeypatch):
@@ -846,6 +866,305 @@ def test_overflowing_since_is_a_tool_error_not_a_traceback(mcp, tmp_path, monkey
         assert err is True, tool
         assert "invalid since value '999999999999d'" in text, tool
     assert "Traceback" not in capsys.readouterr().err
+
+
+def seed_cursor(tmp_path, monkeypatch):
+    from test_cursor_adapter import build_cursor_tree
+
+    cursor_root = tmp_path / "cursor-user"
+    build_cursor_tree(cursor_root)
+    monkeypatch.setenv("TOKEN_USAGE_CURSOR_DIR", str(cursor_root))
+    monkeypatch.setenv("TOKEN_USAGE_LEDGER_DIR", str(tmp_path / "cache"))
+    monkeypatch.delenv("TOKEN_USAGE_PROJECT_DIR", raising=False)
+    monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+    monkeypatch.chdir(tmp_path)
+    return cursor_root
+
+
+def test_invalid_runtime_is_a_tool_error(mcp, tmp_path, monkeypatch):
+    seed(tmp_path, monkeypatch)
+    text, err = call(mcp, "history", runtime="gemini")
+    assert err and "runtime must be one of" in text
+
+
+def test_session_cost_cursor_explicit_bogus_transcript_fails_closed(mcp, tmp_path, monkeypatch):
+    seed_cursor(tmp_path, monkeypatch)
+    text, err = call(mcp, "session_cost", runtime="cursor",
+                     transcript="comp-not-a-file-on-disk")
+    assert err, text
+    assert "Refactor token parser" not in text
+
+
+def test_session_cost_runtime_cursor_discloses_fields(mcp, tmp_path, monkeypatch):
+    seed_cursor(tmp_path, monkeypatch)
+    text, err = call(mcp, "session_cost", runtime="cursor",
+                     session_id="comp-usage-001")
+    assert not err, text
+    data = json.loads(text)
+    assert data["runtime"] == "cursor"
+    assert data["resolved_via"] == "session_id"
+    # The fixture is deterministic: bubbles carry usage but no per-request
+    # breakdown. Listing every level the field can hold asserted nothing.
+    assert data["measurement"] == "partial"
+    assert isinstance(data["warnings"], list)
+    assert "composer:comp-usage-001" in data["transcript"]
+    assert data["by_label"]
+
+
+def test_session_cost_claude_default_omits_runtime_key(mcp, tmp_path, monkeypatch):
+    _proj, s1, _s2 = seed(tmp_path, monkeypatch)
+    data = json.loads(call(mcp, "session_cost", transcript=str(s1))[0])
+    assert "runtime" not in data
+    assert "measurement" not in data
+    assert data["resolved_via"] == "explicit"
+
+
+def test_history_runtime_cursor(mcp, tmp_path, monkeypatch):
+    seed_cursor(tmp_path, monkeypatch)
+    data = json.loads(call(mcp, "history", runtime="cursor")[0])
+    assert data["runtime"] == "cursor"
+    assert data["warnings"] == []
+    assert len(data["rows"]) >= 1
+
+
+def test_insights_runtime_cursor_session_mode(mcp, tmp_path, monkeypatch):
+    seed_cursor(tmp_path, monkeypatch)
+    data = json.loads(call(mcp, "insights", runtime="cursor",
+                           session_id="comp-usage-001")[0])
+    assert data["mode"] == "session"
+    assert data["runtime"] == "cursor"
+    assert data["measurement"] == "partial"
+    assert data["resolved_via"] == "session_id"
+    assert "composer:comp-usage-001" in data["transcript"]
+    assert isinstance(data["warnings"], list)
+
+
+def test_top_consumers_runtime_cursor(mcp, tmp_path, monkeypatch):
+    seed_cursor(tmp_path, monkeypatch)
+    data = json.loads(call(mcp, "top_consumers", runtime="cursor", since="2020-01-01")[0])
+    assert data["runtime"] == "cursor"
+    assert len(data["rows"]) >= 1
+
+
+def test_diff_runtime_auto_rejects_mixed_claude_and_cursor(mcp, tmp_path, monkeypatch):
+    from test_cursor_adapter import build_cursor_tree
+
+    _proj, s1, _s2 = seed(tmp_path, monkeypatch)
+    build_cursor_tree(tmp_path / "cursor-user")
+    monkeypatch.setenv("TOKEN_USAGE_CURSOR_DIR", str(tmp_path / "cursor-user"))
+    text, err = call(mcp, "diff", runtime="auto", old=str(s1), new="comp-usage-001")
+    assert err and "cannot mix" in text.lower()
+
+
+def test_diff_runtime_cursor_explicit(mcp, tmp_path, monkeypatch):
+    from test_cursor_adapter import build_cursor_tree
+
+    cursor_root = tmp_path / "cursor-user"
+    build_cursor_tree(cursor_root, composer_id="comp-a")
+    build_cursor_tree(cursor_root, composer_id="comp-b")
+    monkeypatch.setenv("TOKEN_USAGE_CURSOR_DIR", str(cursor_root))
+    monkeypatch.setenv("TOKEN_USAGE_LEDGER_DIR", str(tmp_path / "cache"))
+    data = json.loads(call(mcp, "diff", runtime="cursor",
+                           old="comp-a", new="comp-b")[0])
+    assert data["runtime"] == "cursor"
+    assert "rows" in data
+
+
+def test_history_runtime_auto_uses_claude_when_project_hint_excludes_cursor(
+    mcp, tmp_path, monkeypatch,
+):
+    from test_cursor_adapter import build_cursor_tree
+
+    seed(tmp_path, monkeypatch)
+    build_cursor_tree(tmp_path / "cursor-user")
+    monkeypatch.setenv("TOKEN_USAGE_CURSOR_DIR", str(tmp_path / "cursor-user"))
+    monkeypatch.setenv("TOKEN_USAGE_PROJECT_DIR", "/Users/x/alpha")
+    data = json.loads(call(mcp, "history", runtime="auto", since="2026-01-01")[0])
+    assert "runtime" not in data
+    assert len(data["rows"]) >= 1
+
+
+def test_insights_runtime_cursor_window_mode(mcp, tmp_path, monkeypatch):
+    seed_cursor(tmp_path, monkeypatch)
+    data = json.loads(call(mcp, "insights", runtime="cursor", since="2020-01-01")[0])
+    assert data["mode"] == "window"
+    assert data["runtime"] == "cursor"
+    assert isinstance(data["warnings"], list)
+
+
+def test_claude_project_dir_does_not_select_cursor_sessions(mcp, tmp_path, monkeypatch):
+    """Project env vars are hints within one runtime, not cross-runtime selectors."""
+    _proj, s1, _s2 = seed(tmp_path, monkeypatch)
+    seed_cursor(tmp_path, monkeypatch)
+    monkeypatch.setenv("TOKEN_USAGE_PROJECT_DIR", "/Users/x/alpha")
+    data = json.loads(call(mcp, "session_cost", runtime="cursor",
+                           session_id="comp-usage-001")[0])
+    assert data["runtime"] == "cursor"
+    assert "composer:" in data["transcript"]
+    assert data["transcript"] != str(s1)
+
+
+def test_session_cost_markdown_cursor_discloses_measurement(mcp, tmp_path, monkeypatch):
+    seed_cursor(tmp_path, monkeypatch)
+    text, err = call(mcp, "session_cost", runtime="cursor",
+                     session_id="comp-usage-001", format="markdown")
+    assert not err, text
+    assert "Measurement: partial" in text
+    assert "/composer:" not in text
+
+
+def test_history_markdown_cursor_discloses_measurement(mcp, tmp_path, monkeypatch):
+    seed_cursor(tmp_path, monkeypatch)
+    text, err = call(mcp, "history", runtime="cursor", format="markdown")
+    assert not err, text
+    assert "partial session(s)" in text
+
+
+def test_markdown_warnings_are_named_once(mcp, tmp_path, monkeypatch):
+    # The measurement disclosure names the warnings behind it; the markdown
+    # envelope must not then repeat each of them verbatim.
+    from test_cursor_adapter import build_cursor_tree
+
+    cursor_root = tmp_path / "cursor-user"
+    build_cursor_tree(cursor_root, bubble_headers=[{"bubbleId": "user-1", "type": 1},
+                                                   {"bubbleId": "ghost-bubble", "type": 2}])
+    monkeypatch.setenv("TOKEN_USAGE_CURSOR_DIR", str(cursor_root))
+    monkeypatch.setenv("TOKEN_USAGE_LEDGER_DIR", str(tmp_path / "cache"))
+    monkeypatch.delenv("TOKEN_USAGE_PROJECT_DIR", raising=False)
+    monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+    text, err = call(mcp, "session_cost", runtime="cursor",
+                     session_id="comp-usage-001", format="markdown")
+    assert not err, text
+    assert "activity-only" in text
+    assert text.count("missing Cursor bubble 'ghost-bubble'") == 1
+
+
+def test_markdown_repeats_a_warning_the_render_only_mentions_in_passing(mcp):
+    # Suppression used to be "is this warning a substring of the markdown",
+    # which any short warning satisfies by accident — a warning whose text
+    # collides with a table header, project slug or model id was dropped even
+    # though nothing in the render disclosed it as a warning.
+    rendered = "| Project | Calls | Total |\n|---|---:|---:|"
+    out = mcp.finish({}, lambda d: rendered, "markdown", ["Total"])
+    assert "Warning: Total" in out
+
+
+def test_markdown_does_not_repeat_the_rendered_warnings_note(mcp, tu):
+    warnings = ["missing Cursor bubble 'ghost-bubble' for composer 'comp-1'"]
+    note = tu.warnings_note(warnings)
+    out = mcp.finish({}, lambda d: f"body\n{note}", "markdown", warnings)
+    assert out.count(warnings[0]) == 1
+    assert "Warning:" not in out
+
+
+def test_markdown_repeats_every_warning_when_the_note_is_absent(mcp):
+    warnings = ["first problem", "second problem"]
+    out = mcp.finish({}, lambda d: "body with no warnings note", "markdown", warnings)
+    assert "Warning: first problem" in out
+    assert "Warning: second problem" in out
+
+
+def test_session_cost_auto_bogus_selector_is_a_clean_tool_error(mcp, tmp_path,
+                                                               monkeypatch, capsys):
+    seed_cursor(tmp_path, monkeypatch)
+    monkeypatch.setenv("TOKEN_USAGE_PROJECTS_DIR", str(tmp_path / "no-claude"))
+    text, err = call(mcp, "session_cost", runtime="auto",
+                     transcript="comp-not-a-file-on-disk")
+    assert err, text
+    assert "CursorExplicitSelectorError" not in text
+    assert ".json" in text
+    assert "Traceback" not in capsys.readouterr().err
+
+
+def test_cursor_session_id_not_in_the_database_fails_closed(mcp, tmp_path, monkeypatch):
+    # The composer id was taken on trust, so an id from another machine
+    # produced an empty "session" instead of saying it does not exist.
+    seed_cursor(tmp_path, monkeypatch)
+    text, err = call(mcp, "session_cost", runtime="cursor",
+                     session_id="comp-from-another-machine")
+    assert err, text
+    assert "comp-from-another-machine" in text
+    assert "Refactor token parser" not in text
+
+
+def two_cursor_composers(tmp_path, monkeypatch):
+    """A Cursor corpus with a partial composer and an activity-only one."""
+    from test_cursor_adapter import build_cursor_tree
+
+    cursor_root = tmp_path / "cursor-user"
+    build_cursor_tree(cursor_root, composer_id="comp-partial")
+    build_cursor_tree(
+        cursor_root, composer_id="comp-zero",
+        bubble_headers=[{"bubbleId": "zero-user", "type": 1},
+                        {"bubbleId": "zero-asst", "type": 2}])
+    monkeypatch.setenv("TOKEN_USAGE_CURSOR_DIR", str(cursor_root))
+    monkeypatch.setenv("TOKEN_USAGE_LEDGER_DIR", str(tmp_path / "cache"))
+    return cursor_root
+
+
+def test_diff_cursor_json_reports_the_worst_side_measurement(mcp, tmp_path, monkeypatch):
+    # A diff is only as trustworthy as its least-measured side, and the JSON
+    # said nothing at all: a Δ against an unmeasured session is not a Δ of $0.
+    two_cursor_composers(tmp_path, monkeypatch)
+    data = json.loads(call(mcp, "diff", runtime="cursor",
+                           old="comp-partial", new="comp-zero")[0])
+    assert data["runtime"] == "cursor"
+    assert data["measurement"] == "activity_only"
+
+
+def test_diff_cursor_json_is_partial_when_both_sides_are(mcp, tmp_path, monkeypatch):
+    two_cursor_composers(tmp_path, monkeypatch)
+    data = json.loads(call(mcp, "diff", runtime="cursor",
+                           old="comp-partial", new="comp-partial")[0])
+    assert data["measurement"] == "partial"
+
+
+def test_diff_cursor_markdown_discloses_activity_only(mcp, tmp_path, monkeypatch):
+    two_cursor_composers(tmp_path, monkeypatch)
+    text, err = call(mcp, "diff", runtime="cursor", old="comp-partial",
+                     new="comp-zero", format="markdown")
+    assert not err, text
+    assert "activity-only" in text
+    assert "unmeasured" in text
+
+
+def test_diff_cursor_markdown_discloses_partial(mcp, tmp_path, monkeypatch):
+    two_cursor_composers(tmp_path, monkeypatch)
+    text, err = call(mcp, "diff", runtime="cursor", old="comp-partial",
+                     new="comp-partial", format="markdown")
+    assert not err, text
+    assert "Measurement: partial" in text
+
+
+def test_diff_default_claude_keeps_its_pre_runtime_shape(mcp, tmp_path, monkeypatch):
+    _proj, s1, s2 = seed(tmp_path, monkeypatch)
+    data = json.loads(call(mcp, "diff", old=str(s1), new=str(s2))[0])
+    assert "runtime" not in data
+    assert "measurement" not in data
+    text, err = call(mcp, "diff", old=str(s1), new=str(s2), format="markdown")
+    assert not err, text
+    assert "Measurement:" not in text
+
+
+def test_default_claude_session_json_matches_the_cli(mcp, tmp_path, monkeypatch):
+    # The MCP payload has always omitted runtime/measurement for Claude; the
+    # CLI started emitting them, so the same session had two shapes and a
+    # pre-runtime Claude consumer saw keys it had never been promised.
+    _proj, s1, _s2 = seed(tmp_path, monkeypatch)
+    data = json.loads(call(mcp, "session_cost", transcript=str(s1))[0])
+    assert "runtime" not in data
+    assert "measurement" not in data
+
+    cli = json.loads(subprocess.run(
+        [sys.executable, str(SCRIPT), "json", str(s1)],
+        capture_output=True, text=True, check=True,
+        env={**os.environ,
+             "TOKEN_USAGE_PROJECTS_DIR": str(tmp_path / "projects"),
+             "TOKEN_USAGE_LEDGER_DIR": str(tmp_path / "cache")},
+    ).stdout)
+    assert "runtime" not in cli
+    assert "measurement" not in cli
+    assert cli["transcript_path"] == data["transcript_path"]
 
 
 def test_serve_exits_cleanly_when_stdin_is_none(mcp, monkeypatch):

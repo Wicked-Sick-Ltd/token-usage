@@ -6,6 +6,141 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Cursor runtime support** — token-usage is no longer Claude-only. A
+  `RuntimeAdapter` seam (`ClaudeAdapter`, `CursorAdapter`) discovers, parses and
+  describes sessions per runtime; Claude Code remains the default and its
+  numbers are unchanged.
+- **`--runtime {claude,cursor,auto}`** on `report`, `json`, `history`,
+  `insights` and `top_consumers`. `auto` picks one corpus only when it is
+  unambiguous and never mixes Claude transcripts with Cursor conversations in a
+  single call.
+- **MCP `runtime` argument** on `session_cost`, `history`, `insights`, `diff`
+  and `top_consumers`, with `runtime`, `measurement` and `warnings` in the
+  results and the same disclosures in markdown.
+- **`token-usage cursor-hook`** — a fail-open Cursor hook command. It always
+  exits 0, prints `{}`, and never blocks the agent. `hooks/hooks-cursor.json`
+  registers it for `beforeSubmitPrompt`, `stop`, `subagentStart` and
+  `subagentStop`; `afterAgentResponse` payloads are also recognised as
+  completion events, but that event is not registered.
+- **Cursor hook ledger** — append-only JSONL under
+  `~/.cache/token-usage/cursor/` (override with `TOKEN_USAGE_LEDGER_DIR`)
+  holding the raw conversation id, UTC timestamps, workspace roots, truncated
+  prompt previews and the hook's raw token fields. It is the highest-confidence
+  Cursor read path, ahead of read-only Desktop SQLite and explicit Cloud Agent
+  export JSON.
+- **Cursor Plugin manifest** — `.cursor-plugin/plugin.json` bundles the stdio MCP
+  server (`scripts/mcp_server.py`), Cursor hooks (`hooks/hooks-cursor.json`), and
+  the `skills/report/` skill. Paths are relative to the plugin root;
+  `${CURSOR_PLUGIN_ROOT}` is used in hook and MCP `args`. Manual `~/.cursor/mcp.json`
+  registration remains documented in the README. There is still no repository-root
+  `mcp.json` (Claude Code would treat it as project-scope config in a checkout).
+- **`docs/cursor-adapter.md`** — evidence note distinguishing official hooks/plugin
+  docs, reverse-engineered SQLite, observed Cloud export behavior, v1 limitations,
+  privacy, and a future Gemini/Codex adapter contract.
+- **README** — Cursor Plugin and manual MCP install, `--runtime cursor` CLI examples,
+  and a concise v1 can/cannot measure section for Cursor.
+- **`dashboard` CLI** — self-contained HTML from indexed history (inline CSS and SVG,
+  no CDN or `<script>`); `--since`, `--project`, `--output`, and `--runtime`.
+- **`live` CLI** — polling terminal refresh of the current session report;
+  `--interval`, `--iterations`, `--agents`, `--models`; Ctrl-C exits 0.
+- **`export` CLI** — RFC-8259 JSONL with schema `token-usage.aggregate.v1` and
+  OTel-style metric names (local interchange, not OTLP wire format); session and
+  history scopes with atomic file output. History records carry
+  `measurement_counts`, the scan's per-session measurement tally, so a consumer
+  can tell one weak session from an entirely unmeasured corpus (and an empty
+  tally from either).
+- **`examples/statusline.ps1`** — dependency-free **PowerShell 7+** statusline for
+  **Claude Code on Windows**: reads the statusline JSON from stdin and resolves
+  `TOKEN_USAGE_LEDGER_DIR/<session_id>.json` (or `~/.cache/token-usage/<session_id>.json`),
+  falling back to `latest.json` — a best-effort symlink pointing at the latest
+  session aggregate — only when there is no usable session id or that session has
+  no ledger yet. Silent (exit 0, no output) on missing or malformed input and
+  ledgers. Not for Cursor (JSONL hooks, no per-session JSON or `latest.json`).
+- **README (0.7 surfaces)** — dashboard/live/export usage, privacy/redaction notes,
+  Windows statusline setup, and MCP scope (dashboard/export remain CLI-only).
+- **Roadmap disclosures** — HTTP/SSE MCP transport and true OTLP mapping deferred
+  to 0.7.1+; user-configurable insight thresholds YAGNI; fleet aggregation and
+  LLM-generated insights out of scope; Gemini/Codex via the adapter contract in
+  `docs/cursor-adapter.md`.
+
+### Changed
+
+- **Statusline docs** — clarify `statusline.ps1` targets Claude Code's ledger
+  layout on Windows, needs PowerShell 7+, and reads `session_id` from stdin;
+  Cursor users should use `live --runtime cursor` because hook storage is JSONL
+  with no per-session JSON or `latest.json`.
+- **`skills/report/SKILL.md`** — Cursor runtime and MCP guidance without a single
+  hardcoded tool prefix.
+- **SECURITY.md** — scope now includes Cursor hook commands, read-only Cursor Desktop
+  SQLite, and Cursor hook ledgers under `~/.cache/token-usage/cursor/`.
+
+### Fixed
+
+- **Cursor sessions counted twice** — a conversation captured by hooks and also
+  present as a Cursor composer row is one session: ledger records now carry the
+  raw `conversation_id`, which deduplicates them (ledger wins) and doubles as
+  the session id the CLI and MCP report.
+- **Destructive Cursor hook token capture** — raw `input_tokens` /
+  `output_tokens` / `cache_read_tokens` / `cache_write_tokens` are stored
+  verbatim and normalized at parse time. Cache is subtracted only when
+  `input >= cache_read + cache_write`; otherwise the measured input is kept, a
+  warning is emitted, and the session is downgraded to `partial` instead of
+  being clamped to zero.
+- **Cursor subagent usage missing from parent totals** — each captured child is
+  merged into its spawning segment exactly once (per-agent rows remain subsets),
+  so a turn that delegated all of its work no longer reports zero and vanishes.
+- **Cursor `--project` returned nothing** — the project slug substring filter
+  and the filesystem discovery hint were one argument. They are separate now,
+  with Claude-compatible substring semantics.
+- **Undated Cursor hook sessions** — hook segments take their generation's first
+  event timestamp, so `--since`, `--by day`, history, top consumers and insights
+  windows include them.
+- **Cursor SQLite schema drift** — a missing or renamed `cursorDiskKV` warns and
+  degrades to an empty/activity-only read instead of raising `sqlite3.Error`,
+  and `--runtime auto` probes no longer fail an otherwise-valid Claude query.
+- **`--runtime auto` traceback** — a selector the Cursor adapter rejects is
+  reported as that adapter's own message when nothing else matched, never as a
+  `CursorExplicitSelectorError` traceback (CLI) or stack trace (MCP).
+- **Cursor measurement hidden in markdown** — report, history, top consumers,
+  insights and their MCP markdown name a `partial` or activity-only measurement
+  and the warnings behind it, so zero buckets cannot read as free usage; corpus
+  JSON carries per-level `measurements` counts.
+- **Cursor diff measurement missing entirely** — an MCP Cursor `diff` now carries
+  the worst-side `measurement` (a Δ against an unmeasured session is not a Δ of
+  `$0.00`), and `render_diff` names it and the warnings behind it. A default
+  Claude diff is unchanged in both JSON and markdown.
+- **Cursor session identity** — hook sessions take their project from the
+  recorded workspace roots instead of all becoming `cursor-hooks`, ledgers are
+  ordered by recency rather than filename, an MCP `session_id` that exists in no
+  ledger and no composer row fails closed, and report *and* insights name an
+  adapter session as `composer:<id>` rather than `/composer:<id>`.
+- **Default Claude session JSON grew runtime keys** — routing Claude through the
+  adapter seam added `runtime`, `measurement` and `warnings` to `token-usage
+  json`. A default Claude run is byte-for-byte its pre-runtime payload again
+  (warnings still go to stderr, as they always did), matching both the MCP
+  session payload and the README's "the CLI's JSON shapes plus `transcript`,
+  `resolved_via` and `warnings`". Cursor keeps all three.
+- **Cursor discovery cost and privacy** — discovery selects only
+  `composerData:%` rows (it used to read every bubble blob and then re-query
+  each key), the ledger root is read lazily so a changed
+  `TOKEN_USAGE_LEDGER_DIR` takes effect, the ledger directory is created
+  owner-only where supported, and `sqlite3` is imported where it is used so the
+  hook path never loads it.
+- **Cursor hooks schema** — `hooks/hooks-cursor.json` now uses Cursor's documented
+  `version: 1` flat entries (`command`/`timeout` per event, no nested `hooks` wrapper).
+- **README Cursor examples** — removed nonexistent `--composer` CLI flag; document
+  latest-session `--runtime cursor` and explicit Cloud export `.json` positional paths.
+- **Cursor install docs** — align with official Customize / Marketplace flow; manual
+  MCP for git checkouts before listing; link to local plugin testing docs.
+- **Cursor CLI session errors** — messages no longer imply a bare composer id works
+  as a positional selector; document `.json` export paths, local discovery, and MCP
+  `session_id`.
+- **Cursor explicit selector fallthrough** — a non-empty CLI/MCP `transcript` path
+  must resolve to an existing Cloud export `.json`; bogus paths no longer silently
+  analyze the latest local session. `session_id` composer lookup unchanged.
+
 ## [0.6.1] — 2026-09-07
 
 ### Fixed

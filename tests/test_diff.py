@@ -65,6 +65,48 @@ def test_diff_tied_deltas_order_alphabetically(tu, tmp_path):
     assert [r["label"] for r in d["rows"]] == ["/alpha", "/beta", "/gamma"]
 
 
+def test_render_diff_discloses_activity_only_and_its_warnings(tu, tmp_path):
+    # Every other Cursor surface names a non-exact measurement; a diff of two
+    # activity-only sessions renders "$0.00 vs $0.00, Δ $0.00", which reads as
+    # "this change was free" rather than "nothing here was measured".
+    a, b = two_transcripts(tmp_path)
+    d = tu.diff_data(a, b, tu.load_pricing())
+    d["runtime"] = "cursor"
+    d["measurement"] = "activity_only"
+    d["warnings"] = ["missing Cursor bubble 'ghost' for composer 'comp-b'"]
+    out = tu.render_diff(d)
+    assert "activity-only" in out
+    assert "unmeasured" in out
+    assert "ghost" in out
+
+
+def test_render_diff_discloses_a_partial_measurement(tu, tmp_path):
+    a, b = two_transcripts(tmp_path)
+    d = tu.diff_data(a, b, tu.load_pricing())
+    d["runtime"] = "cursor"
+    d["measurement"] = "partial"
+    out = tu.render_diff(d)
+    assert "Measurement: partial" in out
+    assert "lower bounds" in out
+    # The two sides are separate sessions: the wording must not claim otherwise.
+    assert "this session" not in out
+
+
+def test_render_diff_claude_default_says_nothing_about_measurement(tu, tmp_path):
+    a, b = two_transcripts(tmp_path)
+    out = tu.render_diff(tu.diff_data(a, b, tu.load_pricing()))
+    assert "Measurement:" not in out
+    assert "warning" not in out.lower()
+
+
+def test_worst_measurement_picks_the_least_confident_side(tu):
+    assert tu.worst_measurement("exact", "exact") == "exact"
+    assert tu.worst_measurement("exact", "partial") == "partial"
+    assert tu.worst_measurement("partial", "exact") == "partial"
+    assert tu.worst_measurement("partial", "activity_only") == "activity_only"
+    assert tu.worst_measurement("activity_only", "exact") == "activity_only"
+
+
 def test_render_diff_total_math_and_signs(tu, tmp_path):
     a = write_jsonl(tmp_path / "a.jsonl", [
         user("2026-06-12T10:00:00Z", command="/review"),

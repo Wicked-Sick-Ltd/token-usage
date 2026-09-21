@@ -1,6 +1,6 @@
 # token-usage
 
-**Where did my tokens go?** A Claude Code plugin that attributes token usage to the work that consumed it — per-slash-command breakdowns, subagent rollups, a live per-session ledger, cross-session history, and cache-aware cost estimates.
+**Where did my tokens go?** A public MIT plugin for **Claude Code** and **Cursor** that attributes token usage to the work that consumed it — per-activity breakdowns (slash commands in Claude Code, composer generations in Cursor), subagent rollups, cross-session history, optional live ledgers, and cache-aware API-price estimates.
 
 📖 **Documentation:** [discovery.wickedsick.com/token-usage-claude-code-plugin-documentation](https://discovery.wickedsick.com/token-usage-claude-code-plugin-documentation) — overview, use cases, and how it works, kept in step with each release.
 
@@ -41,12 +41,17 @@ Claude Code tells you session totals (`/cost`, OTel metrics) and tools like ccus
   exposes `session_cost`, `history`, `insights`, `diff` and `top_consumers` as tools.
   Claude Code starts it automatically with the plugin; Claude desktop can register the
   same script. JSON by default, `format: "markdown"` for the rendered tables.
+  Dashboard, live, and export stay CLI-only (local file writes; not exposed via MCP).
 - **Top consumers** — `top_consumers --by session|command` lists the costliest sessions
   or command labels in a window, the question `history` could not answer directly. A row
   whose cost is only a priced subtotal (some of its usage ran on an unpriced model) is
   marked `*` and footnoted, since the rows are ranked on that number.
 
 ## Installation
+
+Requires `python3` (3.9+, stdlib only — no dependencies).
+
+### Claude Code
 
 ```bash
 # Test locally
@@ -56,7 +61,52 @@ claude --plugin-dir /path/to/token-usage
 /plugin install token-usage
 ```
 
-Requires `python3` (3.9+, stdlib only — no dependencies).
+The Claude manifest is `.claude-plugin/plugin.json` (MCP server, Stop hook, report skill).
+
+### Cursor
+
+Official install path: open **Customize** in the sidebar, find **token-usage** on the
+[Cursor Marketplace](https://cursor.com/marketplace) once this plugin is published, and
+choose **Install** (project or user scope). See
+[Installing plugins](https://cursor.com/docs/plugins#installing-plugins).
+
+The Cursor manifest `.cursor-plugin/plugin.json` bundles:
+
+- stdio MCP server → `scripts/mcp_server.py`
+- hooks → `hooks/hooks-cursor.json` (`version` 1 flat schema; `beforeSubmitPrompt`,
+  `stop`, `subagentStart`, `subagentStop`)
+- skill → `skills/report/`
+
+**Before marketplace listing / for a git checkout today:** use **manual MCP** (below).
+Cursor also documents copying a plugin into `~/.cursor/plugins/local/<name>/` and
+reloading the window for local testing ([Test plugins locally](https://cursor.com/docs/plugins#test-plugins-local));
+that requires the full plugin tree (including `.cursor-plugin/plugin.json`) and may be
+disabled by team policy (`Allow Local Plugin Imports`).
+
+Hook commands use `${CURSOR_PLUGIN_ROOT}`; the MCP entry uses the same variable in
+`args`. See [docs/cursor-adapter.md](docs/cursor-adapter.md) for attribution sources,
+limitations, and privacy.
+
+**Manual MCP (no plugin).** Add to `~/.cursor/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "token-usage": {
+      "command": "python3",
+      "args": ["/absolute/path/to/token-usage/scripts/mcp_server.py"]
+    }
+  }
+}
+```
+
+Use MCP tool argument `runtime: "cursor"` (or `"auto"` when Cursor artifacts are
+unambiguous). Register hooks separately via Cursor settings if you want prospective
+hook ledgers without the full plugin bundle.
+
+This repository intentionally has **no** root `mcp.json`: Claude Code also reads that
+file as *project-scope* MCP inside a checkout, which would register a broken server for
+contributors.
 
 ## Usage
 
@@ -119,9 +169,50 @@ python3 scripts/token_usage.py insights --json [transcript.jsonl]
 # Costliest sessions (or --by command) in the last 30 days
 python3 scripts/token_usage.py top_consumers --since 30d --limit 10
 python3 scripts/token_usage.py top_consumers --by command --project my-repo --json
+
+# Cursor runtime — latest discovered session (hook ledger, then Desktop SQLite)
+python3 scripts/token_usage.py report --runtime cursor
+python3 scripts/token_usage.py json --runtime cursor
+
+# Cursor runtime — explicit Cloud Agent export JSON (activity / any present usage fields)
+python3 scripts/token_usage.py report --runtime cursor /path/to/cloud-export.json
+python3 scripts/token_usage.py json --runtime cursor /path/to/cloud-export.json
+
+python3 scripts/token_usage.py history --runtime cursor --by day --since 7d
+python3 scripts/token_usage.py insights --runtime cursor
+
+# Self-contained HTML dashboard from indexed history (inline CSS/SVG only — no CDN)
+python3 scripts/token_usage.py dashboard [--since 30d] [--project SUBSTRING] \
+  [--output token-usage-dashboard.html] [--runtime claude|cursor|auto]
+
+# Terminal live view — repolls the current or explicit session (Ctrl-C exits 0)
+python3 scripts/token_usage.py live [TRANSCRIPT] [--interval 2] [--iterations N] \
+  [--agents] [--models] [--runtime claude|cursor|auto]
+
+# Structured JSONL aggregates for external spend tooling (not OTLP wire format)
+python3 scripts/token_usage.py export [--scope session|history] [--by project|day|command|model] \
+  [--since 30d] [--project SUBSTRING] [--output usage.jsonl] [--runtime claude|cursor|auto]
+python3 scripts/token_usage.py export [TRANSCRIPT] --scope session --output -
 ```
 
+`--runtime` accepts `claude` (default), `cursor`, or `auto`. `auto` picks one runtime
+when unambiguous and never mixes Claude transcripts with Cursor composers in one call.
+
 With no argument, `report` and `json` pick the most recent session for the current directory's project; failing that, the Cowork sandbox mount; failing that too, the newest transcript under **any** project on the machine. That last step means running these outside a directory with its own Claude Code history can pick up a different project's most recent session rather than reporting "not found" — pass an explicit transcript path when it matters which session gets analysed.
+
+### Dashboard (`dashboard`)
+
+Builds a single portable HTML file from the same indexed history as `history`. Summary cards, an inline SVG daily-cost chart, and top project/activity/model tables are embedded with inline CSS only — no `<script>`, remote assets, CDN, iframe, or network calls. Labels, warnings, and measurement notes are HTML-escaped. Default output is `token-usage-dashboard.html`; `--output -` writes HTML to stdout (progress stays on stderr). With no matching history, the page still renders an honest empty state. Cursor `partial` or activity-only corpora disclose when cost/token cards are unmeasured rather than showing misleading zeros.
+
+### Live mode (`live`)
+
+Polls every `--interval` seconds (default 2), re-rendering the session report each tick. With no `[TRANSCRIPT]`, each iteration re-runs normal latest-session discovery. Interactive terminals clear with ANSI `\x1b[2J\x1b[H`; redirected stdout uses timestamp separators instead. `--iterations N` runs a finite loop for scripts and tests. **Ctrl-C exits 0.** There is no file watcher or background daemon.
+
+### Structured export (`export`)
+
+Emits one RFC-8259 JSON object per line with schema `token-usage.aggregate.v1` and OTel-style metric names (for example `gen_ai.usage.output_tokens`, `gen_ai.estimated_cost.usd`). This is a stable local interchange format — **not** OTLP protobuf/HTTP. Default scope is `history` (grouped by project); `--scope session` emits one `total` row plus one row per activity label. `gen_ai.estimated_cost.usd` is JSON `null` when unpriced or unmeasured. Lines include project slugs, command labels, and model IDs — redact before sharing. File output uses atomic replace; stdout streams directly.
+
+History-scope records also carry `measurement_counts`, the scan's per-session tally (for example `{"exact": 99, "activity_only": 1}`). `measurement` alone is the worst level any session reported, so it cannot tell one weak session from a corpus nobody measured, nor either from a scan that matched nothing — an empty tally is how you spot the last case. Session-scope records cover one session and carry no tally.
 
 ### Budget nudges
 
@@ -139,7 +230,22 @@ When the session's estimated cost crosses the threshold the Stop hook emits a `s
 
 ### Statusline (optional)
 
-`examples/statusline.sh` reads the live ledger and renders e.g. `⏶ 214k out · $33.87 · top: /code-review`. Wire it up with `/statusline` or merge it into your existing statusline script. Requires `jq`.
+`examples/statusline.sh` reads the per-session live ledger (from stdin `session_id`) and renders e.g. `⏶ 214k out · $33.87 · top: /code-review`. Wire it up with `/statusline` in **Claude Code** or merge it into your existing statusline script. Requires `jq`.
+
+On Windows with **Claude Code**, `examples/statusline.ps1` is a dependency-free counterpart to `statusline.sh` and requires **PowerShell 7+** (`pwsh`; Windows PowerShell 5.1 is not supported). Like the bash script it reads Claude Code's statusline JSON from stdin and resolves the ledger by `session_id`:
+
+1. `$env:TOKEN_USAGE_LEDGER_DIR/<session_id>.json` (or `~/.cache/token-usage/<session_id>.json`) — the current session's own aggregate.
+2. `.../latest.json` — a pointer to the most recent session aggregate, used only as a fall back when stdin carried no usable session id or that session has no ledger yet. The hook creates it as a symlink on a best-effort basis and Windows commonly refuses, so it is often absent.
+
+The script formats output tokens, estimated cost, and the top `by_label` activity, and **exits silently** (code 0, no stdout/stderr) when the input or the ledger is missing or malformed. Session ids are stripped to `[A-Za-z0-9_-]`, matching how the hook names the ledger, so a hostile id cannot address a file outside the ledger directory.
+
+```text
+pwsh -NoProfile -File C:/path/to/token-usage/examples/statusline.ps1
+```
+
+**Cursor** hook ledgers live as JSONL under `~/.cache/token-usage/cursor/` and write no per-session JSON or `latest.json`, so this PowerShell example is not a Cursor statusline. For a refreshing Cursor session view in the terminal, use `python3 scripts/token_usage.py live --runtime cursor` (optional `--interval`, `--iterations`).
+
+`statusline.ps1` is always checked structurally from its source; the behavioural smoke tests additionally execute it when `pwsh` is on PATH and are skipped otherwise. No test creates a symlink.
 
 ### MCP server
 
@@ -243,6 +349,28 @@ The `history` subcommand builds an incremental index under `~/.cache/token-usage
 ## Cost disclaimer
 
 Costs are **API-price estimates** from the bundled `data/pricing.json` (rates as of September 2026). Subscription plans (Pro/Max) are not billed per token — treat the figure as "what this would cost at API prices". Update `data/pricing.json` if rates change; models not in the table show `—`. Rates can be added to the user pricing overlay at `~/.config/token-usage/pricing.json`, and unpriced models are named in a report footnote either way. Each entry is `{"input": $/MTok, "output": $/MTok}` with an optional `"cache_read": $/MTok` for models whose cache-hit rate is not 0.1× input (bundled for Fable 5.1 and Mythos 5.1 at $0.25). Sonnet 5 is priced at $2/$10 — its launch price, which Anthropic made permanent in September 2026 instead of raising it to $3/$15.
+
+## Cursor: what v1 can and cannot measure
+
+**Can (when data exists):**
+
+- Per-activity breakdowns from hook ledgers (prospective **exact** buckets when Cursor
+  sends completion token fields), read-only Desktop SQLite composers/bubbles, or an
+  explicit Cloud Agent export path.
+- Cross-session `history`, `insights`, and `top_consumers` with `measurement` and
+  `warnings` in JSON — same aggregate shapes as Claude. Markdown names a
+  `partial` or activity-only measurement, so zero buckets are never mistaken for
+  genuinely free usage.
+- API-price estimates from `data/pricing.json` (not subscription billing).
+
+**Cannot:**
+
+- Infer Cursor plan credits, invoice totals, or subscription-tier billing.
+- Guarantee per-bubble `tokenCount` in SQLite (often zero; not billing truth).
+- Reconstruct exact usage for sessions before hooks were enabled.
+- Attribute marginal token cost to individual `@` attachments.
+
+Details: [docs/cursor-adapter.md](docs/cursor-adapter.md).
 
 ## Limitations
 

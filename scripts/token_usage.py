@@ -16,25 +16,35 @@ Subcommands:
     report [TRANSCRIPT]   Markdown breakdown table (default: latest session in cwd project)
     json   [TRANSCRIPT]   Same data as JSON
     hook                  Read Claude Code hook JSON on stdin, update the session ledger
+    cursor-hook           Read Cursor hook JSON on stdin, append to the Cursor hook ledger
     history               Cross-session rollup by project/day/command/model
     insights              Rule-based findings for one session or a window
     top_consumers         Costliest sessions or commands in a window
+    dashboard             Self-contained HTML dashboard from indexed history
+    live [TRANSCRIPT]     Refreshing terminal report for the current session
+    export [TRANSCRIPT]   JSONL aggregate export for session or indexed history
 (run with --help for each subcommand's flags)
 
 Stdlib only. Python 3.9+.
 """
 
 import argparse
+import contextlib
+import hashlib
+import html
 import json
 import math
 import os
 import re
 import sys
+import time
+import urllib.parse
 from pathlib import Path
+
+LIVE_CLEAR = "\x1b[2J\x1b[H"
 
 COMMAND_RE = re.compile(r"<command-name>([^<]+)</command-name>")
 OTHER_LABEL = "(no command)"
-LEDGER_DIR = Path(os.environ.get("TOKEN_USAGE_LEDGER_DIR", Path.home() / ".cache" / "token-usage"))
 
 # Per-MTok USD rates live in data/pricing.json (the bundled table is canonical).
 # Cache read = 0.1x input unless the entry carries an explicit "cache_read" rate
@@ -79,13 +89,48 @@ def _valid_rates(v):
             and ("cache_read" not in v or _is_rate(v["cache_read"])))
 
 
+_WARNED_IN_SCOPE = None       # set() while a deduped_warnings() block is open
+
+
 def warn(message, warnings=None):
     """Report a non-fatal problem on stderr and, when a list is given, collect
     it. MCP callers never see stderr, so anything that silently changes the
-    numbers has to be able to travel in the result too."""
-    print(f"token-usage: {message}", file=sys.stderr)
+    numbers has to be able to travel in the result too.
+
+    Inside a deduped_warnings() block the same message reaches stderr once;
+    the caller's list still receives every occurrence, because counting them
+    is the caller's decision, not this function's."""
+    if _WARNED_IN_SCOPE is None or message not in _WARNED_IN_SCOPE:
+        if _WARNED_IN_SCOPE is not None:
+            _WARNED_IN_SCOPE.add(message)
+        print(f"token-usage: {message}", file=sys.stderr)
     if warnings is not None:
         warnings.append(message)
+
+
+@contextlib.contextmanager
+def deduped_warnings():
+    """Print each distinct warning to stderr once for the duration of the block.
+
+    For a command that deliberately scans one corpus several times — the
+    dashboard's four groupings plus its partial-enrichment pass — where a
+    single missing root is one problem however many passes trip over it.
+
+    Scoped to the block rather than to the process: a warning that recurs
+    legitimately, across two history calls in a long-lived MCP server or
+    across live's refreshes, must still be reported each time it happens.
+    Nesting reuses the open scope instead of restarting it, and the scope is
+    released even when the body raises, so a failed command cannot leave the
+    next one silenced."""
+    global _WARNED_IN_SCOPE
+    if _WARNED_IN_SCOPE is not None:
+        yield
+        return
+    _WARNED_IN_SCOPE = set()
+    try:
+        yield
+    finally:
+        _WARNED_IN_SCOPE = None
 
 
 def _merge_pricing_file(pricing, path, warnings):
@@ -235,6 +280,101 @@ def unpriced_footnote(models):
         return None
     return (f"{len(models)} model(s) unpriced ({', '.join(models)}): "
             f"add rates to {user_pricing_path()}")
+
+
+MEASUREMENT_NAMES = {"partial": "partial", "activity_only": "activity-only"}
+
+# Least confident last: worst_measurement ranks on this order.
+MEASUREMENT_CONFIDENCE = ("exact", "partial", "activity_only")
+
+
+def worst_measurement(*levels):
+    """The least confident of several measurements.
+
+    A comparison is only as trustworthy as its weakest side, so a diff of an
+    exact session against an unmeasured one is an unmeasured diff — not an
+    exact one that happens to contain zeroes. An unrecognised level is ignored
+    rather than guessed at."""
+    worst = "exact"
+    for level in levels:
+        if level in MEASUREMENT_CONFIDENCE and (
+                MEASUREMENT_CONFIDENCE.index(level)
+                > MEASUREMENT_CONFIDENCE.index(worst)):
+            worst = level
+    return worst
+
+
+def measurement_note(measurement, subject="this session"):
+    """Disclosure line for a non-exact measurement, else None.
+
+    A runtime that reports no token counts produces zero buckets and (for
+    activity-only data) a suppressed cost column — typographically identical
+    to a session that genuinely cost nothing. Markdown has to say which.
+    `subject` names what was measured: a diff spans two sessions, and calling
+    that "this session" would point the reader at the wrong thing."""
+    if measurement == "partial":
+        return ("Measurement: partial — this runtime reported only some token "
+                f"buckets for {subject}, so totals and costs are lower bounds.")
+    if measurement == "activity_only":
+        return ("Measurement: activity-only — this runtime reported no token counts "
+                f"for {subject}, so zero usage means unmeasured, not free.")
+    return None
+
+
+def measurement_scan_note(counts):
+    """The same disclosure for a corpus scan, counting the sessions behind it."""
+    parts = [f"{counts[key]} {name}" for key, name in MEASUREMENT_NAMES.items()
+             if counts.get(key)]
+    if not parts:
+        return None
+    return ("Measurement: " + " and ".join(parts) + " session(s) — zero or missing "
+            "token buckets mean unmeasured usage, not free usage.")
+
+
+def warnings_note(warnings):
+    """The warnings behind a measurement disclosure, named rather than counted."""
+    if not warnings:
+        return None
+    return f"{len(warnings)} warning(s): " + "; ".join(warnings)
+
+
+def _dedupe_warnings_in_place(warnings):
+    """Keep warning order stable while dropping repeats.
+
+    Any surface that scans the same corpus more than once over one shared list
+    — a live refresh, a dashboard's four groupings — collects the same warning
+    once per pass, and a reader counting them sees that many problems."""
+    seen = set()
+    out = []
+    for w in warnings:
+        if w in seen:
+            continue
+        seen.add(w)
+        out.append(w)
+    warnings[:] = out
+
+
+def atomic_write_text(path, text):
+    """Replace `path` with `text` in one step, leaving no temp file behind.
+
+    The temp name carries the pid because concurrent writers — parallel
+    SubagentStop hooks, two scans warming the same cache entry — must never
+    interleave through one shared temp file."""
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        tmp.replace(path)
+    except OSError:
+        # The replace is what makes this atomic, so failing before it leaves
+        # any prior content untouched — but also leaves a truncated temp file
+        # beside it, in directories (the index, the ledger) written on every
+        # run. Clear the debris and raise the real failure; a cleanup problem
+        # must not mask the one the caller needs to see.
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
 
 
 def merge_by_model(dest, src):
@@ -619,6 +759,16 @@ def fmt_cost_delta(c):
     return f"{'-' if c < 0 else '+'}${abs(c):.2f}"
 
 
+def session_display(path_str):
+    """How a report names the session it measured.
+
+    "<project>/<file>" for a transcript path, and the label itself for an
+    adapter-supplied name — Path("composer:abc") has no parent, which used to
+    render as the nonsense "/composer:abc"."""
+    path = Path(path_str)
+    return f"{path.parent.name}/{path.name}" if path.parent.name else str(path_str)
+
+
 def sub_row(label, u, cost):
     """One ↳ breakdown row (a subset of its parent row) for the report table."""
     return (f"| ↳ {label} | | {fmt_tokens(u['output'])} | {fmt_tokens(u['input'])} "
@@ -665,8 +815,13 @@ def render_report(data, show_agents=False, show_models=False):
         # Resolution can fall back to a transcript in a project other than
         # the caller's (see find_latest_transcript) — always name which one
         # was actually measured, rather than leaving that silent.
-        tp = Path(transcript_path)
-        lines.append(f"Session: `{tp.parent.name}/{tp.name}`")
+        lines.append(f"Session: `{session_display(transcript_path)}`")
+    note = measurement_note(data.get("measurement"))
+    if note:
+        lines.append(note)
+        named = warnings_note(data.get("warnings"))
+        if named:
+            lines.append(named)
     savings = t.get("cache_savings_usd")
     if savings is not None and savings >= 0.01:
         lines.append(f"Prompt caching saved ~{fmt_cost(savings)} vs. full input rates.")
@@ -717,6 +872,16 @@ def render_diff(d):
     sign = "+" if do >= 0 else "-"
     lines.append(f"| **Total** | **{fmt_cost(ta['cost_usd'])}** | **{fmt_cost(tb['cost_usd'])}** "
                  f"| **{fmt_cost_delta(dt)}** | **{sign}{fmt_tokens(abs(do))}** |")
+    # Reported for the worst of the two sides (see worst_measurement): a Δ
+    # against an unmeasured session is not a Δ of $0, and the table alone
+    # cannot say so. Claude diffs carry no measurement and print nothing.
+    note = measurement_note(d.get("measurement"),
+                            subject="at least one side of this comparison")
+    if note:
+        lines += ["", note]
+        named = warnings_note(d.get("warnings"))
+        if named:
+            lines.append(named)
     return "\n".join(lines)
 
 
@@ -746,9 +911,18 @@ def check_projects_root(warnings=None):
     return str(root)
 
 
-def index_dir():
+def ledger_dir():
+    """Root of the session ledger, summary index and Cursor hook ledgers.
+
+    Read on every call rather than bound at import: the Cursor hook ledger is
+    also a session *corpus*, so a process (or a test) that changes
+    TOKEN_USAGE_LEDGER_DIR must not keep scanning the previous root."""
     return Path(os.environ.get("TOKEN_USAGE_LEDGER_DIR",
-                               Path.home() / ".cache" / "token-usage")) / "index"
+                               Path.home() / ".cache" / "token-usage"))
+
+
+def index_dir():
+    return ledger_dir() / "index"
 
 
 def pricing_fingerprint(pricing):
@@ -821,9 +995,7 @@ def cached_summary(path, pricing, warnings=None):
     # per process and hand back the freshly parsed summary anyway.
     try:
         cache_file.parent.mkdir(parents=True, exist_ok=True)
-        tmp = cache_file.with_suffix(".tmp")
-        tmp.write_text(json.dumps(s), encoding="utf-8")
-        tmp.replace(cache_file)
+        atomic_write_text(cache_file, json.dumps(s))
     except OSError as e:
         # Once per process on stderr, but every caller's `warnings` list gets
         # it: an MCP caller never sees stderr, and a long-lived server would
@@ -950,12 +1122,42 @@ def iter_summaries(pricing, cutoff=None, project=None, exclude=None, progress=Fa
         yield s
 
 
-def run_history(by="project", since=None, project=None, warnings=None):
+def run_history(by="project", since=None, project=None, warnings=None, runtime="claude",
+                corpus_project_dir=None, corpus_resolution=None):
+    data, measurements, runtime_name = _run_history_core(
+        by=by, since=since, project=project, warnings=warnings, runtime=runtime,
+        corpus_project_dir=corpus_project_dir, corpus_resolution=corpus_resolution)
+    out = dict(data)
+    if runtime_name != "claude":
+        out["runtime"] = runtime_name
+        out["measurements"] = measurements
+    return out
+
+
+def _run_history_core(by="project", since=None, project=None, warnings=None, runtime="claude",
+                      corpus_project_dir=None, corpus_resolution=None):
+    """Scan indexed history; always returns per-session measurement tallies."""
     pricing = load_pricing(warnings)
     cutoff = since_cutoff(since)
-    missing_root = check_projects_root(warnings)
+    if corpus_resolution is not None:
+        adapter, runtime_name = corpus_resolution
+    else:
+        adapter, runtime_name = resolve_runtime_corpus(
+            runtime, project_dir=corpus_project_dir, warnings=warnings)
+    skipped = []
+    if adapter.name == "claude":
+        missing_root = check_projects_root(warnings)
+        summary_iter = iter_summaries(pricing, cutoff=cutoff, project=project,
+                                      progress=True, skipped=skipped, warnings=warnings)
+    else:
+        missing_root = check_cursor_root(warnings)
+        summary_iter = iter_adapter_summaries(adapter, pricing, cutoff=cutoff,
+                                              project=project, progress=True,
+                                              skipped=skipped, warnings=warnings,
+                                              project_dir=corpus_project_dir)
     rows = {}
-    unpriced, skipped = set(), []
+    unpriced = set()
+    measurements = {}
 
     def add_row(key, usage_dict, cost, calls):
         r = rows.setdefault(key, {"key": key, "usage": empty_usage(),
@@ -966,9 +1168,9 @@ def run_history(by="project", since=None, project=None, warnings=None):
             r["cost_usd"] = (r["cost_usd"] or 0.0) + cost
         r["calls"] += calls
 
-    for s in iter_summaries(pricing, cutoff=cutoff, project=project, progress=True,
-                            skipped=skipped, warnings=warnings):
+    for s in summary_iter:
         unpriced.update(unpriced_models(s.get("by_model", {}), pricing))
+        _count_measurement(measurements, s)
         if by == "project":
             add_row(s["project"], s["total"]["usage"], s["total"]["cost_usd"], 1)
         elif by == "day":
@@ -985,9 +1187,44 @@ def run_history(by="project", since=None, project=None, warnings=None):
                 add_row(label, agg["usage"], agg["cost_usd"], agg["invocations"])
 
     ordered = sorted(rows.values(), key=lambda r: (-(r["cost_usd"] or 0), r["key"]))
-    return {"by": by, "since": since, "project": project, "rows": ordered,
+    data = {"by": by, "since": since, "project": project, "rows": ordered,
             "unpriced_models": sorted(unpriced), "skipped_transcripts": skipped,
             "projects_dir_missing": missing_root}
+    return data, measurements, runtime_name
+
+
+def history_scan_measurement(counts):
+    """Worst measurement level for a corpus scan tally (dashboard + export).
+
+    An empty tally means no session reported a level of its own, which is the
+    Claude corpus (exact by construction) and also a scan that matched nothing
+    at all. Both come out "exact", and neither is a claim about spend: the
+    reader is told the scan was empty by the empty-state banner and the
+    missing-root footnote, and a consumer tells the two apart by the tally
+    itself, which export ships as `measurement_counts`."""
+    if counts:
+        return worst_measurement(*counts.keys())
+    return "exact"
+
+
+def history_export_data(by="project", since=None, project=None, warnings=None, runtime="claude",
+                        corpus_project_dir=None):
+    """History rows for export plus scan measurement tallies for any runtime."""
+    warnings = warnings if warnings is not None else []
+    data, measurement_counts, runtime_name = _run_history_core(
+        by=by, since=since, project=project, warnings=warnings, runtime=runtime,
+        corpus_project_dir=corpus_project_dir)
+    data = dict(data)
+    data["runtime"] = runtime_name
+    data["warnings"] = warnings
+    return data, measurement_counts
+
+
+def _count_measurement(counts, summary):
+    """Tally one scanned session's measurement level for the scan disclosure."""
+    level = summary.get("measurement")
+    if level:
+        counts[level] = counts.get(level, 0) + 1
 
 
 def burn_rate_line(total_cost, since):
@@ -1025,18 +1262,32 @@ def scan_footnotes(data, unpriced=True):
     check_projects_root — "nothing here to read" is not "you spent nothing").
 
     `unpriced=False` for renders with no cost figures to qualify — insights,
-    and a top-consumers table with no rows."""
+    and a top-consumers table with no rows.
+
+    The wording follows the runtime that was scanned: a Cursor root is not a
+    Claude Code projects directory, and calling it one sends the reader to
+    fix the wrong thing."""
     models = data.get("unpriced_models") or []
     skipped = data.get("skipped_transcripts") or []
     root = data.get("projects_dir_missing")
+    cursor = (data.get("runtime") or "claude") == "cursor"
     notes = []
     if unpriced and models:
         notes.append(unpriced_footnote(models))
     if skipped:
-        notes.append(f"{len(skipped)} transcript(s) skipped (unreadable): {', '.join(skipped)}")
+        kind = "Cursor session" if cursor else "transcript"
+        notes.append(f"{len(skipped)} {kind}(s) skipped (unreadable): {', '.join(skipped)}")
     if root:
-        notes.append(f"No readable Claude Code projects directory at {root} "
-                     "— nothing was scanned.")
+        where = ("readable Cursor session data (Desktop SQLite or hook ledger) at"
+                 if cursor else "readable Claude Code projects directory at")
+        notes.append(f"No {where} {root} — nothing was scanned.")
+    measured = (measurement_scan_note(data.get("measurements") or {})
+                or measurement_note(data.get("measurement")))
+    if measured:
+        notes.append(measured)
+        named = warnings_note(data.get("warnings"))
+        if named:
+            notes.append(named)
     return notes
 
 
@@ -1094,23 +1345,615 @@ def render_history(data):
     return "\n".join(lines)
 
 
-def run_top_consumers(by="session", since="30d", project=None, limit=10, warnings=None):
+def _history_scan_kwargs(since, project, warnings, runtime, project_dir):
+    return {
+        "since": since,
+        "project": project,
+        "warnings": warnings,
+        "runtime": runtime,
+        "corpus_project_dir": project_dir,
+    }
+
+
+def _sum_history_rows(rows):
+    total = empty_usage()
+    total_cost, sessions = None, 0
+    for r in rows:
+        u = r["usage"]
+        for k in total:
+            total[k] += u[k]
+        if r["cost_usd"] is not None:
+            total_cost = (total_cost or 0.0) + r["cost_usd"]
+        sessions += r["calls"]
+    return total, total_cost, sessions
+
+
+def dashboard_data(runtime="claude", since=None, project=None, project_dir=None,
+                   warnings=None):
+    """Aggregate indexed history for the static HTML dashboard."""
+    warnings = warnings if warnings is not None else []
+    scan = _history_scan_kwargs(since, project, warnings, runtime, project_dir)
+    # Five passes over one corpus. Without a scope around them a single missing
+    # root reaches the terminal five times, which reads as five problems — the
+    # same repetition the page itself is deduplicated to avoid.
+    with deduped_warnings():
+        by_project, scan_measurements, runtime_name = _run_history_core(
+            by="project", **scan)
+        by_day, _, _ = _run_history_core(by="day", **scan)
+        by_command, _, _ = _run_history_core(by="command", **scan)
+        by_model, _, _ = _run_history_core(by="model", **scan)
+        out = _dashboard_payload(
+            since, project, by_project, by_day, by_command, by_model,
+            scan_measurements, runtime_name, warnings)
+        _enrich_dashboard_partials(out, scan, warnings)
+    _dedupe_warnings_in_place(warnings)
+    return out
+
+
+def _dashboard_payload(since, project, by_project, by_day, by_command, by_model,
+                       scan_measurements, runtime_name, warnings):
+    usage_total, cost_total, sessions = _sum_history_rows(by_project["rows"])
+    measurement = history_scan_measurement(scan_measurements)
+    out = {
+        "since": since,
+        "project": project,
+        "summary": {
+            "usage": usage_total,
+            "cost_usd": cost_total,
+            "sessions": sessions,
+            "measurement": measurement,
+        },
+        "by_day": sorted(by_day["rows"], key=lambda r: r["key"]),
+        "top_projects": by_project["rows"][:10],
+        "top_commands": by_command["rows"][:10],
+        "top_models": by_model["rows"][:10],
+        "unpriced_models": by_project.get("unpriced_models"),
+        "skipped_transcripts": by_project.get("skipped_transcripts"),
+        "projects_dir_missing": by_project.get("projects_dir_missing"),
+        "measurements": scan_measurements,
+        "warnings": warnings,
+    }
+    if runtime_name != "claude":
+        out["runtime"] = runtime_name
+    return out
+
+
+def _enrich_dashboard_partials(data, scan, warnings):
+    """Mark history rows whose cost is a priced subtotal (unpriced model usage)."""
+    pricing = load_pricing(warnings)
+    cutoff = since_cutoff(scan.get("since"))
+    adapter, _ = resolve_runtime_corpus(
+        scan["runtime"], project_dir=scan.get("corpus_project_dir"), warnings=warnings)
+    skipped = []
+    if adapter.name == "claude":
+        summary_iter = iter_summaries(
+            pricing, cutoff=cutoff, project=scan.get("project"),
+            progress=True, skipped=skipped, warnings=warnings)
+    else:
+        summary_iter = iter_adapter_summaries(
+            adapter, pricing, cutoff=cutoff, project=scan.get("project"),
+            progress=True, skipped=skipped, warnings=warnings,
+            project_dir=scan.get("corpus_project_dir"))
+    project_partial = {}
+    command_partial = {}
+    for s in summary_iter:
+        if unpriced_models(s.get("by_model", {}), pricing):
+            project_partial[s["project"]] = True
+        for label, agg in s["by_label"].items():
+            if agg["cost_usd"] is None or agg.get("unpriced"):
+                command_partial[label] = True
+
+    def _mark(rows, partial_keys):
+        for row in rows:
+            if partial_keys.get(row["key"]):
+                row["partial"] = True
+
+    _mark(data["top_projects"], project_partial)
+    _mark(data["top_commands"], command_partial)
+
+
+def _dashboard_footnote_source(data):
+    return {
+        "unpriced_models": data.get("unpriced_models"),
+        "skipped_transcripts": data.get("skipped_transcripts"),
+        "projects_dir_missing": data.get("projects_dir_missing"),
+        "runtime": data.get("runtime", "claude"),
+        "measurements": data.get("measurements"),
+        "warnings": data.get("warnings"),
+    }
+
+
+def _dashboard_activity_only(data):
+    """True only when EVERY scanned session was activity-only.
+
+    Blanking the cards and flattening the chart is the right answer for a
+    corpus nobody measured, and the wrong one for a corpus with a single
+    unmeasured session in it: the measured sessions really were measured, and
+    throwing their totals away to protect the reader from one weak session
+    tells them they spent nothing. A mixed scan keeps its numbers and
+    discloses the lower bound through the scan footnote, which counts the
+    sessions behind each level.
+
+    The tally is the only input. dashboard_data always supplies it, so an
+    empty one means nothing was scanned — an empty window, or a corpus like
+    Claude's that records no per-session levels — and neither is a corpus of
+    unmeasured sessions."""
+    counts = data.get("measurements") or {}
+    measured = {level for level, n in counts.items() if n}
+    return bool(measured) and measured == {"activity_only"}
+
+
+def _dashboard_measurement_label(level, counts):
+    """The Measurement card's text: the worst level, and how much of the scan
+    sits at it.
+
+    A bare "activity_only" beside populated cost cards reads as a
+    contradiction — the reader cannot tell a lower bound owed to one weak
+    session from one owed to the whole corpus. "all N sessions" says there is
+    no measured remainder to look for; "M of N sessions" says how little of
+    the scan the caveat covers."""
+    total = sum(counts.values())
+    at_level = counts.get(level, 0)
+    if not total or not at_level:
+        return level
+    unit = "session" if total == 1 else "sessions"
+    share = f"all {total} {unit}" if at_level == total else f"{at_level} of {total} {unit}"
+    return f"{level} ({share})"
+
+
+_DASHBOARD_UNMEASURED = "— (unmeasured)"
+
+
+def _dashboard_fmt_cost(cost, partial=False):
+    if cost is None:
+        return "—"
+    text = fmt_cost(cost)
+    return f"{text}*" if partial else text
+
+
+def _dashboard_metric_display(value, activity_only, token=False):
+    if activity_only:
+        return _DASHBOARD_UNMEASURED
+    return fmt_tokens(value) if token else fmt_cost(value)
+
+
+_DASHBOARD_AXIS_LABEL_PX = 62
+
+
+def _dashboard_axis_stride(bar_w):
+    """How many bars each printed x-axis label has to cover to stay legible.
+
+    A 30-day window packs bars about 19px apart, and an ISO date needs ~62px,
+    so labelling every bar overprinted them into a grey smear. Every bar keeps
+    its own <title>, which is where the exact day and cost still live."""
+    if bar_w <= 0:
+        return 1
+    return max(1, math.ceil(_DASHBOARD_AXIS_LABEL_PX / bar_w))
+
+
+def _dashboard_svg_chart(by_day, activity_only):
+    """Inline SVG daily cost bars; deterministic geometry for a given dataset."""
+    width, height, pad = 640, 220, 36
+    if not by_day:
+        inner = (
+            f'<text x="{width // 2}" y="{height // 2}" text-anchor="middle" '
+            f'class="muted">No daily data in window</text>'
+        )
+        return f'<svg viewBox="0 0 {width} {height}" role="img" aria-label="Daily cost">{inner}</svg>'
+    costs = [r["cost_usd"] if r["cost_usd"] is not None else 0.0 for r in by_day]
+    peak = max(costs) if costs else 0.0
+    max_cost = peak if peak > 0 else 1.0
+    plot_w = width - pad * 2
+    plot_h = height - pad * 2
+    n = len(by_day)
+    bar_w = plot_w / max(n, 1)
+    stride = _dashboard_axis_stride(bar_w)
+    parts = [
+        f'<rect x="0" y="0" width="{width}" height="{height}" fill="none"/>',
+    ]
+    for i, row in enumerate(by_day):
+        cost = row["cost_usd"] if row["cost_usd"] is not None else 0.0
+        bar_h = (cost / max_cost) * plot_h if not activity_only else 0.0
+        x = pad + i * bar_w + bar_w * 0.1
+        w = bar_w * 0.8
+        y = pad + plot_h - bar_h
+        title = html.escape(f"{row['key']}: {fmt_cost(row['cost_usd'])}")
+        parts.append(
+            f'<rect x="{x:.1f}" y="{y:.1f}" width="{w:.1f}" height="{bar_h:.1f}" '
+            f'class="bar"><title>{title}</title></rect>'
+        )
+        if i % stride == 0:
+            label = html.escape(str(row["key"]))
+            parts.append(
+                f'<text x="{x + w / 2:.1f}" y="{height - 8}" text-anchor="middle" '
+                f'class="axis">{label}</text>'
+            )
+    # Bars are scaled to the window's own peak, so without this the tallest
+    # bar could be five cents or five hundred dollars and read identically.
+    if peak > 0 and not activity_only:
+        parts.append(
+            f'<text x="{pad}" y="{pad - 8}" text-anchor="start" class="scale">'
+            f'max {html.escape(fmt_cost(peak))}/day</text>'
+        )
+    note = ""
+    if activity_only:
+        note = (
+            f'<text x="{width // 2}" y="{pad - 8}" text-anchor="middle" class="muted">'
+            "Costs unmeasured (activity-only)</text>"
+        )
+    return (
+        f'<svg viewBox="0 0 {width} {height}" role="img" aria-label="Daily estimated cost">'
+        f"{note}{''.join(parts)}</svg>"
+    )
+
+
+def _dashboard_table_rows(rows, calls_col="calls"):
+    if not rows:
+        return '<tr><td colspan="6" class="muted">No data</td></tr>'
+    lines = []
+    for r in rows:
+        u = r["usage"]
+        lines.append(
+            "<tr>"
+            f"<td>{html.escape(str(r['key']))}</td>"
+            f"<td>{r[calls_col]}</td>"
+            f"<td>{fmt_tokens(u['output'])}</td>"
+            f"<td>{fmt_tokens(u['input'])}</td>"
+            f"<td>{fmt_tokens(u['cache_read'])}</td>"
+            f"<td>{html.escape(_dashboard_fmt_cost(r['cost_usd'], r.get('partial')))}</td>"
+            "</tr>"
+        )
+    return "\n".join(lines)
+
+
+def _dashboard_partial_footnotes(data):
+    """Priced-subtotal footnotes for the rows that can actually carry one.
+
+    Model rows cannot: a by-model row *is* one model, so its cost is either
+    fully priced or None — never a subtotal. Only the project and command
+    groupings mix priced and unpriced model usage into a single cell, and
+    only they are marked by _enrich_dashboard_partials."""
+    notes = []
+    for kind, rows in (
+        ("project", data.get("top_projects") or []),
+        ("command", data.get("top_commands") or []),
+    ):
+        note = partial_footnote(rows, kind)
+        if note:
+            notes.append(note)
+    return notes
+
+
+def render_dashboard(data, generated_at=None):
+    """Self-contained HTML dashboard (inline CSS/SVG, no external assets)."""
+    if generated_at is None:
+        from datetime import datetime, timezone
+        generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    runtime = data.get("runtime", "claude")
+    activity_only = _dashboard_activity_only(data)
+    summary = data["summary"]
+    u = summary["usage"]
+    window = html.escape(data.get("since") or "all time")
+    project = data.get("project")
+    project_line = (
+        f"<p>Project filter: <strong>{html.escape(project)}</strong></p>"
+        if project else ""
+    )
+    footnotes = scan_footnotes(_dashboard_footnote_source(data))
+    footnotes.extend(_dashboard_partial_footnotes(data))
+    notes_html = "".join(
+        f"<p class=\"note\">{html.escape(note)}</p>" for note in footnotes
+    )
+    missing_root = data.get("projects_dir_missing")
+    empty = summary["sessions"] == 0 and not data["top_projects"]
+    empty_banner = ""
+    if missing_root:
+        empty_banner = (
+            '<p class="empty">No readable corpus at this path — nothing was scanned.</p>'
+        )
+    elif empty:
+        empty_banner = '<p class="empty">No sessions matched this window.</p>'
+    unmeasured = (
+        '<p class="note">Token and cost totals are unmeasured for activity-only '
+        "sessions; zero means unknown, not free.</p>"
+        if activity_only else ""
+    )
+    cost_card = _dashboard_metric_display(summary["cost_usd"], activity_only, token=False)
+    out_card = _dashboard_metric_display(u["output"], activity_only, token=True)
+    in_card = _dashboard_metric_display(u["input"], activity_only, token=True)
+    cache_card = _dashboard_metric_display(u["cache_read"], activity_only, token=True)
+    svg = _dashboard_svg_chart(data.get("by_day") or [], activity_only)
+    measurement_card = _dashboard_measurement_label(
+        summary.get("measurement") or "exact", data.get("measurements") or {})
+    model_rows = _dashboard_table_rows(data.get("top_models") or [], calls_col="calls")
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>Token usage dashboard</title>
+<style>
+body {{ font-family: system-ui, sans-serif; margin: 1.5rem; color: #111; }}
+h1 {{ font-size: 1.5rem; margin-bottom: 0.25rem; }}
+.meta {{ color: #444; font-size: 0.9rem; }}
+.cards {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr)); gap: 0.75rem; margin: 1rem 0; }}
+.card {{ border: 1px solid #ccc; border-radius: 6px; padding: 0.75rem; }}
+.card strong {{ display: block; font-size: 1.25rem; }}
+.card span {{ color: #555; font-size: 0.85rem; }}
+table {{ border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: 0.9rem; }}
+th, td {{ border: 1px solid #ddd; padding: 0.35rem 0.5rem; text-align: left; }}
+th {{ background: #f4f4f4; }}
+.muted {{ color: #666; }}
+.note, .empty {{ background: #fff8e6; border-left: 3px solid #e6b800; padding: 0.5rem 0.75rem; }}
+svg .bar {{ fill: #3b6ea5; }}
+svg .axis {{ font-size: 10px; fill: #333; }}
+svg .scale {{ font-size: 10px; fill: #444; }}
+</style>
+</head>
+<body>
+<h1>Token usage dashboard</h1>
+<p class="meta">Runtime: <strong>{html.escape(runtime)}</strong> · Window: <strong>{window}</strong> · Generated: <strong>{html.escape(generated_at)}</strong></p>
+{project_line}
+{empty_banner}
+{unmeasured}
+<section class="cards" aria-label="Summary">
+<div class="card"><span>Estimated cost</span><strong>{html.escape(cost_card)}</strong></div>
+<div class="card"><span>Output tokens</span><strong>{html.escape(out_card)}</strong></div>
+<div class="card"><span>Input tokens</span><strong>{html.escape(in_card)}</strong></div>
+<div class="card"><span>Cache reads</span><strong>{html.escape(cache_card)}</strong></div>
+<div class="card"><span>Sessions</span><strong>{summary['sessions']}</strong></div>
+<div class="card"><span>Measurement</span><strong>{html.escape(measurement_card)}</strong></div>
+</section>
+<section aria-label="Daily cost chart">
+<h2>Daily estimated cost</h2>
+{svg}
+</section>
+<section aria-label="Top projects">
+<h2>Top projects</h2>
+<table>
+<thead><tr><th>Project</th><th>Sessions</th><th>Output</th><th>Input</th><th>Cache read</th><th>Est. cost</th></tr></thead>
+<tbody>
+{_dashboard_table_rows(data.get('top_projects') or [])}
+</tbody>
+</table>
+</section>
+<section aria-label="Top commands">
+<h2>Top commands</h2>
+<table>
+<thead><tr><th>Command</th><th>Calls</th><th>Output</th><th>Input</th><th>Cache read</th><th>Est. cost</th></tr></thead>
+<tbody>
+{_dashboard_table_rows(data.get('top_commands') or [])}
+</tbody>
+</table>
+</section>
+<section aria-label="Top models">
+<h2>Top models</h2>
+<table>
+<thead><tr><th>Model</th><th>Requests</th><th>Output</th><th>Input</th><th>Cache read</th><th>Est. cost</th></tr></thead>
+<tbody>
+{model_rows}
+</tbody>
+</table>
+</section>
+{notes_html}
+</body>
+</html>
+"""
+
+
+def write_text_output(text, output_path):
+    """Write text to a file atomically, or to stdout when output_path is '-'."""
+    if output_path == "-" or str(output_path) == "-":
+        sys.stdout.write(text)
+        return
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(path, text)
+
+
+def write_output_or_exit(text, output_path):
+    """write_text_output at the CLI boundary.
+
+    A misspelled directory, an --output that names an existing directory, a
+    read-only volume: all user mistakes, and all of them used to unwind a
+    traceback ending somewhere in pathlib. Diagnose them the way every other
+    bad argument is diagnosed — one line naming the path and the reason."""
+    try:
+        write_text_output(text, output_path)
+    except OSError as e:
+        sys.exit(f"token-usage: cannot write {output_path}: {e.strerror or e}")
+
+
+EXPORT_SCHEMA = "token-usage.aggregate.v1"
+
+
+def _export_timestamp(generated_at=None):
+    if generated_at is not None:
+        return generated_at
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _export_metrics(usage, cost_usd):
+    """Map internal usage buckets to OTel-style metric names (not OTLP wire format)."""
+    cache_write = (usage.get("cache_5m") or 0) + (usage.get("cache_1h") or 0)
+    cost = cost_usd
+    if isinstance(cost, float) and not math.isfinite(cost):
+        cost = None
+    return {
+        "gen_ai.usage.input_tokens": int(usage.get("input") or 0),
+        "gen_ai.usage.output_tokens": int(usage.get("output") or 0),
+        "gen_ai.usage.cache_read_tokens": int(usage.get("cache_read") or 0),
+        "gen_ai.usage.cache_write_tokens": int(cache_write),
+        "gen_ai.usage.requests": int(usage.get("requests") or 0),
+        "gen_ai.estimated_cost.usd": cost,
+    }
+
+
+def _export_history_counts(data, measurement_counts=None):
+    """The scan's per-session measurement tally, defaulting to the scan data."""
+    if measurement_counts is not None:
+        return dict(measurement_counts)
+    return dict(data.get("measurements") or {})
+
+
+def _export_record(*, runtime, scope, key, dimensions, usage, cost_usd, measurement,
+                   warnings, timestamp, group_by=None, measurement_counts=None):
+    rec = {
+        "schema": EXPORT_SCHEMA,
+        "runtime": runtime,
+        "scope": scope,
+        "key": key,
+        "timestamp": timestamp,
+        "dimensions": dimensions,
+        "metrics": _export_metrics(usage, cost_usd),
+        "measurement": measurement,
+        "warnings": list(warnings or []),
+    }
+    if group_by is not None:
+        rec["group_by"] = group_by
+    # History scope only: `measurement` is the worst level any session in the
+    # scan reported, which cannot distinguish one weak session in a hundred
+    # from a corpus nobody measured — or either from a scan that matched
+    # nothing. The tally can. A session record has one session, so it has
+    # nothing to count.
+    if measurement_counts is not None:
+        rec["measurement_counts"] = measurement_counts
+    return rec
+
+
+def session_export_records(data, generated_at=None):
+    """One total row plus one activity row per aggregated command label."""
+    ts = _export_timestamp(generated_at)
+    runtime = data.get("runtime") or "claude"
+    measurement = data.get("measurement") or "exact"
+    warnings = data.get("warnings") or []
+    records = []
+    for label, agg in sorted(data["by_label"].items(), key=lambda kv: kv[0]):
+        if agg["usage"]["requests"] == 0:
+            continue
+        records.append(_export_record(
+            runtime=runtime,
+            scope="session",
+            key=label,
+            dimensions={"activity": label},
+            usage=agg["usage"],
+            cost_usd=agg["cost_usd"],
+            measurement=measurement,
+            warnings=warnings,
+            timestamp=ts,
+        ))
+    total = data["total"]
+    records.append(_export_record(
+        runtime=runtime,
+        scope="session",
+        key="total",
+        dimensions={},
+        usage=total["usage"],
+        cost_usd=total["cost_usd"],
+        measurement=measurement,
+        warnings=warnings,
+        timestamp=ts,
+    ))
+    return records
+
+
+def history_export_records(data, generated_at=None, *, measurement_counts=None):
+    """One row per history grouping key plus a final total row."""
+    ts = _export_timestamp(generated_at)
+    runtime = data.get("runtime") or "claude"
+    group_by = data["by"]
+    counts = _export_history_counts(data, measurement_counts)
+    measurement = history_scan_measurement(counts)
+    warnings = data.get("warnings") or []
+    records = []
+    for row in data["rows"]:
+        records.append(_export_record(
+            runtime=runtime,
+            scope="history",
+            key=row["key"],
+            dimensions={group_by: row["key"]},
+            usage=row["usage"],
+            cost_usd=row["cost_usd"],
+            measurement=measurement,
+            warnings=warnings,
+            timestamp=ts,
+            group_by=group_by,
+            measurement_counts=counts,
+        ))
+    usage_total, cost_total, _sessions = _sum_history_rows(data["rows"])
+    records.append(_export_record(
+        runtime=runtime,
+        scope="history",
+        key="total",
+        dimensions={},
+        usage=usage_total,
+        cost_usd=cost_total,
+        measurement=measurement,
+        warnings=warnings,
+        timestamp=ts,
+        group_by=group_by,
+        measurement_counts=counts,
+    ))
+    return records
+
+
+def _json_safe_export(value):
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {k: _json_safe_export(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_json_safe_export(v) for v in value]
+    return value
+
+
+def render_jsonl(records):
+    """Serialize export records to newline-delimited RFC-8259 JSON (no NaN/Infinity)."""
+    lines = []
+    for rec in records or []:
+        safe = _json_safe_export(rec)
+        lines.append(json.dumps(safe, ensure_ascii=False, allow_nan=False,
+                               separators=(",", ":")))
+    if not lines:
+        return ""
+    return "\n".join(lines) + "\n"
+
+
+def run_top_consumers(by="session", since="30d", project=None, limit=10, warnings=None,
+                      runtime="claude", corpus_project_dir=None, corpus_resolution=None):
     """Costliest sessions (by="session") or command labels aggregated across
     sessions (by="command") in a window. Unpriced rows sort last."""
     pricing = load_pricing(warnings)
     cutoff = since_cutoff(since)
-    missing_root = check_projects_root(warnings)
-    unpriced, skipped = set(), []
+    if corpus_resolution is not None:
+        adapter, runtime_name = corpus_resolution
+    else:
+        adapter, runtime_name = resolve_runtime_corpus(
+            runtime, project_dir=corpus_project_dir, warnings=warnings)
+    skipped = []
+    if adapter.name == "claude":
+        missing_root = check_projects_root(warnings)
+        summary_iter = iter_summaries(pricing, cutoff=cutoff, project=project,
+                                      skipped=skipped, warnings=warnings)
+    else:
+        missing_root = check_cursor_root(warnings)
+        summary_iter = iter_adapter_summaries(adapter, pricing, cutoff=cutoff,
+                                              project=project, skipped=skipped,
+                                              warnings=warnings,
+                                              project_dir=corpus_project_dir)
+    unpriced = set()
+    measurements = {}
     sessions, commands = [], {}
-    for s in iter_summaries(pricing, cutoff=cutoff, project=project, skipped=skipped,
-                            warnings=warnings):
+    for s in summary_iter:
         session_unpriced = unpriced_models(s.get("by_model", {}), pricing)
         unpriced.update(session_unpriced)
+        _count_measurement(measurements, s)
         if by == "session":
             # "partial": some of this session's usage ran on an unpriced
             # model, so cost_usd is a priced subtotal — the session ranks on
             # it, and a bare number would hide that.
-            sessions.append({"session_id": Path(s["path"]).stem, "path": s["path"],
+            sid = s.get("session_id") or Path(s["path"]).stem
+            sessions.append({"session_id": sid, "path": s["path"],
                              "project": s["project"], "first_ts": s["first_ts"],
                              "usage": s["total"]["usage"],
                              "cost_usd": s["total"]["cost_usd"],
@@ -1138,6 +1981,9 @@ def run_top_consumers(by="session", since="30d", project=None, limit=10, warning
     data = {"by": by, "since": since, "project": project, "limit": limit,
             "rows": rows[:limit], "unpriced_models": sorted(unpriced),
             "skipped_transcripts": skipped, "projects_dir_missing": missing_root}
+    if runtime_name != "claude":
+        data["runtime"] = runtime_name
+        data["measurements"] = measurements
     if by == "session":
         # Counted over the whole window: unpriced sessions rank last, so the
         # limit is exactly what hides them.
@@ -1221,7 +2067,8 @@ def _median(xs):
     return xs[mid] if n % 2 else (xs[mid - 1] + xs[mid]) / 2
 
 
-def compute_baseline(pricing, project, days=30, exclude=None, warnings=None):
+def compute_baseline(pricing, project, days=30, exclude=None, warnings=None,
+                     runtime="claude", corpus_project_dir=None):
     """Per-project norms from the history index (median session cost; per-command
     median cost and cache-read ratio) over the trailing `days`, excluding the
     transcript at `exclude` (the session being analysed).
@@ -1232,10 +2079,21 @@ def compute_baseline(pricing, project, days=30, exclude=None, warnings=None):
     so a thinned corpus and a genuinely unremarkable session look identical
     without them."""
     cutoff = since_cutoff(f"{days}d")
-    missing_root = check_projects_root(warnings)
-    session_costs, commands, skipped = [], {}, []
-    for s in iter_summaries(pricing, cutoff=cutoff, exclude=exclude, skipped=skipped,
-                            warnings=warnings):
+    adapter, _ = resolve_runtime_corpus(runtime, project_dir=corpus_project_dir,
+                                        warnings=warnings)
+    skipped = []
+    if adapter.name == "claude":
+        missing_root = check_projects_root(warnings)
+        summary_iter = iter_summaries(pricing, cutoff=cutoff, exclude=exclude,
+                                        skipped=skipped, warnings=warnings)
+    else:
+        missing_root = check_cursor_root(warnings)
+        summary_iter = iter_adapter_summaries(adapter, pricing, cutoff=cutoff,
+                                              exclude=exclude, skipped=skipped,
+                                              warnings=warnings,
+                                              project_dir=corpus_project_dir)
+    session_costs, commands = [], {}
+    for s in summary_iter:
         if s["project"] != project:
             continue
         if s["total"]["cost_usd"] is not None:
@@ -1414,46 +2272,119 @@ def window_insights(summaries, cutoff, pricing, now=None, halves=None):
     return sort_findings(out)
 
 
-def run_insights(transcript=None, since=None, project=None, budget=None, warnings=None):
+def run_insights(transcript=None, since=None, project=None, budget=None, warnings=None,
+                 runtime="claude", corpus_project_dir=None, corpus_resolution=None):
     pricing = load_pricing(warnings)
+    warnings = warnings if warnings is not None else []
     if since:
         cutoff = since_cutoff(since)
-        missing_root = check_projects_root(warnings)
+        if corpus_resolution is not None:
+            adapter, runtime_name = corpus_resolution
+        else:
+            adapter, runtime_name = resolve_runtime_corpus(
+                runtime, project_dir=corpus_project_dir, warnings=warnings)
         skipped = []
-        summaries = list(iter_summaries(pricing, cutoff=cutoff, project=project,
-                                        skipped=skipped, warnings=warnings))
+        if adapter.name == "claude":
+            missing_root = check_projects_root(warnings)
+            summaries = list(iter_summaries(pricing, cutoff=cutoff, project=project,
+                                            skipped=skipped, warnings=warnings))
+        else:
+            missing_root = check_cursor_root(warnings)
+            summaries = list(iter_adapter_summaries(adapter, pricing, cutoff=cutoff,
+                                                    project=project, skipped=skipped,
+                                                    warnings=warnings,
+                                                    project_dir=corpus_project_dir))
         # The trend rules compare the window's halves, so "how many sessions
         # matched" is not the whole story of what could be compared: report
         # the first half too, and let the renderer disclose a dead one.
         halves = window_halves(summaries, cutoff)
         first = halves[0]
         c1 = half_cost(first)
-        return {"mode": "window",
-                "findings": window_insights(summaries, cutoff, pricing, halves=halves),
-                # "first_half_spend" is the rules' own predicate, UNROUNDED:
-                # first_half_cost is rounded for the payload, and a first half
-                # under $5e-7 rounds to 0.0 while rules 7-8 still run on it.
-                "baseline": {"sessions": len(summaries), "since": since,
-                             "first_half_sessions": len(first),
-                             "first_half_cost": round(c1, 6),
-                             "first_half_spend": c1 > 0},
-                "skipped_transcripts": skipped,
-                "projects_dir_missing": missing_root}
-    t = resolve_transcript(transcript)
-    data = aggregate(parse_session(t), pricing)
-    baseline = compute_baseline(pricing, project=t.parent.name, exclude=str(t),
-                                warnings=warnings)
+        out = {"mode": "window",
+               "findings": window_insights(summaries, cutoff, pricing, halves=halves),
+               # "first_half_spend" is the rules' own predicate, UNROUNDED:
+               # first_half_cost is rounded for the payload, and a first half
+               # under $5e-7 rounds to 0.0 while rules 7-8 still run on it.
+               "baseline": {"sessions": len(summaries), "since": since,
+                            "first_half_sessions": len(first),
+                            "first_half_cost": round(c1, 6),
+                            "first_half_spend": c1 > 0},
+               "skipped_transcripts": skipped,
+               "projects_dir_missing": missing_root}
+        # See the session branch below: a default Claude run keeps the shape it
+        # had before runtimes existed, and its warnings reach a CLI reader on
+        # stderr the way they always did.
+        if runtime_name != "claude":
+            out["runtime"] = runtime_name
+            measurements = {}
+            for s in summaries:
+                _count_measurement(measurements, s)
+            out["measurements"] = measurements
+            out["warnings"] = warnings
+        return out
+    if isinstance(transcript, CursorSession):
+        _validate_runtime_name(runtime)
+        if runtime not in ("cursor", "auto"):
+            sys.exit("token-usage: CursorSession requires --runtime cursor "
+                     "(got claude)")
+        runtime_name = "cursor" if runtime == "auto" else runtime
+        adapter = get_runtime_adapter(runtime_name)
+    else:
+        adapter, runtime_name = resolve_runtime(runtime, transcript_arg=transcript,
+                                                warnings=warnings)
+    if adapter.name == "claude":
+        t = resolve_transcript(transcript)
+        parsed = {"segments": parse_session(t), "measurement": "exact", "warnings": []}
+        exclude = str(t)
+        project_name = t.parent.name
+        transcript_path = str(t)
+    elif isinstance(transcript, CursorSession):
+        source = transcript
+        parsed = adapter.parse(source)
+        exclude = adapter.describe(source)
+        project_name = adapter.project(source)
+        transcript_path = exclude
+    else:
+        try:
+            source = adapter.locate(transcript)
+        except CursorExplicitSelectorError as e:
+            sys.exit(str(e))
+        if source is None:
+            sys.exit(CURSOR_CLI_SESSION_NOT_FOUND)
+        parsed = adapter.parse(source)
+        exclude = adapter.describe(source)
+        project_name = adapter.project(source)
+        transcript_path = exclude
+    for w in parsed.get("warnings") or []:
+        if w not in warnings:
+            warnings.append(w)
+    measurement = measurement_for_adapter(adapter, parsed)
+    data = aggregate(parsed["segments"], pricing)
+    data = apply_measurement_costs(data, measurement)
+    baseline = compute_baseline(pricing, project=project_name, exclude=exclude,
+                                warnings=warnings, runtime=runtime_name,
+                                corpus_project_dir=corpus_project_dir)
     # One canonical top-level key in both modes: render_insights footnotes it,
     # and a session-mode reader needs it most -- the baseline scan is the only
     # thing that makes session mode say anything at all.
     skipped = baseline.pop("skipped_transcripts")
     missing_root = baseline.pop("projects_dir_missing")
-    return {"mode": "session",
-            "findings": session_insights(data, baseline, budget=budget),
-            "baseline": baseline,
-            "skipped_transcripts": skipped,
-            "projects_dir_missing": missing_root,
-            "transcript_path": str(t)}
+    out = {"mode": "session",
+           "findings": session_insights(data, baseline, budget=budget),
+           "baseline": baseline,
+           "skipped_transcripts": skipped,
+           "projects_dir_missing": missing_root,
+           "transcript_path": transcript_path}
+    # Same rule as the session `json` payload: a default Claude run predates
+    # runtimes and keeps the shape it always had. Cursor has to disclose both
+    # its runtime and its measurement, and carries the warnings behind them.
+    # The MCP envelope adds its own "warnings" key in one place (finish), so
+    # neither caller needs per-key cleanup here.
+    if runtime_name != "claude":
+        out["runtime"] = runtime_name
+        out["measurement"] = measurement
+        out["warnings"] = warnings
+    return out
 
 
 def insights_caveat(result):
@@ -1526,8 +2457,7 @@ def render_insights(result):
     transcript_path = result.get("transcript_path")
     session = ""
     if transcript_path:
-        tp = Path(transcript_path)
-        session = f"(session: {tp.parent.name}/{tp.name})"
+        session = f"(session: {session_display(transcript_path)})"
     caveat = insights_caveat(result)
     if result["findings"]:
         lines = [f"- [{f['severity']}] {f['message']}" for f in result["findings"]]
@@ -1639,6 +2569,1348 @@ def locate_transcript(arg=None, session_id=None, project_dir=None):
                                          project_dir=project_dir)[0]
 
 
+class RuntimeAdapter:
+    """Runtime-specific transcript discovery and parsing."""
+
+    name = "runtime"
+
+    def locate(self, arg=None, session_id=None, project_dir=None):
+        raise NotImplementedError
+
+    def iter_sessions(self, project_dir=None, warnings=None):
+        raise NotImplementedError
+
+    def parse(self, source):
+        raise NotImplementedError
+
+    def project(self, source):
+        raise NotImplementedError
+
+    def describe(self, source):
+        raise NotImplementedError
+
+
+class ClaudeAdapter(RuntimeAdapter):
+    name = "claude"
+
+    def locate(self, arg=None, session_id=None, project_dir=None):
+        return locate_transcript(arg, session_id=session_id, project_dir=project_dir)
+
+    def iter_sessions(self, project_dir=None, warnings=None):
+        root = projects_dir()
+        if project_dir is not None:
+            slug_dir = root / project_slug(
+                str(Path(project_dir).expanduser().resolve()))
+            if slug_dir.is_dir():
+                for path in sorted(slug_dir.glob("*.jsonl")):
+                    yield path
+            return
+        if root.is_dir():
+            for path in sorted(root.glob("*/*.jsonl")):
+                yield path
+
+    def parse(self, source):
+        return parse_session(source)
+
+    def project(self, source):
+        return Path(source).parent.name
+
+    def session_id(self, source):
+        return Path(source).stem
+
+    def describe(self, source):
+        path = Path(source)
+        return f"{path.parent.name}/{path.name}"
+
+
+CURSOR_NO_ACTIVITY = "(no activity)"
+CURSOR_USER_BUBBLE = 1
+CURSOR_ASSISTANT_BUBBLE = 2
+CURSOR_CLI_SESSION_NOT_FOUND = (
+    "token-usage: no Cursor session found — pass a Cloud Agent export .json path, "
+    "or omit the selector for local discovery (hook ledger / Desktop SQLite under "
+    "TOKEN_USAGE_CURSOR_DIR). Composer IDs are accepted via MCP session_id only, "
+    "not as a CLI positional argument."
+)
+
+
+class CursorExplicitSelectorError(Exception):
+    """Non-empty CLI/MCP path selector did not resolve to a Cloud export .json file."""
+
+
+def _cursor_fail_explicit_selector(message):
+    raise CursorExplicitSelectorError(f"token-usage: {message}")
+
+
+def cursor_user_dir():
+    """Cursor Desktop User data root (override with TOKEN_USAGE_CURSOR_DIR)."""
+    override = os.environ.get("TOKEN_USAGE_CURSOR_DIR")
+    if override:
+        return Path(override).expanduser().resolve()
+    if sys.platform == "darwin":
+        return (Path.home() / "Library" / "Application Support" / "Cursor" / "User").resolve()
+    if sys.platform == "win32":
+        appdata = os.environ.get("APPDATA")
+        if appdata:
+            return (Path(appdata) / "Cursor" / "User").resolve()
+        return (Path.home() / "AppData" / "Roaming" / "Cursor" / "User").resolve()
+    return (Path.home() / ".config" / "Cursor" / "User").resolve()
+
+
+def open_cursor_db(db_path):
+    """Open a Cursor state.vscdb read-only (never mutate Cursor state)."""
+    import sqlite3
+    path = Path(db_path).expanduser().resolve()
+    uri = f"file:{urllib.parse.quote(str(path))}?mode=ro"
+    return sqlite3.connect(uri, uri=True)
+
+
+def _cursor_decode_kv(raw):
+    """JSON value of one cursorDiskKV blob, or None when it is not JSON."""
+    if raw is None:
+        return None
+    if isinstance(raw, memoryview):
+        raw = raw.tobytes()
+    text = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else str(raw)
+    try:
+        return json.loads(text)
+    except ValueError:
+        return None
+
+
+def _cursor_kv_json(conn, key, warnings=None):
+    """One cursorDiskKV value, or None — including when the table is gone.
+
+    Cursor's schema is a private implementation detail: a renamed or dropped
+    `cursorDiskKV` is a shape we do not understand, not a crash to hand the
+    user, so it degrades to "nothing readable here" with a warning."""
+    import sqlite3
+    try:
+        row = conn.execute(
+            "SELECT value FROM cursorDiskKV WHERE key = ?", (key,)
+        ).fetchone()
+    except sqlite3.Error as exc:
+        warn(f"cannot read Cursor cursorDiskKV table ({exc}); "
+             "treating this database as empty", warnings)
+        return None
+    return _cursor_decode_kv(row[0]) if row else None
+
+
+class CursorSession:
+    """One Cursor conversation source (SQLite composer, export, or hook ledger)."""
+
+    __slots__ = (
+        "composer_id",
+        "db_path",
+        "export_path",
+        "ledger_path",
+        "project_path",
+        "source",
+    )
+
+    def __init__(self, composer_id, source, db_path=None, export_path=None,
+                 ledger_path=None, project_path=None):
+        self.composer_id = composer_id
+        self.source = source
+        self.db_path = Path(db_path).resolve() if db_path else None
+        self.export_path = Path(export_path).resolve() if export_path else None
+        self.ledger_path = Path(ledger_path).resolve() if ledger_path else None
+        self.project_path = (Path(project_path).expanduser().resolve()
+                             if project_path else None)
+
+
+def _cursor_folder_uri_to_path(folder_uri):
+    if not folder_uri:
+        return None
+    parsed = urllib.parse.urlparse(folder_uri)
+    if parsed.scheme != "file":
+        return None
+    path = urllib.parse.unquote(parsed.path)
+    if sys.platform == "win32" and path.startswith("/") and len(path) > 2 and path[2] == ":":
+        path = path[1:]
+    try:
+        return Path(path).expanduser().resolve()
+    except OSError:
+        return None
+
+
+def _cursor_folder_for_workspace(cursor_root, workspace_id):
+    """Resolved workspace folder path for a workspaceStorage id, or None."""
+    if not workspace_id:
+        return None
+    ws_json = cursor_root / "workspaceStorage" / workspace_id / "workspace.json"
+    if not ws_json.is_file():
+        return None
+    try:
+        data = json.loads(ws_json.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, ValueError):
+        return None
+    folder = data.get("folder") or data.get("configuration", {}).get("folder")
+    return _cursor_folder_uri_to_path(folder)
+
+
+def _cursor_composer_record(db_path, composer_id, warnings=None):
+    """The composer row for `composer_id`, or None when it does not exist.
+
+    None is the fail-closed answer an explicit id needs: a database that has
+    no such composer must not resolve to some other session."""
+    import sqlite3
+    if not db_path or not Path(db_path).is_file():
+        return None
+    try:
+        conn = open_cursor_db(db_path)
+    except sqlite3.Error as exc:
+        warn(f"cannot open Cursor database read-only: {exc}", warnings)
+        return None
+    try:
+        data = _cursor_kv_json(conn, f"composerData:{composer_id}", warnings)
+        return data if isinstance(data, dict) else None
+    finally:
+        conn.close()
+
+
+def _cursor_composer_workspace_folder(cursor_root, composer):
+    ws_id = (composer or {}).get("workspaceStorageId") or (composer or {}).get("workspaceId")
+    return _cursor_folder_for_workspace(cursor_root, ws_id)
+
+
+def _cursor_workspace_ids_for_project(cursor_root, project_dir):
+    if project_dir is None:
+        return None
+    target = Path(project_dir).expanduser().resolve()
+    matched = []
+    ws_root = cursor_root / "workspaceStorage"
+    if not ws_root.is_dir():
+        return matched
+    for ws_json in ws_root.glob("*/workspace.json"):
+        try:
+            data = json.loads(ws_json.read_text(encoding="utf-8", errors="replace"))
+        except (OSError, ValueError):
+            continue
+        folder = data.get("folder") or data.get("configuration", {}).get("folder")
+        ws_path = _cursor_folder_uri_to_path(folder)
+        if ws_path == target:
+            matched.append(ws_json.parent.name)
+    return matched
+
+
+def _cursor_global_db_path(cursor_root):
+    return cursor_root / "globalStorage" / "state.vscdb"
+
+
+def _cursor_list_composers(conn, workspace_ids=None, warnings=None):
+    """(lastUpdated, composer_id, record) rows, newest first.
+
+    Only composerData rows are selected, and each row's value is decoded from
+    the result already in hand: scanning every key pulled every bubble blob in
+    the database through discovery and then re-queried each composer."""
+    import sqlite3
+    rows = []
+    try:
+        fetched = conn.execute(
+            "SELECT key, value FROM cursorDiskKV WHERE key LIKE 'composerData:%'"
+        ).fetchall()
+    except sqlite3.Error as exc:
+        warn(f"cannot read Cursor cursorDiskKV table ({exc}); "
+             "treating this database as empty", warnings)
+        return rows
+    for key, value in fetched:
+        if not str(key).startswith("composerData:"):
+            continue
+        composer_id = str(key).split(":", 1)[1]
+        data = _cursor_decode_kv(value)
+        if not isinstance(data, dict):
+            continue
+        ws_id = data.get("workspaceStorageId") or data.get("workspaceId")
+        if workspace_ids is not None and ws_id not in workspace_ids:
+            continue
+        updated = data.get("lastUpdatedAt") or data.get("createdAt") or 0
+        rows.append((updated, composer_id, data))
+    rows.sort(key=lambda r: (-r[0], r[1]))
+    return rows
+
+
+def _cursor_activity_label(title, prompt):
+    if title:
+        return str(title).strip()
+    prompt = (prompt or "").strip()
+    if prompt:
+        return prompt[:120]
+    return CURSOR_NO_ACTIVITY
+
+
+def _cursor_token_flat(token_count):
+    """Conservative normalization of Cursor bubble tokenCount; never infer."""
+    if not isinstance(token_count, dict):
+        return None
+    inp = token_count.get("inputTokens")
+    if inp is None:
+        inp = token_count.get("input_tokens")
+    out = token_count.get("outputTokens")
+    if out is None:
+        out = token_count.get("output_tokens")
+    cache_read = token_count.get("cacheReadTokens")
+    if cache_read is None:
+        cache_read = token_count.get("cache_read_tokens")
+    cache_write = token_count.get("cacheWriteTokens")
+    if cache_write is None:
+        cache_write = token_count.get("cache_write_tokens")
+    flat = {
+        "input": int(inp) if isinstance(inp, (int, float)) and inp > 0 else 0,
+        "output": int(out) if isinstance(out, (int, float)) and out > 0 else 0,
+        "cache_read": (int(cache_read) if isinstance(cache_read, (int, float))
+                       and cache_read > 0 else 0),
+        "cache_5m": 0,
+        "cache_1h": 0,
+    }
+    if cache_write and isinstance(cache_write, (int, float)) and cache_write > 0:
+        flat["cache_5m"] = int(cache_write)
+    if any(flat[k] for k in ("input", "output", "cache_read", "cache_5m", "cache_1h")):
+        return flat
+    return None
+
+
+_CURSOR_COMPLETION_HOOKS = frozenset({"stop", "afterAgentResponse"})
+
+
+def cursor_ledger_root():
+    """Directory holding the Cursor hook ledgers (one JSONL per conversation)."""
+    return ledger_dir() / "cursor"
+
+
+def _sanitize_cursor_id(value):
+    """Alphanumeric Cursor id for in-ledger references (generation/subagent)."""
+    cleaned = re.sub(r"[^A-Za-z0-9_-]", "", str(value or ""))
+    return cleaned or "unknown"
+
+
+def _cursor_ledger_paths():
+    """Hook ledgers, most recently written first.
+
+    Recency, not filename order: the basename starts with a truncated
+    conversation id, so sorting by name picked "the alphabetically first
+    conversation" as the latest session."""
+    root = cursor_ledger_root()
+    if not root.is_dir():
+        return []
+    dated = []
+    for path in root.glob("*.jsonl"):
+        try:
+            dated.append((path.stat().st_mtime_ns, path))
+        except OSError:      # vanished mid-scan
+            continue
+    dated.sort(key=lambda item: (-item[0], item[1].name))
+    return [path for _mtime, path in dated]
+
+
+def _cursor_ledger_meta(path):
+    """(conversation_id, workspace_roots, first_ts) for one hook ledger.
+
+    Ledgers written before the capture recorded the raw conversation id fall
+    back to the hashed filename stem — the only identity such a file has."""
+    conversation_id, roots, first_ts = None, [], None
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(ev, dict):
+                    continue
+                cid = ev.get("conversation_id")
+                if conversation_id is None and isinstance(cid, str) and cid:
+                    conversation_id = cid
+                if not roots and isinstance(ev.get("workspace_roots"), list):
+                    roots = [r for r in ev["workspace_roots"] if isinstance(r, str) and r]
+                ts = ev.get("ts")
+                if first_ts is None and isinstance(ts, str) and ts:
+                    first_ts = ts
+                if conversation_id and roots and first_ts:
+                    break
+    except OSError:
+        # Missing or unreadable ledgers are expected (fresh install, vanished
+        # mid-scan). Fall through with filename-derived identity and whatever
+        # metadata we collected before the read failed.
+        pass
+    return (conversation_id or Path(path).stem), roots, first_ts
+
+
+def _cursor_project_path_from_roots(roots):
+    """The workspace root a hook-captured conversation belongs to, or None."""
+    for root in roots or []:
+        try:
+            return Path(root).expanduser().resolve()
+        except OSError:
+            continue
+    return None
+
+
+def _cursor_ledger_filename(conversation_id):
+    """Deterministic ledger basename: readable prefix plus short hash of the raw id."""
+    raw = str(conversation_id or "")
+    prefix = re.sub(r"[^A-Za-z0-9_-]", "", raw)[:48] or "unknown"
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:8]
+    return f"{prefix}_{digest}"
+
+
+def _cursor_hook_usage_has_tokens(usage):
+    if not isinstance(usage, dict):
+        return False
+    return any(
+        usage.get(k) for k in ("input", "output", "cache_read", "cache_5m", "cache_1h")
+    )
+
+
+CURSOR_TOKEN_FIELDS = ("input_tokens", "output_tokens",
+                       "cache_read_tokens", "cache_write_tokens")
+
+
+def _cursor_hook_tokens_from_payload(payload):
+    """The token fields a Cursor completion hook carries, stored verbatim.
+
+    Capture stays lossless. Cursor's cumulative `input_tokens` has to have the
+    cache buckets subtracted out before it means "uncached input", but doing
+    that here clamped a measured input to zero whenever the payload's cache
+    fields were larger — with nothing left in the ledger to notice it by.
+    _cursor_usage_from_tokens does the arithmetic at parse time, where an
+    impossible combination can still be disclosed."""
+    if not isinstance(payload, dict):
+        return None
+    tokens = {}
+    for field in CURSOR_TOKEN_FIELDS:
+        val = payload.get(field)
+        if isinstance(val, (int, float)) and not isinstance(val, bool) and val >= 0:
+            tokens[field] = int(val)
+    return tokens or None
+
+
+def _cursor_usage_from_tokens(tokens, context, warnings=None):
+    """(usage buckets, trusted) for one completion event's raw token fields.
+
+    `trusted` is False when the cache buckets exceed the reported input: that
+    is a payload shape we do not understand, so the measured input is kept as
+    it stands and the session is downgraded to `partial` rather than being
+    silently clamped to zero uncached input."""
+    if not isinstance(tokens, dict):
+        return None, True
+    vals = {}
+    for field in CURSOR_TOKEN_FIELDS:
+        val = tokens.get(field)
+        vals[field] = int(val) if isinstance(val, (int, float)) and not isinstance(val, bool) and val > 0 else 0
+    if not any(vals.values()):
+        return None, True
+    inp = vals["input_tokens"]
+    cached = vals["cache_read_tokens"] + vals["cache_write_tokens"]
+    trusted = True
+    if inp and cached:
+        if inp >= cached:
+            inp -= cached
+        else:
+            trusted = False
+            warn(f"Cursor hook {context}: input_tokens ({inp}) is below "
+                 f"cache_read+cache_write ({cached}); keeping the reported input "
+                 "and downgrading this session to partial", warnings)
+    return {"input": inp, "output": vals["output_tokens"],
+            "cache_read": vals["cache_read_tokens"],
+            "cache_5m": vals["cache_write_tokens"], "cache_1h": 0}, trusted
+
+
+def _cursor_workspace_roots_from_payload(payload):
+    """Workspace roots from a hook payload — the ledger's only project identity."""
+    roots = payload.get("workspace_roots")
+    if isinstance(roots, str):
+        roots = [roots]
+    if not isinstance(roots, list):
+        return None
+    cleaned = [r.strip() for r in roots if isinstance(r, str) and r.strip()]
+    return cleaned or None
+
+
+def _utc_now_iso():
+    """Now, as the second-precision UTC ISO instant transcripts already use.
+
+    Same shape as since_cutoff()'s output so the plain string comparisons the
+    window filters run on stay meaningful."""
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _cursor_hook_activity_from_payload(payload):
+    for key in ("command", "skill_name", "skill"):
+        val = payload.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()[:120]
+    prompt = payload.get("prompt")
+    if isinstance(prompt, str) and prompt.strip():
+        return prompt.strip()[:120]
+    return ""
+
+
+def _cursor_hook_record_from_payload(payload):
+    hook = str(payload.get("hook_event_name") or "")
+    gen = _sanitize_cursor_id(payload.get("generation_id"))
+    # The ledger filename hashes the conversation id for path safety, so the
+    # raw id travels in the record: it is what deduplicates a hook-captured
+    # conversation against Cursor's own composer row for the same one.
+    record = {"hook": hook, "generation_id": gen, "ts": _utc_now_iso(),
+              "conversation_id": str(payload.get("conversation_id"))}
+    roots = _cursor_workspace_roots_from_payload(payload)
+    if roots:
+        record["workspace_roots"] = roots
+    if hook == "beforeSubmitPrompt":
+        prompt = payload.get("prompt")
+        if isinstance(prompt, str):
+            record["prompt"] = prompt.strip()[:120]
+        label = _cursor_hook_activity_from_payload(payload)
+        if label:
+            record["label"] = label
+    elif hook == "subagentStart":
+        record["subagent_id"] = _sanitize_cursor_id(payload.get("subagent_id"))
+        record["subagent_type"] = str(payload.get("subagent_type") or "agent")
+        task = payload.get("task")
+        if isinstance(task, str) and task.strip():
+            record["task"] = task.strip()[:120]
+        model = payload.get("subagent_model") or payload.get("model")
+        if model:
+            record["subagent_model"] = str(model)
+    elif hook in _CURSOR_COMPLETION_HOOKS | {"subagentStop"}:
+        model = payload.get("model") or payload.get("subagent_model")
+        if model:
+            record["model"] = str(model)
+        tokens = _cursor_hook_tokens_from_payload(payload)
+        if tokens:
+            record["tokens"] = tokens
+        if hook == "subagentStop":
+            record["subagent_id"] = _sanitize_cursor_id(payload.get("subagent_id"))
+            record["subagent_type"] = str(payload.get("subagent_type") or "agent")
+    return record
+
+
+def _cursor_hook_ledger_path(conversation_id):
+    return cursor_ledger_root() / f"{_cursor_ledger_filename(conversation_id)}.jsonl"
+
+
+def _append_cursor_hook_line(ledger_path, record):
+    parent = ledger_path.parent
+    fresh = not parent.is_dir()
+    parent.mkdir(parents=True, exist_ok=True)
+    if fresh:
+        # Ledgers hold prompt previews: owner-only where the filesystem
+        # supports it, and no worse than the default where it does not.
+        try:
+            os.chmod(parent, 0o700)
+        except OSError:
+            # Best-effort permission hardening only; continue on platforms
+            # or filesystems where chmod is unsupported or denied.
+            pass
+    line = json.dumps(record, separators=(",", ":")) + "\n"
+    with open(ledger_path, "a", encoding="utf-8") as handle:
+        handle.write(line)
+        handle.flush()
+        try:
+            os.fsync(handle.fileno())
+        except OSError:
+            # fsync is durability, not correctness: the line is already in
+            # the FILE* buffer (and flushed). Fail open so a hook never
+            # blocks the session on a filesystem that cannot sync.
+            pass
+
+
+def _run_cursor_hook(payload):
+    if not isinstance(payload, dict):
+        return 0
+    hook = payload.get("hook_event_name")
+    if not hook:
+        return 0
+    conversation_id = payload.get("conversation_id")
+    if not conversation_id:
+        return 0
+    try:
+        record = _cursor_hook_record_from_payload(payload)
+        _append_cursor_hook_line(_cursor_hook_ledger_path(conversation_id), record)
+    except Exception as e:  # noqa: BLE001 — fail-open
+        _hook_warn(f"cursor-hook: {type(e).__name__}: {e}")
+    return 0
+
+
+def run_cursor_hook():
+    """Cursor hooks entry point: always exit 0, append-only ledger updates."""
+    try:
+        rc = _run_cursor_hook(_hook_payload())
+        print(json.dumps({}))
+        _flush_stdout()
+        return rc
+    except Exception as e:  # noqa: BLE001
+        _hook_warn(f"cursor-hook: {type(e).__name__}: {e}")
+        print(json.dumps({}))
+        _flush_stdout()
+        return 0
+
+
+def _cursor_ledger_event_usage(ev, warnings):
+    """(usage buckets, trusted) for one ledger event, new shape or legacy.
+
+    New records carry the hook's raw `tokens`; ledgers written before the
+    capture stopped normalizing carry an already-bucketed `usage`, which is
+    taken as it stands (its input was subtracted at capture time)."""
+    if "tokens" in ev:
+        gen = ev.get("generation_id") or "unknown"
+        return _cursor_usage_from_tokens(ev.get("tokens"), f"generation {gen}", warnings)
+    usage = ev.get("usage")
+    if not _cursor_hook_usage_has_tokens(usage):
+        return None, True
+    return {k: int(usage.get(k) or 0)
+            for k in ("input", "output", "cache_read", "cache_5m", "cache_1h")}, True
+
+
+def _cursor_parse_hook_ledger(session, warnings):
+    """(segments, measurement) for one conversation's hook ledger."""
+    segments = []
+    saw_tokens = False
+    trusted = True
+    path = session.ledger_path
+    if path is None or not path.is_file():
+        warn(f"Cursor hook ledger not found for {session.composer_id!r}", warnings)
+        return segments, "activity_only"
+
+    events = []
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        warn(f"cannot read Cursor hook ledger: {exc}", warnings)
+        return segments, "activity_only"
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(ev, dict) and ev.get("generation_id"):
+            events.append(ev)
+
+    gen_order = []
+    gen_meta = {}
+    subagents = {}
+
+    def meta_for(gen):
+        if gen not in gen_meta:
+            gen_meta[gen] = {
+                "prompt": "",
+                "label": "",
+                "model": "unknown",
+                "usage": None,
+                "start_ts": None,
+                "completion_done": False,
+                "subagents": [],
+            }
+            gen_order.append(gen)
+        return gen_meta[gen]
+
+    def record_completion(meta, ev):
+        usage, ev_trusted = _cursor_ledger_event_usage(ev, warnings)
+        if meta["usage"] is not None:
+            return None
+        if usage:
+            if ev.get("model"):
+                meta["model"] = str(ev.get("model"))
+            meta["usage"] = usage
+            meta["completion_done"] = True
+            return ev_trusted
+        if not meta["completion_done"]:
+            if ev.get("model"):
+                meta["model"] = str(ev.get("model"))
+            meta["completion_done"] = True
+        return None
+
+    for ev in events:
+        gen = ev.get("generation_id")
+        hook = ev.get("hook") or ""
+        meta = meta_for(gen)
+        # The generation's first event dates the whole turn: every since/day/
+        # history/top-consumer window filters on it.
+        if meta["start_ts"] is None and isinstance(ev.get("ts"), str) and ev["ts"]:
+            meta["start_ts"] = ev["ts"]
+        if hook == "beforeSubmitPrompt":
+            meta["prompt"] = str(ev.get("prompt") or "").strip()[:120]
+            label = ev.get("label") or _cursor_activity_label("", meta["prompt"])
+            if label and label != CURSOR_NO_ACTIVITY:
+                meta["label"] = label
+            elif meta["prompt"]:
+                meta["label"] = meta["prompt"]
+        elif hook == "subagentStart":
+            sid = ev.get("subagent_id") or "unknown"
+            subagents[(gen, sid)] = {
+                "type": ev.get("subagent_type") or "agent",
+                "description": str(ev.get("task") or "").strip()[:120],
+                "model": ev.get("subagent_model") or "unknown",
+                "parent_gen": gen,
+                "stop_recorded": False,
+            }
+        elif hook == "subagentStop":
+            sid = ev.get("subagent_id") or "unknown"
+            sub_key = (gen, sid)
+            sub = subagents.setdefault(
+                sub_key,
+                {
+                    "type": ev.get("subagent_type") or "agent",
+                    "description": "",
+                    "model": ev.get("model") or "unknown",
+                    "parent_gen": gen,
+                    "stop_recorded": False,
+                },
+            )
+            if sub["stop_recorded"]:
+                continue
+            sub["stop_recorded"] = True
+            usage, ev_trusted = _cursor_ledger_event_usage(ev, warnings)
+            model = ev.get("model") or sub.get("model") or "unknown"
+            parent = sub.get("parent_gen") or gen
+            parent_meta = meta_for(parent)
+            bucket = empty_usage()
+            bucket["requests"] = 1
+            if usage:
+                saw_tokens = True
+                trusted = trusted and ev_trusted
+                for key, value in usage.items():
+                    bucket[key] = value
+            parent_meta["subagents"].append({
+                "type": sub.get("type") or "agent",
+                "description": sub.get("description") or "",
+                "output_tokens": bucket["output"],
+                "by_model": {model: bucket},
+            })
+        elif hook in _CURSOR_COMPLETION_HOOKS:
+            ev_trusted = record_completion(meta, ev)
+            if ev_trusted is not None:
+                saw_tokens = True
+                trusted = trusted and ev_trusted
+
+    for gen in gen_order:
+        meta = gen_meta[gen]
+        label = meta["label"] or _cursor_activity_label("", meta["prompt"])
+        seg = {
+            "label": label,
+            "start_ts": meta["start_ts"],
+            "by_model": {},
+            "prompt": meta["prompt"],
+            "subagents": meta["subagents"],
+        }
+        model = meta["model"] or "unknown"
+        if meta["usage"]:
+            add_flat(seg["by_model"].setdefault(model, empty_usage()), meta["usage"])
+        elif meta["completion_done"]:
+            seg["by_model"].setdefault(model, empty_usage())["requests"] += 1
+        # Cursor's parent completion hook reports the parent turn only, so a
+        # child's usage is added to the segment total exactly once — the same
+        # parent-includes-children shape Claude subagent rollups produce, with
+        # the per-agent rows staying subsets of it. Without this, a turn that
+        # delegated all its work had no usage at all and the report dropped it.
+        for child in meta["subagents"]:
+            merge_by_model(seg["by_model"], child["by_model"])
+        segments.append(seg)
+    if not saw_tokens:
+        return segments, "activity_only"
+    return segments, ("exact" if trusted else "partial")
+
+
+def _cursor_bubble_text(bubble):
+    if not isinstance(bubble, dict):
+        return ""
+    text = bubble.get("text")
+    if isinstance(text, str):
+        return text
+    rich = bubble.get("richText")
+    if isinstance(rich, str):
+        return rich
+    return ""
+
+
+def _cursor_bubble_model(bubble, composer):
+    if isinstance(bubble, dict):
+        for key in ("modelType", "model", "modelName"):
+            val = bubble.get(key)
+            if val:
+                return str(val)
+    cfg = (composer or {}).get("modelConfig") or {}
+    return str(cfg.get("modelName") or cfg.get("model") or "unknown")
+
+
+def _cursor_parse_sqlite(session, warnings):
+    segments = []
+    saw_tokens = False
+
+    def new_segment(label, ts, prompt=""):
+        segments.append({
+            "label": label, "start_ts": ts, "by_model": {},
+            "prompt": (prompt or "").strip()[:120], "subagents": [],
+        })
+
+    import sqlite3
+    db_path = session.db_path or _cursor_global_db_path(cursor_user_dir())
+    try:
+        conn = open_cursor_db(db_path)
+    except sqlite3.Error as exc:
+        warn(f"cannot open Cursor database read-only: {exc}", warnings)
+        return segments, saw_tokens
+    try:
+        composer = _cursor_kv_json(conn, f"composerData:{session.composer_id}", warnings)
+        if not isinstance(composer, dict):
+            warn(f"composer {session.composer_id!r} not found in Cursor database",
+                 warnings)
+            return segments, saw_tokens
+        title = composer.get("name") or composer.get("title") or ""
+        headers = (composer.get("fullConversationHeadersOnly")
+                   or composer.get("conversationHeaders")
+                   or [])
+        if not isinstance(headers, list):
+            headers = []
+        for header in headers:
+            if not isinstance(header, dict):
+                continue
+            bubble_id = header.get("bubbleId") or header.get("id")
+            if not bubble_id:
+                continue
+            bubble = _cursor_kv_json(
+                conn, f"bubbleId:{session.composer_id}:{bubble_id}", warnings)
+            if bubble is None:
+                warn(f"missing Cursor bubble {bubble_id!r} for composer "
+                     f"{session.composer_id!r}", warnings)
+                continue
+            # Some Cursor versions leave the header's type null and only the
+            # bubble itself knows whether the turn was the user's.
+            btype = header.get("type")
+            if btype is None:
+                btype = bubble.get("type")
+            ts = bubble.get("createdAt") or bubble.get("timestamp")
+            if btype == CURSOR_USER_BUBBLE:
+                prompt = _cursor_bubble_text(bubble)
+                label = _cursor_activity_label(
+                    title if not segments else "", prompt)
+                new_segment(label, ts, prompt)
+            elif btype == CURSOR_ASSISTANT_BUBBLE:
+                if not segments:
+                    new_segment(_cursor_activity_label(title, ""), ts)
+                seg = segments[-1]
+                model = _cursor_bubble_model(bubble, composer)
+                bucket = seg["by_model"].setdefault(model, empty_usage())
+                flat = _cursor_token_flat(bubble.get("tokenCount"))
+                if flat:
+                    saw_tokens = True
+                    add_flat(bucket, flat)
+                else:
+                    bucket["requests"] += 1
+    finally:
+        conn.close()
+    return segments, saw_tokens
+
+
+def _cursor_parse_cloud_export(session, warnings):
+    """(segments, saw_tokens) for a Cloud Agent export JSON.
+
+    Most exports state no usage at all, which is why the measurement default
+    for this source is activity_only. But some do carry explicit `usage` /
+    `tokenUsage` objects, and those tokens are read verbatim into the buckets —
+    so the caller needs to know they are there. Calling such a session
+    activity_only nulls its cost while the report still prints the tokens
+    behind it, which reads as "these tokens were free"."""
+    segments = []
+    saw_tokens = False
+    try:
+        data = json.loads(session.export_path.read_text(encoding="utf-8",
+                                                        errors="replace"))
+    except (OSError, ValueError) as exc:
+        warn(f"cannot read Cursor cloud export: {exc}", warnings)
+        return segments, saw_tokens
+    title = data.get("title") or data.get("name") or ""
+    messages = data.get("messages") or []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        ts = msg.get("timestamp") or msg.get("createdAt")
+        text = msg.get("text") or msg.get("content") or ""
+        if isinstance(text, list):
+            text = text_of(text)
+        if role == "user":
+            label = _cursor_activity_label(title if not segments else "", text)
+            new = {
+                "label": label, "start_ts": ts, "by_model": {},
+                "prompt": str(text).strip()[:120], "subagents": [],
+            }
+            segments.append(new)
+        elif role == "assistant":
+            if not segments:
+                segments.append({
+                    "label": _cursor_activity_label(title, ""),
+                    "start_ts": ts, "by_model": {}, "prompt": "",
+                    "subagents": [],
+                })
+            seg = segments[-1]
+            model = str(msg.get("model") or data.get("model") or "unknown")
+            bucket = seg["by_model"].setdefault(model, empty_usage())
+            usage = msg.get("usage") or msg.get("tokenUsage")
+            flat = None
+            if isinstance(usage, dict):
+                flat = normalize_usage(usage)
+                if not any(flat[k] for k in flat):
+                    flat = None
+            if flat:
+                saw_tokens = True
+                add_flat(bucket, flat)
+            else:
+                bucket["requests"] += 1
+    return segments, saw_tokens
+
+
+class CursorAdapter(RuntimeAdapter):
+    name = "cursor"
+
+    def locate(self, arg=None, session_id=None, project_dir=None):
+        if arg is not None and str(arg).strip():
+            explicit = str(arg).strip()
+            path = Path(explicit).expanduser()
+            if not path.is_file():
+                _cursor_fail_explicit_selector(
+                    f"Cursor export not found: {explicit!r} — expected an existing "
+                    ".json Cloud Agent export file (omit the selector for local "
+                    "discovery; composer IDs use MCP session_id only)"
+                )
+            if path.suffix.lower() != ".json":
+                _cursor_fail_explicit_selector(
+                    f"Cursor explicit selector must be a .json Cloud Agent export, "
+                    f"not {path.suffix!r} ({path})"
+                )
+            try:
+                data = json.loads(path.read_text(encoding="utf-8",
+                                                 errors="replace"))
+            except (OSError, ValueError):
+                _cursor_fail_explicit_selector(
+                    f"Cursor export is not readable JSON: {path}"
+                )
+            if not isinstance(data, dict):
+                _cursor_fail_explicit_selector(
+                    f"Cursor export must be a JSON object: {path}"
+                )
+            cid = (data.get("id") or data.get("conversation_id") or path.stem)
+            return CursorSession(str(cid), "cloud_export", export_path=path)
+        if session_id:
+            # An explicit id outranks a project hint, and fails closed: a
+            # composer that is not in this database is not "the latest one".
+            wanted = str(session_id)
+            for session in self._iter_ledger_sessions():
+                if session.composer_id == wanted:
+                    return session
+            root = cursor_user_dir()
+            db = _cursor_global_db_path(root)
+            composer = _cursor_composer_record(db, wanted)
+            if composer is None:
+                return None
+            return CursorSession(wanted, "sqlite", db_path=db,
+                                 project_path=_cursor_composer_workspace_folder(
+                                     root, composer))
+        for session in self.iter_sessions(project_dir=project_dir):
+            return session
+        return None
+
+    def _iter_ledger_sessions(self, project_dir=None, warnings=None):
+        """Hook-ledger sessions, newest first, keyed by their raw conversation id."""
+        target = (Path(project_dir).expanduser().resolve()
+                  if project_dir is not None else None)
+        for path in _cursor_ledger_paths():
+            conversation_id, roots, _first_ts = _cursor_ledger_meta(path)
+            project_path = _cursor_project_path_from_roots(roots)
+            if target is not None and project_path != target:
+                continue
+            yield CursorSession(conversation_id, "hook_ledger", ledger_path=path,
+                                project_path=project_path)
+
+    def iter_sessions(self, project_dir=None, warnings=None):
+        import sqlite3
+        cursor_root = cursor_user_dir()
+        # Hook ledgers first (they are the higher-confidence read path) and
+        # their conversation ids suppress Cursor's own composer row for the
+        # same conversation: one session, counted once.
+        from_ledger = set()
+        for session in self._iter_ledger_sessions(project_dir, warnings):
+            from_ledger.add(session.composer_id)
+            yield session
+        db_path = _cursor_global_db_path(cursor_root)
+        if not db_path.is_file():
+            return
+        workspace_ids = _cursor_workspace_ids_for_project(cursor_root, project_dir)
+        try:
+            conn = open_cursor_db(db_path)
+        except sqlite3.Error as exc:
+            warn(f"cannot open Cursor database read-only: {exc}", warnings)
+            return
+        try:
+            composers = _cursor_list_composers(
+                conn, workspace_ids if project_dir is not None else None,
+                warnings=warnings)
+            for _updated, composer_id, data in composers:
+                if composer_id in from_ledger:
+                    continue
+                folder = _cursor_composer_workspace_folder(cursor_root, data)
+                yield CursorSession(composer_id, "sqlite", db_path=db_path,
+                                    project_path=folder)
+        finally:
+            conn.close()
+
+    def parse(self, source):
+        warnings = []
+        if isinstance(source, (str, Path)):
+            source = self.locate(str(source))
+        if source is None:
+            warn("no Cursor session to parse", warnings)
+            return {"segments": [], "measurement": "activity_only",
+                    "warnings": warnings}
+        if source.source == "cloud_export":
+            segments, saw_tokens = _cursor_parse_cloud_export(source, warnings)
+            measurement = "partial" if saw_tokens else "activity_only"
+        elif source.source == "hook_ledger":
+            segments, measurement = _cursor_parse_hook_ledger(source, warnings)
+        else:
+            segments, saw_tokens = _cursor_parse_sqlite(source, warnings)
+            measurement = "partial" if saw_tokens else "activity_only"
+        return {"segments": segments, "measurement": measurement,
+                "warnings": warnings}
+
+    def session_id(self, source):
+        if isinstance(source, CursorSession):
+            return source.composer_id
+        return str(source)
+
+    def project(self, source):
+        if isinstance(source, CursorSession):
+            if source.project_path is not None:
+                return project_slug(str(source.project_path))
+            if source.source == "cloud_export" and source.export_path:
+                return project_slug(source.export_path.stem)
+            if source.source == "hook_ledger":
+                # Only reached when the ledger recorded no workspace root:
+                # every hook-captured session used to land here, so a whole
+                # machine's Cursor work rolled up under one fake project.
+                return "cursor-hooks"
+            return project_slug(f"cursor:{source.composer_id}")
+        return str(source)
+
+    def describe(self, source):
+        if isinstance(source, CursorSession):
+            if source.source == "cloud_export" and source.export_path:
+                return source.export_path.name
+            if source.source == "hook_ledger":
+                return f"conversation:{source.composer_id}"
+            return f"composer:{source.composer_id}"
+        return str(source)
+
+
+_RUNTIME_ADAPTERS = {
+    "claude": ClaudeAdapter(),
+    "cursor": CursorAdapter(),
+}
+
+
+def get_runtime_adapter(name):
+    """Return the adapter for a runtime name (`claude`, …)."""
+    try:
+        return _RUNTIME_ADAPTERS[name]
+    except KeyError:
+        raise ValueError(f"unknown runtime {name!r}") from None
+
+
+RUNTIME_CHOICES = ("claude", "cursor", "auto")
+
+_DEFAULT_MEASUREMENT = {"claude": "exact", "cursor": "activity_only"}
+
+
+def measurement_for_adapter(adapter, parsed):
+    """Canonical measurement when the adapter parse omits or nulls the field."""
+    value = parsed.get("measurement") if isinstance(parsed, dict) else None
+    if value:
+        return value
+    return _DEFAULT_MEASUREMENT[adapter.name]
+
+
+def _validate_runtime_name(name):
+    if name not in RUNTIME_CHOICES:
+        sys.exit(f"token-usage: invalid --runtime {name!r} — "
+                 f"use one of: {', '.join(RUNTIME_CHOICES)}")
+
+
+def check_cursor_root(warnings=None):
+    """Like check_projects_root, for Cursor's User data directory."""
+    root = cursor_user_dir()
+    db = root / "globalStorage" / "state.vscdb"
+    ledger = cursor_ledger_root()
+    if (db.is_file() and os.access(db, os.R_OK)) or (
+            ledger.is_dir() and os.access(ledger, os.R_OK | os.X_OK)):
+        return None
+    warn(f"no readable Cursor session data at {root}", warnings)
+    return str(root)
+
+
+def apply_measurement_costs(data, measurement):
+    """Activity-only sessions count turns but never carry priced totals."""
+    if measurement != "activity_only":
+        return data
+    for agg in data["by_label"].values():
+        agg["cost_usd"] = None
+        for row in agg.get("models", []):
+            row["cost_usd"] = None
+        for row in agg.get("agents", []):
+            row["cost_usd"] = None
+    data["total"]["cost_usd"] = None
+    data["total"]["cache_savings_usd"] = None
+    for seg in data.get("segments", []):
+        seg["cost_usd"] = None
+    return data
+
+
+def _adapter_source_cache_key(adapter, source):
+    """Stable identity + freshness for adapter summary caches."""
+    if isinstance(source, CursorSession):
+        if source.source == "hook_ledger" and source.ledger_path:
+            p = source.ledger_path
+            return f"{adapter.name}:hook:{source.composer_id}:{p}"
+        if source.source == "cloud_export" and source.export_path:
+            p = source.export_path
+            return f"{adapter.name}:export:{p}"
+        if source.db_path:
+            return f"{adapter.name}:sqlite:{source.composer_id}:{source.db_path}"
+        return f"{adapter.name}:{source.composer_id}:{source.source}"
+    return f"{adapter.name}:{source}"
+
+
+def _adapter_source_stat(adapter, source):
+    if isinstance(source, CursorSession):
+        if source.source == "hook_ledger" and source.ledger_path:
+            return source.ledger_path.stat()
+        if source.source == "cloud_export" and source.export_path:
+            return source.export_path.stat()
+        if source.db_path and source.db_path.is_file():
+            return source.db_path.stat()
+    path = Path(source) if not isinstance(source, Path) else source
+    return path.stat()
+
+
+def _segments_by_day(segments, pricing, measurement):
+    by_day = {}
+    for seg in segments:
+        day = _local_day(seg.get("start_ts"))
+        models = seg["by_model"]
+        merge_by_model(by_day.setdefault(day, {}), models)
+    out = {}
+    for day, models in by_day.items():
+        cost = cost_usd(models, pricing)
+        if measurement == "activity_only":
+            cost = None
+        out[day] = {"usage": sum_buckets(models), "cost_usd": cost}
+    return out
+
+
+def summarize_adapter_source(adapter, source, pricing, warnings=None):
+    """One adapter session -> the same summary shape corpus scans expect."""
+    warnings = warnings if warnings is not None else []
+    parsed = adapter.parse(source)
+    for w in parsed.get("warnings") or []:
+        if w not in warnings:
+            warnings.append(w)
+    measurement = measurement_for_adapter(adapter, parsed)
+    segments = parsed.get("segments") or []
+    if not segments:
+        raise UnreadableTranscript("no measurable activity")
+    data = aggregate(segments, pricing)
+    data = apply_measurement_costs(data, measurement)
+    st = _adapter_source_stat(adapter, source)
+    path = adapter.describe(source)
+    sid = adapter.session_id(source) if hasattr(adapter, "session_id") else path
+    return {
+        "version": INDEX_VERSION,
+        "path": path,
+        "session_id": sid,
+        "mtime_ns": st.st_mtime_ns,
+        "size": st.st_size,
+        "pricing": pricing_fingerprint(pricing),
+        "runtime": adapter.name,
+        "measurement": measurement,
+        "project": adapter.project(source),
+        "first_ts": next((s["start_ts"] for s in segments if s.get("start_ts")), None),
+        "by_label": {label: {"usage": agg["usage"], "cost_usd": agg["cost_usd"],
+                             "invocations": agg["invocations"],
+                             "unpriced": bool(unpriced_models(agg["by_model"], pricing))}
+                     for label, agg in data["by_label"].items()},
+        "by_model": data["total"]["by_model"],
+        "total": {"usage": data["total"]["usage"],
+                  "cost_usd": data["total"]["cost_usd"]},
+        "by_day": _segments_by_day(segments, pricing, measurement),
+    }
+
+
+def cached_adapter_summary(adapter, source, pricing, warnings=None):
+    import hashlib
+    global _CACHE_WRITE_WARNED
+    key = _adapter_source_cache_key(adapter, source)
+    cache_file = (index_dir() / adapter.name
+                  / (hashlib.sha1(key.encode()).hexdigest() + ".json"))
+    st = _adapter_source_stat(adapter, source)
+    if cache_file.exists():
+        try:
+            c = json.loads(cache_file.read_text(encoding="utf-8", errors="replace"))
+            if (isinstance(c, dict) and c.get("version") == INDEX_VERSION
+                    and c.get("mtime_ns") == st.st_mtime_ns
+                    and c.get("size") == st.st_size
+                    and c.get("pricing") == pricing_fingerprint(pricing)):
+                return c, True
+        except (ValueError, OSError):
+            # Unreadable or malformed cache is a miss: recompute the summary
+            # rather than failing the scan.
+            pass
+    s = summarize_adapter_source(adapter, source, pricing, warnings)
+    try:
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(cache_file, json.dumps(s))
+    except OSError as e:
+        message = f"cannot write summary cache {cache_file.parent}: {e}"
+        if not _CACHE_WRITE_WARNED:
+            _CACHE_WRITE_WARNED = True
+            warn(message)
+        if warnings is not None and message not in warnings:
+            warnings.append(message)
+    return s, False
+
+
+def iter_adapter_summaries(adapter, pricing, cutoff=None, project=None, exclude=None,
+                           progress=False, skipped=None, warnings=None,
+                           project_dir=None):
+    """Yield cached_adapter_summary() for every session the adapter discovers.
+
+    `project` is a substring filter on the project slug — the same rule
+    iter_summaries applies for Claude — and `project_dir` is the discovery
+    hint, a real filesystem path. They were one argument, so `--project
+    my-repo` was handed to the adapter as a path, matched no workspace, and
+    every Cursor corpus query with a project filter came back empty."""
+    parsed = 0
+    saw_any = False
+    for source in adapter.iter_sessions(project_dir=project_dir, warnings=warnings):
+        saw_any = True
+        try:
+            s, hit = cached_adapter_summary(adapter, source, pricing, warnings)
+        except (OSError, ValueError, AttributeError) as e:
+            desc = adapter.describe(source)
+            warn(f"skipping unreadable {adapter.name} session {desc}: {e}")
+            if skipped is not None:
+                skipped.append(desc)
+            continue
+        if progress and not hit:
+            parsed += 1
+            if parsed % 25 == 0:
+                print(f"token-usage: parsed {parsed} sessions…", file=sys.stderr)
+        if exclude and s["path"] == exclude:
+            continue
+        if cutoff and (s["first_ts"] or "") < cutoff:
+            continue
+        if project and project not in s["project"]:
+            continue
+        yield s
+    if not saw_any and adapter.name == "cursor":
+        root = cursor_user_dir()
+        db = root / "globalStorage" / "state.vscdb"
+        if not db.is_file():
+            warn(f"Cursor database not found at {db}", warnings)
+
+
+def _corpus_has_claude_sessions():
+    root = projects_dir()
+    if not root.is_dir() or not os.access(root, os.R_OK | os.X_OK):
+        return False
+    for path in sorted(root.glob("*/*.jsonl")):
+        try:
+            if path.stat().st_size and _has_entries(path):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _corpus_has_cursor_sessions(project_dir=None, warnings=None):
+    """True when the Cursor corpus has anything to read (an `auto` probe)."""
+    import sqlite3
+    adapter = get_runtime_adapter("cursor")
+    try:
+        for _ in adapter.iter_sessions(project_dir=project_dir, warnings=warnings):
+            return True
+    except (OSError, ValueError, sqlite3.Error) as exc:
+        # A probe, not a query: an unreadable Cursor corpus must answer
+        # "nothing to read here" and leave a valid Claude scan working.
+        warn(f"ignoring unreadable Cursor corpus: {exc}", warnings)
+    return False
+
+
+def resolve_runtime(name, transcript_arg=None, project_dir=None, warnings=None):
+    """Pick one adapter for a single-session command (report/json/insights)."""
+    _validate_runtime_name(name)
+    if name == "auto":
+        claude = None
+        cursor = None
+        # A selector the Cursor adapter rejects is an answer ("not a Cursor
+        # session"), not a crash: under auto it only becomes the user's error
+        # when the Claude side found nothing either — and then as the
+        # adapter's own message, never as a traceback.
+        selector_error = []
+
+        def locate_cursor():
+            try:
+                return get_runtime_adapter("cursor").locate(
+                    transcript_arg, project_dir=project_dir)
+            except CursorExplicitSelectorError as exc:
+                selector_error.append(str(exc))
+                return None
+
+        if transcript_arg:
+            p = Path(transcript_arg)
+            if p.suffix.lower() == ".jsonl":
+                claude = locate_transcript(transcript_arg, project_dir=project_dir)
+            elif p.suffix.lower() == ".json" and p.is_file():
+                cursor = locate_cursor()
+            else:
+                claude = locate_transcript(transcript_arg, project_dir=project_dir)
+                cursor = locate_cursor()
+        else:
+            claude = locate_transcript(transcript_arg, project_dir=project_dir)
+            cursor = locate_cursor()
+        if claude and cursor:
+            sys.exit("token-usage: --runtime auto is ambiguous — both Claude and "
+                     "Cursor sessions match; pass --runtime claude or cursor")
+        if cursor:
+            return get_runtime_adapter("cursor"), "cursor"
+        if not claude and selector_error:
+            sys.exit(selector_error[0])
+        return get_runtime_adapter("claude"), "claude"
+    return get_runtime_adapter(name), name
+
+
+def resolve_runtime_corpus(name, project_dir=None, warnings=None):
+    """Pick one adapter for corpus scans (history/top_consumers/window insights)."""
+    _validate_runtime_name(name)
+    if name != "auto":
+        return get_runtime_adapter(name), name
+    has_claude = _corpus_has_claude_sessions()
+    has_cursor = _corpus_has_cursor_sessions(project_dir=project_dir,
+                                             warnings=warnings)
+    if has_claude and has_cursor:
+        sys.exit("token-usage: --runtime auto is ambiguous — both Claude and "
+                 "Cursor corpora have sessions; pass --runtime claude or cursor")
+    if has_cursor:
+        return get_runtime_adapter("cursor"), "cursor"
+    return get_runtime_adapter("claude"), "claude"
+
+
 def budget_from_env(warnings=None):
     """Session budget from TOKEN_USAGE_BUDGET_USD, or None when unset/unparseable.
     Shared by the CLI, the Stop hook and the MCP server so all three read the
@@ -1729,16 +4001,13 @@ def _prior_budget_multiple(ledger):
 
 
 def _write_ledger(ledger, data):
-    LEDGER_DIR.mkdir(parents=True, exist_ok=True)
-    # Per-process temp names: concurrent SubagentStop hooks must never
-    # interleave writes into a shared temp file.
-    tmp = ledger.with_suffix(f".{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(data, indent=1), encoding="utf-8")
-    tmp.replace(ledger)
-    link_tmp = LEDGER_DIR / f".latest.{os.getpid()}.tmp"
+    root = ledger_dir()
+    root.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(ledger, json.dumps(data, indent=1))
+    link_tmp = root / f".latest.{os.getpid()}.tmp"
     try:
         link_tmp.symlink_to(ledger)
-        link_tmp.replace(LEDGER_DIR / "latest.json")
+        link_tmp.replace(root / "latest.json")
     except OSError:
         link_tmp.unlink(missing_ok=True)
 
@@ -1798,7 +4067,7 @@ def _run_hook(payload):
     data = aggregate(parse_session(transcript), load_pricing())
     data["session_id"] = session_id
     data["transcript_path"] = str(transcript)
-    ledger = LEDGER_DIR / f"{session_id}.json"
+    ledger = ledger_dir() / f"{session_id}.json"
 
     prior_multiple = _prior_budget_multiple(ledger)
     limit = budget_from_env()
@@ -1834,6 +4103,104 @@ def _run_hook(payload):
     return 0
 
 
+def _add_runtime_arg(parser):
+    parser.add_argument("--runtime", choices=RUNTIME_CHOICES, default="claude",
+                        help="which agent runtime to read (default: claude)")
+
+
+def run_live(transcript=None, runtime="claude", interval=2.0, iterations=None,
+             show_agents=False, show_models=False, warnings=None, output=None,
+             output_stream=None, flush_fn=None, sleep_fn=None, clock_fn=None,
+             isatty_fn=None, project_dir=None):
+    """Poll session aggregates and render the report table until iterations or Ctrl-C."""
+    if interval <= 0:
+        raise ValueError("interval must be > 0")
+    if iterations is not None and iterations <= 0:
+        raise ValueError("iterations must be positive when supplied")
+
+    if output is None:
+        stream = output_stream if output_stream is not None else sys.stdout
+
+        def output(text):
+            stream.write(text)
+            if flush_fn is not None:
+                flush_fn()
+            else:
+                stream.flush()
+    if sleep_fn is None:
+        sleep_fn = time.sleep
+    if clock_fn is None:
+        def clock_fn():
+            from datetime import datetime, timezone
+            return datetime.now(timezone.utc)
+    if isatty_fn is None:
+        def isatty_fn():
+            return hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
+
+    if warnings is None:
+        warnings = []
+    pricing = load_pricing(warnings)
+    adapter, runtime_name = resolve_runtime(
+        runtime, transcript_arg=transcript, project_dir=project_dir, warnings=warnings)
+
+    done = 0
+    while iterations is None or done < iterations:
+        frame_parts = []
+        if done > 0:
+            if isatty_fn():
+                frame_parts.append(LIVE_CLEAR)
+            else:
+                ts = clock_fn().strftime("%Y-%m-%dT%H:%M:%SZ")
+                frame_parts.append(f"\n--- {ts} ---\n")
+
+        data = _session_aggregate(adapter, runtime_name, transcript, pricing, warnings)
+        frame_parts.append(
+            render_report(data, show_agents=show_agents, show_models=show_models) + "\n"
+        )
+        output("".join(frame_parts))
+        _dedupe_warnings_in_place(warnings)
+
+        done += 1
+        if iterations is not None and done >= iterations:
+            break
+        sleep_fn(interval)
+
+
+def _session_aggregate(adapter, runtime_name, transcript_arg, pricing, warnings):
+    """Parse one session and return (aggregate dict, measurement, path label)."""
+    if adapter.name == "claude":
+        transcript = resolve_transcript(transcript_arg)
+        parsed = {"segments": parse_session(transcript), "measurement": "exact",
+                  "warnings": []}
+        path_label = str(transcript)
+    else:
+        try:
+            source = adapter.locate(transcript_arg)
+        except CursorExplicitSelectorError as e:
+            sys.exit(str(e))
+        if source is None:
+            sys.exit(CURSOR_CLI_SESSION_NOT_FOUND)
+        parsed = adapter.parse(source)
+        path_label = adapter.describe(source)
+    for w in parsed.get("warnings") or []:
+        if w not in warnings:
+            warnings.append(w)
+    measurement = measurement_for_adapter(adapter, parsed)
+    data = aggregate(parsed["segments"], pricing)
+    data = apply_measurement_costs(data, measurement)
+    data["transcript_path"] = path_label
+    # Same rule the MCP session payload follows: a default Claude run predates
+    # runtimes and keeps the shape it always had, which is also what the README
+    # promises ("the CLI's JSON shapes plus transcript, resolved_via and
+    # warnings" — so warnings is the MCP envelope's, not the CLI's). Claude
+    # warnings still reach a CLI reader the way they always did, on stderr.
+    if runtime_name != "claude":
+        data["runtime"] = runtime_name
+        data["measurement"] = measurement
+        data["warnings"] = warnings
+    return data
+
+
 def main():
     ap = argparse.ArgumentParser(prog="token-usage")
     sub = ap.add_subparsers(dest="cmd")
@@ -1844,32 +4211,62 @@ def main():
             p.add_argument("--agents", action="store_true")
             p.add_argument("--models", action="store_true")
         p.add_argument("--diff", nargs=2, metavar=("OLD", "NEW"), default=None)
+        _add_runtime_arg(p)
     sub.add_parser("hook")
+    sub.add_parser("cursor-hook")
     h = sub.add_parser("history")
     h.add_argument("--by", choices=("project", "day", "command", "model"), default="project")
     h.add_argument("--since", default=None)
     h.add_argument("--project", default=None)
     h.add_argument("--json", action="store_true", dest="as_json")
     h.add_argument("--csv", action="store_true", dest="as_csv")
+    _add_runtime_arg(h)
     i = sub.add_parser("insights")
     i.add_argument("transcript", nargs="?", default=None)
     i.add_argument("--since", default=None)
     i.add_argument("--project", default=None)
     i.add_argument("--json", action="store_true", dest="as_json")
+    _add_runtime_arg(i)
     t = sub.add_parser("top_consumers")
     t.add_argument("--by", choices=("session", "command"), default="session")
     t.add_argument("--since", default="30d")
     t.add_argument("--project", default=None)
     t.add_argument("--limit", type=int, default=10)
     t.add_argument("--json", action="store_true", dest="as_json")
+    _add_runtime_arg(t)
+    dash = sub.add_parser("dashboard")
+    dash.add_argument("--since", default="30d")
+    dash.add_argument("--project", default=None)
+    dash.add_argument("--output", default="token-usage-dashboard.html")
+    _add_runtime_arg(dash)
+    live = sub.add_parser("live")
+    live.add_argument("transcript", nargs="?", default=None)
+    live.add_argument("--interval", type=float, default=2.0)
+    live.add_argument("--iterations", type=int, default=None)
+    live.add_argument("--agents", action="store_true")
+    live.add_argument("--models", action="store_true")
+    _add_runtime_arg(live)
+    exp = sub.add_parser("export")
+    exp.add_argument("transcript", nargs="?", default=None)
+    exp.add_argument("--scope", choices=("session", "history"), default="history")
+    # None rather than "project" so that --scope session can tell an explicit
+    # --by from the history default it must not silently accept.
+    exp.add_argument("--by", choices=("project", "day", "command", "model"), default=None)
+    exp.add_argument("--since", default=None)
+    exp.add_argument("--project", default=None)
+    exp.add_argument("--output", default="-")
+    _add_runtime_arg(exp)
     args = ap.parse_args()
 
     if args.cmd == "hook":
         sys.exit(run_hook())
+    if args.cmd == "cursor-hook":
+        sys.exit(run_cursor_hook())
     if args.cmd == "history":
         if args.as_json and args.as_csv:
             sys.exit("token-usage: --json and --csv cannot be combined")
-        data = run_history(by=args.by, since=args.since, project=args.project)
+        data = run_history(by=args.by, since=args.since, project=args.project,
+                           runtime=args.runtime)
         if args.as_json:
             print(json.dumps(data, indent=1))
         elif args.as_csv:
@@ -1886,15 +4283,72 @@ def main():
             sys.exit("token-usage: --project applies to window mode (use --since)")
         budget = budget_from_env()
         result = run_insights(transcript=args.transcript, since=args.since,
-                              project=args.project, budget=budget)
+                              project=args.project, budget=budget,
+                              runtime=args.runtime)
         print(json.dumps(result, indent=1) if args.as_json else render_insights(result))
         return
     if args.cmd == "top_consumers":
         if args.limit < 1:
             sys.exit("token-usage: --limit must be >= 1")
         data = run_top_consumers(by=args.by, since=args.since,
-                                 project=args.project, limit=args.limit)
+                                 project=args.project, limit=args.limit,
+                                 runtime=args.runtime)
         print(json.dumps(data, indent=1) if args.as_json else render_top_consumers(data))
+        return
+    if args.cmd == "dashboard":
+        warnings = []
+        data = dashboard_data(runtime=args.runtime, since=args.since,
+                              project=args.project, project_dir=None,
+                              warnings=warnings)
+        html_text = render_dashboard(data)
+        write_output_or_exit(html_text, args.output)
+        return
+    if args.cmd == "live":
+        if args.interval <= 0:
+            sys.exit("token-usage: --interval must be > 0")
+        if args.iterations is not None and args.iterations <= 0:
+            sys.exit("token-usage: --iterations must be > 0")
+        try:
+            run_live(transcript=args.transcript, runtime=args.runtime,
+                     interval=args.interval, iterations=args.iterations,
+                     show_agents=args.agents, show_models=args.models)
+        except KeyboardInterrupt:
+            pass
+        return
+    if args.cmd == "export":
+        warnings = []
+        if args.scope == "session":
+            # --by/--since/--project only shape a corpus scan. Dropping them
+            # here would report the whole session while looking like the
+            # filter had been applied.
+            ignored = [flag for flag, value in (("--by", args.by),
+                                                ("--since", args.since),
+                                                ("--project", args.project))
+                       if value is not None]
+            if ignored:
+                sys.exit(f"token-usage: {', '.join(ignored)} "
+                         f"appl{'ies' if len(ignored) == 1 else 'y'} to "
+                         "--scope history")
+            pricing = load_pricing(warnings)
+            adapter, runtime_name = resolve_runtime(
+                args.runtime, transcript_arg=args.transcript, warnings=warnings)
+            data = _session_aggregate(adapter, runtime_name, args.transcript,
+                                      pricing, warnings)
+            if "runtime" not in data:
+                data["runtime"] = runtime_name
+            if "measurement" not in data:
+                data["measurement"] = "exact"
+            data["warnings"] = warnings
+            records = session_export_records(data)
+        else:
+            if args.transcript:
+                sys.exit("token-usage: TRANSCRIPT applies only to --scope session")
+            export_data, measurement_counts = history_export_data(
+                by=args.by or "project", since=args.since, project=args.project,
+                runtime=args.runtime, warnings=warnings)
+            records = history_export_records(
+                export_data, measurement_counts=measurement_counts)
+        write_output_or_exit(render_jsonl(records), args.output)
         return
     if getattr(args, "diff", None):
         if getattr(args, "transcript", None):
@@ -1904,9 +4358,12 @@ def main():
         d = diff_data(Path(args.diff[0]), Path(args.diff[1]), load_pricing())
         print(json.dumps(d, indent=1) if args.cmd == "json" else render_diff(d))
         return
-    transcript = resolve_transcript(getattr(args, "transcript", None))
-    data = aggregate(parse_session(transcript), load_pricing())
-    data["transcript_path"] = str(transcript)
+    warnings = []
+    pricing = load_pricing(warnings)
+    adapter, runtime_name = resolve_runtime(
+        args.runtime, transcript_arg=getattr(args, "transcript", None), warnings=warnings)
+    data = _session_aggregate(adapter, runtime_name, getattr(args, "transcript", None),
+                              pricing, warnings)
     if args.cmd == "json":
         print(json.dumps(data, indent=1))
     else:

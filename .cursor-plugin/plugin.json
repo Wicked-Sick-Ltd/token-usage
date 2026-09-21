@@ -1,0 +1,30 @@
+{
+  "name": "token-usage",
+  "version": "0.6.1",
+  "description": "Attribute Claude Code, Cowork, and Cursor token usage to the work that consumed it — per-activity breakdowns, subagent rollups, cross-session history, live session ledger, cache-aware API-price estimates, and a bundled MCP server with optional Cursor hook attribution",
+  "author": {
+    "name": "Craig Fletcher",
+    "email": "craig@wickedsick.com"
+  },
+  "repository": "https://github.com/Wicked-Sick-Ltd/token-usage",
+  "license": "MIT",
+  "keywords": [
+    "tokens",
+    "usage",
+    "cost",
+    "observability",
+    "analytics",
+    "cursor",
+    "claude-code"
+  ],
+  "skills": "skills/report",
+  "hooks": "hooks/hooks-cursor.json",
+  "mcpServers": {
+    "token-usage": {
+      "command": "python3",
+      "args": [
+        "${CURSOR_PLUGIN_ROOT}/scripts/mcp_server.py"
+      ]
+    }
+  }
+}
