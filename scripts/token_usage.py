@@ -3739,6 +3739,9 @@ def codex_parent(meta):
 
 def _codex_flat(usage):
     """Codex input includes cache hits; reasoning is already inside output."""
+    if not all(key in usage for key in ("input_tokens", "output_tokens")):
+        raise ValueError("Codex usage is missing input/output counters")
+
     def count(key):
         value = usage.get(key, 0)
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -3808,6 +3811,10 @@ def parse_codex_session(source):
             if p.get("thread_id") and p["thread_id"] != session_id:
                 continue  # inherited/forwarded records belong to their own rollout
             usage = p.get("usage")
+            if not isinstance(usage, dict):
+                warnings.append("Codex usage record has no usage counters")
+                partial = True
+                continue
             req = p.get("response_id")
             active = turn_segments.get(p.get("turn_id"), active)
         elif not records and kind == "event_msg" and p.get("type") == "token_count":

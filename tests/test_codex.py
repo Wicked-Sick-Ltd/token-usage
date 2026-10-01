@@ -181,3 +181,17 @@ def test_cumulative_reset_is_disclosed(tu, tmp_path, monkeypatch):
     parsed = tu.parse_codex_session(p)
     assert parsed["measurement"] == "partial"
     assert any("decreased" in warning for warning in parsed["warnings"])
+
+
+@pytest.mark.parametrize("counters", [{}, None, {"input_tokens": 0}])
+def test_missing_native_counters_never_become_exact_zero(tu, tmp_path, monkeypatch, counters):
+    path = make_rollout(tmp_path, monkeypatch)
+    rows = [e for e in tu.iter_jsonl(path) if e["type"] != "token_usage_record"]
+    rows.append(event("token_usage_record", {"response_id": "incomplete", "usage": counters}))
+    write_jsonl(path, rows)
+    parsed = tu.parse_codex_session(path)
+    assert parsed["measurement"] == "activity_only"
+    assert any("counters" in warning for warning in parsed["warnings"])
+    rows.append(event("token_usage_record", {"response_id": "valid-zero", "usage": usage(0, 0, 0)}))
+    write_jsonl(path, rows)
+    assert tu.parse_codex_session(path)["measurement"] == "partial"
