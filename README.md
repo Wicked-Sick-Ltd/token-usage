@@ -394,3 +394,10 @@ MIT
 
 MIT licensed; see [LICENSE](LICENSE). Preserve third-party notices.
 <!-- repository-guidance:end -->
+
+## Codex
+
+Native Codex plugin support includes the report skill, local MCP server, Stop hooks, and
+`--runtime codex` across reports, history, insights, comparisons, live views, dashboards
+and exports. Reads local rollouts and rolls linked subagents into their parent once.
+See [setup, accounting and limitations](docs/codex-adapter.md).

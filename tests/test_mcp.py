@@ -127,7 +127,7 @@ def test_tools_list_names_and_schema_shape(mcp):
         assert "format" in s["properties"]
         assert s["properties"]["format"]["enum"] == ["json", "markdown"]
         rt = s["properties"]["runtime"]
-        assert rt["enum"] == ["claude", "cursor", "auto"]
+        assert rt["enum"] == ["claude", "cursor", "codex", "auto"]
     by_name = {t["name"]: t for t in tools}
     assert by_name["diff"]["inputSchema"]["required"] == ["old", "new"]
     assert by_name["history"]["inputSchema"]["properties"]["by"]["enum"] == \

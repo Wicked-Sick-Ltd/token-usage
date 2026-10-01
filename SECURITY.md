@@ -27,6 +27,13 @@ stays on disk in the user's home directory unless they copy reports elsewhere.
 - Accepts explicit Cloud Agent export JSON paths supplied by the user; does not
   call Cursor cloud APIs or store account tokens.
 
+**Codex**
+
+- Reads local rollout JSONL from CODEX_HOME sessions and archived_sessions.
+- Stores separate codex-prefixed ledgers in the existing token-usage cache.
+- Never reads authentication files or sends usage/transcripts over the network.
+- Native hooks require user trust; the local MCP server uses the same boundaries.
+
 **Shared**
 
 - Filesystem path handling (session and conversation IDs are sanitised before

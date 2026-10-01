@@ -190,7 +190,8 @@ def call_tool(name, args):
 
 
 def plugin_manifest_path():
-    return Path(__file__).resolve().parent.parent / ".claude-plugin" / "plugin.json"
+    folder = ".codex-plugin" if os.environ.get("TOKEN_USAGE_RUNTIME") == "codex" else ".claude-plugin"
+    return Path(__file__).resolve().parent.parent / folder / "plugin.json"
 
 
 def plugin_version():
@@ -327,7 +328,7 @@ def check_since(value, key="since"):
 
 
 def runtime_from_args(args):
-    return args.get("runtime") or "claude"
+    return args.get("runtime") or os.environ.get("TOKEN_USAGE_RUNTIME", "claude")
 
 
 def _runtime_exit_as_tool_error(exc):
@@ -376,6 +377,7 @@ def pick_session_auto(path=None, session_id=None, project_dir=None, warnings=Non
         raise ToolError("transcript must not be blank")
     transcript_arg = path.strip() if path else None
     if session_id and not transcript_arg:
+        codex = tu.get_runtime_adapter("codex").locate(session_id=session_id.strip())
         claude_t, _ = tu.locate_transcript_with_source(session_id=session_id.strip(),
                                                        project_dir=project_dir)
         try:
@@ -383,6 +385,10 @@ def pick_session_auto(path=None, session_id=None, project_dir=None, warnings=Non
                 session_id=session_id.strip(), project_dir=project_dir)
         except (OSError, ValueError, AttributeError):
             cursor_s = None
+        if codex and (claude_t or cursor_s):
+            raise ToolError("runtime auto is ambiguous; pass runtime claude, cursor or codex")
+        if codex:
+            return tu.get_runtime_adapter("codex"), "codex", codex, "session_id"
         if claude_t and cursor_s:
             raise ToolError("runtime auto is ambiguous — both Claude and Cursor sessions "
                             "match; pass runtime claude or cursor")
@@ -396,6 +402,8 @@ def pick_session_auto(path=None, session_id=None, project_dir=None, warnings=Non
             "auto", transcript_arg=transcript_arg, project_dir=project_dir, warnings=warnings)
     except SystemExit as e:
         _runtime_exit_as_tool_error(e)
+    if adapter.name == "codex":
+        return pick_session("codex", transcript_arg, session_id, warnings)
     if adapter.name == "claude":
         if transcript_arg:
             t, via = tu.locate_transcript_with_source(transcript_arg, project_dir=project_dir)
@@ -415,6 +423,17 @@ def pick_session(runtime, path=None, session_id=None, warnings=None):
     project_dir = project_dir_from_env()
     if runtime == "auto":
         return pick_session_auto(path, session_id, project_dir=project_dir, warnings=warnings)
+    if runtime == "codex":
+        if path is not None and not path.strip():
+            raise ToolError("transcript must not be blank")
+        if session_id is not None and not session_id.strip():
+            raise ToolError("session_id must not be blank")
+        adapter = tu.get_runtime_adapter("codex")
+        source = adapter.locate(path, session_id=session_id, project_dir=project_dir)
+        if source is None:
+            raise ToolError("no Codex session found; pass a rollout transcript or session_id")
+        via = "explicit" if path else "session_id" if session_id else "project_dir" if project_dir else "any_project"
+        return adapter, "codex", source, via
     if runtime == "cursor":
         source, via = pick_cursor_session(path, session_id, project_dir=project_dir)
         return tu.get_runtime_adapter("cursor"), "cursor", source, via

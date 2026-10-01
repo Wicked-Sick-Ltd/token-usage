@@ -1,0 +1,11 @@
+{
+  "name": "token-usage",
+  "version": "0.7.0",
+  "description": "Local Codex token accounting by turn, explicit skill and model, with history, insights, live reports, exports and a bundled MCP server.",
+  "author": {"name": "Craig Fletcher"},
+  "license": "MIT",
+  "skills": "./codex-skills/",
+  "mcpServers": "./.mcp-codex.json",
+  "hooks": "./hooks/hooks-codex.json",
+  "interface": {"displayName": "Token Usage"}
+}

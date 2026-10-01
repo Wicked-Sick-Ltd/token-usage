@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "Stop": [{"hooks": [{
+      "type": "command",
+      "command": "python3 \"${PLUGIN_ROOT}/scripts/token_usage.py\" codex-hook",
+      "commandWindows": "python \"${PLUGIN_ROOT}/scripts/token_usage.py\" codex-hook",
+      "timeout": 15
+    }]}],
+    "SubagentStop": [{"hooks": [{
+      "type": "command",
+      "command": "python3 \"${PLUGIN_ROOT}/scripts/token_usage.py\" codex-hook",
+      "commandWindows": "python \"${PLUGIN_ROOT}/scripts/token_usage.py\" codex-hook",
+      "timeout": 15
+    }]}]
+  }
+}
