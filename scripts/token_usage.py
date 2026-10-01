@@ -1150,7 +1150,8 @@ def _run_history_core(by="project", since=None, project=None, warnings=None, run
         summary_iter = iter_summaries(pricing, cutoff=cutoff, project=project,
                                       progress=True, skipped=skipped, warnings=warnings)
     else:
-        missing_root = check_cursor_root(warnings)
+        missing_root = (check_codex_root(warnings) if adapter.name == "codex"
+                        else check_cursor_root(warnings))
         summary_iter = iter_adapter_summaries(adapter, pricing, cutoff=cutoff,
                                               project=project, progress=True,
                                               skipped=skipped, warnings=warnings,
@@ -1279,7 +1280,8 @@ def scan_footnotes(data, unpriced=True):
         notes.append(f"{len(skipped)} {kind}(s) skipped (unreadable): {', '.join(skipped)}")
     if root:
         where = ("readable Cursor session data (Desktop SQLite or hook ledger) at"
-                 if cursor else "readable Claude Code projects directory at")
+                 if cursor else "readable Codex sessions at" if data.get("runtime") == "codex"
+                 else "readable Claude Code projects directory at")
         notes.append(f"No {where} {root} — nothing was scanned.")
     measured = (measurement_scan_note(data.get("measurements") or {})
                 or measurement_note(data.get("measurement")))
@@ -1936,7 +1938,7 @@ def run_top_consumers(by="session", since="30d", project=None, limit=10, warning
         summary_iter = iter_summaries(pricing, cutoff=cutoff, project=project,
                                       skipped=skipped, warnings=warnings)
     else:
-        missing_root = check_cursor_root(warnings)
+        missing_root = check_codex_root(warnings) if adapter.name == "codex" else check_cursor_root(warnings)
         summary_iter = iter_adapter_summaries(adapter, pricing, cutoff=cutoff,
                                               project=project, skipped=skipped,
                                               warnings=warnings,
@@ -2087,7 +2089,7 @@ def compute_baseline(pricing, project, days=30, exclude=None, warnings=None,
         summary_iter = iter_summaries(pricing, cutoff=cutoff, exclude=exclude,
                                         skipped=skipped, warnings=warnings)
     else:
-        missing_root = check_cursor_root(warnings)
+        missing_root = check_codex_root(warnings) if adapter.name == "codex" else check_cursor_root(warnings)
         summary_iter = iter_adapter_summaries(adapter, pricing, cutoff=cutoff,
                                               exclude=exclude, skipped=skipped,
                                               warnings=warnings,
@@ -2289,7 +2291,7 @@ def run_insights(transcript=None, since=None, project=None, budget=None, warning
             summaries = list(iter_summaries(pricing, cutoff=cutoff, project=project,
                                             skipped=skipped, warnings=warnings))
         else:
-            missing_root = check_cursor_root(warnings)
+            missing_root = check_codex_root(warnings) if adapter.name == "codex" else check_cursor_root(warnings)
             summaries = list(iter_adapter_summaries(adapter, pricing, cutoff=cutoff,
                                                     project=project, skipped=skipped,
                                                     warnings=warnings,
@@ -2350,7 +2352,8 @@ def run_insights(transcript=None, since=None, project=None, budget=None, warning
         except CursorExplicitSelectorError as e:
             sys.exit(str(e))
         if source is None:
-            sys.exit(CURSOR_CLI_SESSION_NOT_FOUND)
+            sys.exit("token-usage: no Codex session found; pass a rollout .jsonl path"
+                     if adapter.name == "codex" else CURSOR_CLI_SESSION_NOT_FOUND)
         parsed = adapter.parse(source)
         exclude = adapter.describe(source)
         project_name = adapter.project(source)
@@ -3610,9 +3613,273 @@ class CursorAdapter(RuntimeAdapter):
         return str(source)
 
 
+def codex_home():
+    return Path(os.environ.get("TOKEN_USAGE_CODEX_HOME") or os.environ.get("CODEX_HOME")
+                or Path.home() / ".codex").expanduser()
+
+
+def codex_metadata(path):
+    for entry in iter_jsonl(path):
+        if entry.get("type") == "session_meta":
+            payload = entry.get("payload")
+            return payload if isinstance(payload, dict) else {}
+    return {}
+
+
+def is_codex_transcript(path):
+    try:
+        return bool(codex_metadata(path))
+    except (OSError, ValueError):
+        return False
+
+
+class CodexAdapter(RuntimeAdapter):
+    """Read local rollout JSONL; never read auth, SQLite, or remote APIs."""
+
+    name = "codex"
+
+    def all_sessions(self, project_dir=None, warnings=None):
+        target = Path(project_dir).expanduser().resolve() if project_dir else None
+        seen = set()
+        for folder in ("sessions", "archived_sessions"):
+            for path in sorted((codex_home() / folder).rglob("*.jsonl"), reverse=True):
+                try:
+                    meta = codex_metadata(path)
+                except (OSError, ValueError) as exc:
+                    warn(f"skipping unreadable Codex rollout {path}: {exc}", warnings)
+                    continue
+                sid = meta.get("id") or meta.get("session_id")
+                if not sid or sid in seen:
+                    continue
+                if target is not None and (
+                        not meta.get("cwd") or Path(meta["cwd"]).resolve() != target):
+                    continue
+                seen.add(sid)
+                yield path
+
+    def iter_sessions(self, project_dir=None, warnings=None):
+        # Parent reports own their children. Orphans remain independently visible.
+        sources = list(self.all_sessions(project_dir, warnings))
+        ids = {self.session_id(p) for p in sources}
+        for path in sources:
+            if codex_parent(codex_metadata(path)) not in ids:
+                yield path
+
+    def locate(self, arg=None, session_id=None, project_dir=None):
+        explicit = arg or (os.environ.get("TOKEN_USAGE_TRANSCRIPT") if not session_id else None)
+        if explicit:
+            path = Path(explicit).expanduser()
+            return path if path.is_file() and is_codex_transcript(path) else None
+        wanted = session_id or os.environ.get("CODEX_THREAD_ID")
+        if wanted:
+            return next((p for p in self.all_sessions()
+                         if self.session_id(p) == wanted), None)
+        candidates = list(self.iter_sessions(project_dir=project_dir or Path.cwd()))
+        if not candidates and project_dir is None:
+            candidates = list(self.iter_sessions())
+        return max(candidates, key=lambda p: p.stat().st_mtime_ns) if candidates else None
+
+    def session_id(self, source):
+        meta = codex_metadata(source)
+        return meta.get("id") or meta.get("session_id") or Path(source).stem
+
+    def project(self, source):
+        return project_slug(codex_metadata(source).get("cwd") or "codex:unknown")
+
+    def describe(self, source):
+        return str(source)
+
+    def parse(self, source):
+        parsed = parse_codex_session(source)
+        visited = {self.session_id(source)}
+        sources = list(self.all_sessions())
+        parents = {self.session_id(p): codex_parent(codex_metadata(p)) for p in sources}
+        changed = True
+        while changed:
+            changed = False
+            for path in sources:
+                sid = self.session_id(path)
+                if sid in visited or parents[sid] not in visited:
+                    continue
+                visited.add(sid)
+                changed = True
+                child = parse_codex_session(path)
+                child_segments = child["segments"]
+                if not child_segments:
+                    continue
+                ts = child_segments[0].get("start_ts")
+                candidates = [s for s in parsed["segments"] if not ts or not s["start_ts"] or s["start_ts"] <= ts]
+                if not candidates:
+                    parsed["segments"].append({"label": OTHER_LABEL, "start_ts": ts,
+                                               "prompt": "", "by_model": {}, "subagents": []})
+                    candidates = parsed["segments"]
+                owner = candidates[-1]
+                by_model = {}
+                for seg in child_segments:
+                    merge_by_model(by_model, seg["by_model"])
+                merge_by_model(owner["by_model"], by_model)
+                owner["subagents"].append({"type": "codex", "description": sid,
+                                           "by_model": by_model,
+                                           "output_tokens": sum_buckets(by_model)["output"]})
+                parsed["measurement"] = worst_measurement(parsed["measurement"], child["measurement"])
+                parsed["warnings"].extend(w for w in child["warnings"] if w not in parsed["warnings"])
+        return parsed
+
+
+def codex_parent(meta):
+    source = meta.get("source")
+    if isinstance(source, dict):
+        subagent = source.get("subagent")
+        if isinstance(subagent, dict):
+            spawn = subagent.get("thread_spawn")
+            if isinstance(spawn, dict):
+                return spawn.get("parent_thread_id")
+    return meta.get("parent_thread_id")
+
+
+def _codex_flat(usage):
+    """Codex input includes cache hits; reasoning is already inside output."""
+    def count(key):
+        value = usage.get(key, 0)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"invalid Codex counter {key}")
+        return value
+
+    cached = count("cached_input_tokens")
+    written = count("cache_write_input_tokens")
+    if cached + written > count("input_tokens"):
+        raise ValueError("Codex cache counters exceed total input")
+    return {"input": count("input_tokens") - cached - written,
+            "output": count("output_tokens"), "cache_read": cached,
+            "cache_5m": written, "cache_1h": 0}
+
+
+def parse_codex_session(source):
+    # New rollouts contain both per-response records and cumulative token_count
+    # notifications. Choose one stream for the entire file to avoid double billing.
+    records = any(e.get("type") == "token_usage_record" for e in iter_jsonl(source))
+    metadata = codex_metadata(source)
+    session_id = metadata.get("id") or metadata.get("session_id")
+    segments, warnings, pending = [], [], {}
+    model, current_turn, previous = "unknown", None, None
+    turn_segments = {}
+    seen_usage = False
+    partial = False
+
+    def segment(ts, label=OTHER_LABEL, prompt=""):
+        s = {"label": label, "start_ts": ts, "prompt": prompt[:120],
+             "by_model": {}, "subagents": []}
+        segments.append(s)
+        return s
+
+    active = None
+    for e in iter_jsonl(source):
+        p = e.get("payload")
+        if not isinstance(p, dict):
+            continue
+        ts = e.get("timestamp")
+        kind = e.get("type")
+        if kind == "turn_context":
+            model = p.get("model") or model
+            current_turn = p.get("turn_id") or current_turn
+            if current_turn and current_turn not in turn_segments:
+                active = segment(ts)
+                turn_segments[current_turn] = active
+        elif kind == "event_msg" and p.get("type") == "task_started":
+            current_turn = p.get("turn_id") or current_turn
+            active = segment(ts)
+            if current_turn:
+                turn_segments[current_turn] = active
+        elif kind == "response_item" and p.get("type") == "message" and p.get("role") == "user":
+            # User content is used only for explicit skill/command attribution.
+            # Never attribute a shell read of SKILL.md as a skill invocation.
+            content = p.get("content") or []
+            prompt = "\n".join(c.get("text", "") for c in content if isinstance(c, dict))
+            match = re.match(r"\s*([$\/][A-Za-z0-9][A-Za-z0-9_:-]*)\b", prompt)
+            if active is None:
+                active = segment(ts)
+            if match:
+                active["label"] = match.group(1)
+            if not active["prompt"]:
+                active["prompt"] = prompt.strip()[:120]
+        usage = None
+        req = None
+        if records and kind == "token_usage_record":
+            if p.get("thread_id") and p["thread_id"] != session_id:
+                continue  # inherited/forwarded records belong to their own rollout
+            usage = p.get("usage")
+            req = p.get("response_id")
+            active = turn_segments.get(p.get("turn_id"), active)
+        elif not records and kind == "event_msg" and p.get("type") == "token_count":
+            info = p.get("info")
+            if not isinstance(info, dict):
+                continue  # rate-limit-only notification
+            total = info.get("total_token_usage")
+            if not isinstance(total, dict):
+                continue
+            try:
+                flat = _codex_flat(total)
+            except ValueError as exc:
+                warnings.append(str(exc))
+                partial = True
+                continue
+            # Cumulative notifications are duplicated on idle/rate-limit events.
+            # A reset cannot be safely interpreted as fresh usage.
+            if previous is not None:
+                if any(flat[k] < previous[k] for k in flat):
+                    partial = True
+                    warnings.append("Codex cumulative counters decreased; reset interval omitted")
+                    previous = flat
+                    continue
+                delta = {k: flat[k] - previous[k] for k in flat}
+            else:
+                delta = flat
+            previous = flat
+            if not any(delta.values()):
+                continue
+            seen_usage = True
+            if active is None:
+                active = segment(ts)
+            add_flat(active["by_model"].setdefault(model, empty_usage()), delta)
+        if not isinstance(usage, dict):
+            continue
+        try:
+            flat = _codex_flat(usage)
+        except ValueError as exc:
+            warnings.append(str(exc))
+            partial = True
+            continue
+        seen_usage = True
+        if active is None:
+            active = segment(ts)
+        if req:
+            if req in pending:
+                max_flat(pending[req][2], flat)
+            else:
+                pending[req] = (active, model, flat)
+        else:
+            partial = True
+            warnings.append("Codex usage record has no response_id; cannot deduplicate it")
+            add_flat(active["by_model"].setdefault(model, empty_usage()), flat)
+    for s, m, flat in pending.values():
+        add_flat(s["by_model"].setdefault(m, empty_usage()), flat)
+    warnings.append("Codex attribution follows turns and explicit skill names. Costs are standard API-equivalent estimates, not subscription charges or tier-adjusted billing.")
+    return {"segments": segments,
+            "measurement": ("partial" if partial else "exact") if seen_usage else "activity_only",
+            "warnings": list(dict.fromkeys(warnings))}
+
+
+def check_codex_root(warnings=None):
+    if any((codex_home() / name).is_dir() for name in ("sessions", "archived_sessions")):
+        return None
+    warn(f"no readable Codex sessions under {codex_home()}", warnings)
+    return str(codex_home())
+
+
 _RUNTIME_ADAPTERS = {
     "claude": ClaudeAdapter(),
     "cursor": CursorAdapter(),
+    "codex": CodexAdapter(),
 }
 
 
@@ -3624,9 +3891,9 @@ def get_runtime_adapter(name):
         raise ValueError(f"unknown runtime {name!r}") from None
 
 
-RUNTIME_CHOICES = ("claude", "cursor", "auto")
+RUNTIME_CHOICES = ("claude", "cursor", "codex", "auto")
 
-_DEFAULT_MEASUREMENT = {"claude": "exact", "cursor": "activity_only"}
+_DEFAULT_MEASUREMENT = {"claude": "exact", "cursor": "activity_only", "codex": "activity_only"}
 
 
 def measurement_for_adapter(adapter, parsed):
@@ -3759,7 +4026,9 @@ def cached_adapter_summary(adapter, source, pricing, warnings=None):
     cache_file = (index_dir() / adapter.name
                   / (hashlib.sha1(key.encode()).hexdigest() + ".json"))
     st = _adapter_source_stat(adapter, source)
-    if cache_file.exists():
+    # Codex parent reports include independently growing child rollouts. A
+    # parent-only stat cannot validate that cache; recompute the family.
+    if cache_file.exists() and adapter.name != "codex":
         try:
             c = json.loads(cache_file.read_text(encoding="utf-8", errors="replace"))
             if (isinstance(c, dict) and c.get("version") == INDEX_VERSION
@@ -3856,6 +4125,8 @@ def resolve_runtime(name, transcript_arg=None, project_dir=None, warnings=None):
     """Pick one adapter for a single-session command (report/json/insights)."""
     _validate_runtime_name(name)
     if name == "auto":
+        if transcript_arg and is_codex_transcript(Path(transcript_arg)):
+            return get_runtime_adapter("codex"), "codex"
         claude = None
         cursor = None
         # A selector the Cursor adapter rejects is an answer ("not a Cursor
@@ -3884,6 +4155,12 @@ def resolve_runtime(name, transcript_arg=None, project_dir=None, warnings=None):
         else:
             claude = locate_transcript(transcript_arg, project_dir=project_dir)
             cursor = locate_cursor()
+        codex = (get_runtime_adapter("codex").locate(project_dir=project_dir)
+                 if not transcript_arg else None)
+        if codex and (claude or cursor):
+            sys.exit("token-usage: --runtime auto is ambiguous; pass --runtime claude, cursor or codex")
+        if codex:
+            return get_runtime_adapter("codex"), "codex"
         if claude and cursor:
             sys.exit("token-usage: --runtime auto is ambiguous — both Claude and "
                      "Cursor sessions match; pass --runtime claude or cursor")
@@ -3903,6 +4180,11 @@ def resolve_runtime_corpus(name, project_dir=None, warnings=None):
     has_claude = _corpus_has_claude_sessions()
     has_cursor = _corpus_has_cursor_sessions(project_dir=project_dir,
                                              warnings=warnings)
+    has_codex = next(get_runtime_adapter("codex").iter_sessions(project_dir), None) is not None
+    if has_codex and (has_claude or has_cursor):
+        sys.exit("token-usage: --runtime auto is ambiguous; pass --runtime claude, cursor or codex")
+    if has_codex:
+        return get_runtime_adapter("codex"), "codex"
     if has_claude and has_cursor:
         sys.exit("token-usage: --runtime auto is ambiguous — both Claude and "
                  "Cursor corpora have sessions; pass --runtime claude or cursor")
@@ -4012,13 +4294,13 @@ def _write_ledger(ledger, data):
         link_tmp.unlink(missing_ok=True)
 
 
-def run_hook():
+def run_hook(runtime="claude"):
     """Stop/SubagentStop entry point: exit 0 for ANY stdin bytes, and write
     nothing to stdout but the hook protocol's own JSON. A non-zero exit or a
     traceback here breaks the user's session, so no exception class may
     escape — not even from the diagnostics."""
     try:
-        rc = _run_hook(_hook_payload())
+        rc = _run_hook(_hook_payload(), runtime=runtime)
         _flush_stdout()
         return rc
     except Exception as e:  # noqa: BLE001 — a hook must never break the session
@@ -4046,7 +4328,7 @@ def _flush_stdout():
             pass
 
 
-def _run_hook(payload):
+def _run_hook(payload, runtime="claude"):
     if payload is None:
         return 0
     transcript = payload.get("transcript_path")
@@ -4055,7 +4337,7 @@ def _run_hook(payload):
     if not isinstance(transcript, str) or not transcript or not Path(transcript).exists():
         return 0
     transcript = Path(transcript)
-    if "subagents" in transcript.parts and transcript.name != f"{session_id}.jsonl":
+    if runtime == "claude" and "subagents" in transcript.parts and transcript.name != f"{session_id}.jsonl":
         # SubagentStop delivers the subagent's own sidechain transcript; find
         # the owning session transcript and re-aggregate the whole session.
         main = next((p / f"{session_id}.jsonl" for p in transcript.parents
@@ -4064,10 +4346,15 @@ def _run_hook(payload):
             return 0  # never ledger sidechain-only data under the session id
         transcript = main
     is_subagent_stop = payload.get("hook_event_name") == "SubagentStop"
-    data = aggregate(parse_session(transcript), load_pricing())
+    if runtime == "codex":
+        parsed = get_runtime_adapter("codex").parse(transcript)
+        data = apply_measurement_costs(aggregate(parsed["segments"], load_pricing()), parsed["measurement"])
+        data.update(runtime="codex", measurement=parsed["measurement"], warnings=parsed["warnings"])
+    else:
+        data = aggregate(parse_session(transcript), load_pricing())
     data["session_id"] = session_id
     data["transcript_path"] = str(transcript)
-    ledger = ledger_dir() / f"{session_id}.json"
+    ledger = ledger_dir() / (f"codex-{session_id}.json" if runtime == "codex" else f"{session_id}.json")
 
     prior_multiple = _prior_budget_multiple(ledger)
     limit = budget_from_env()
@@ -4104,7 +4391,8 @@ def _run_hook(payload):
 
 
 def _add_runtime_arg(parser):
-    parser.add_argument("--runtime", choices=RUNTIME_CHOICES, default="claude",
+    parser.add_argument("--runtime", choices=RUNTIME_CHOICES,
+                        default=os.environ.get("TOKEN_USAGE_RUNTIME", "claude"),
                         help="which agent runtime to read (default: claude)")
 
 
@@ -4179,7 +4467,8 @@ def _session_aggregate(adapter, runtime_name, transcript_arg, pricing, warnings)
         except CursorExplicitSelectorError as e:
             sys.exit(str(e))
         if source is None:
-            sys.exit(CURSOR_CLI_SESSION_NOT_FOUND)
+            sys.exit("token-usage: no Codex session found; pass a rollout .jsonl path"
+                     if adapter.name == "codex" else CURSOR_CLI_SESSION_NOT_FOUND)
         parsed = adapter.parse(source)
         path_label = adapter.describe(source)
     for w in parsed.get("warnings") or []:
@@ -4214,6 +4503,7 @@ def main():
         _add_runtime_arg(p)
     sub.add_parser("hook")
     sub.add_parser("cursor-hook")
+    sub.add_parser("codex-hook")
     h = sub.add_parser("history")
     h.add_argument("--by", choices=("project", "day", "command", "model"), default="project")
     h.add_argument("--since", default=None)
@@ -4260,6 +4550,8 @@ def main():
 
     if args.cmd == "hook":
         sys.exit(run_hook())
+    if args.cmd == "codex-hook":
+        sys.exit(run_hook(runtime="codex"))
     if args.cmd == "cursor-hook":
         sys.exit(run_cursor_hook())
     if args.cmd == "history":
@@ -4355,7 +4647,12 @@ def main():
             sys.exit("token-usage: --diff ignores TRANSCRIPT — pass exactly two paths to --diff")
         if getattr(args, "agents", False) or getattr(args, "models", False):
             sys.exit("token-usage: --diff cannot be combined with --agents or --models")
-        d = diff_data(Path(args.diff[0]), Path(args.diff[1]), load_pricing())
+        if args.runtime != "claude":
+            import mcp_server
+            d = json.loads(mcp_server.tool_diff({"old": args.diff[0], "new": args.diff[1],
+                                               "runtime": args.runtime, "format": "json"}))
+        else:
+            d = diff_data(Path(args.diff[0]), Path(args.diff[1]), load_pricing())
         print(json.dumps(d, indent=1) if args.cmd == "json" else render_diff(d))
         return
     warnings = []

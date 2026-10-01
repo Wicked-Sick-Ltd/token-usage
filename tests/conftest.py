@@ -53,6 +53,13 @@ def _isolated_cursor_dir(monkeypatch, tmp_path_factory):
 
 
 @pytest.fixture(autouse=True)
+def _isolated_codex_home(monkeypatch, tmp_path):
+    monkeypatch.setenv("TOKEN_USAGE_CODEX_HOME", str(tmp_path / "codex"))
+    monkeypatch.delenv("CODEX_THREAD_ID", raising=False)
+    monkeypatch.delenv("TOKEN_USAGE_RUNTIME", raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _no_cowork_mounts(monkeypatch):
     # Transcript discovery falls through to the Cowork sandbox mounts, which on
     # a real Cowork host hold a live transcript this suite must never see.

@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "token-usage": {
+      "command": "python",
+      "args": ["${PLUGIN_ROOT}/scripts/mcp_server.py"],
+      "env": {"TOKEN_USAGE_RUNTIME": "codex", "PYTHONUTF8": "1"}
+    }
+  }
+}

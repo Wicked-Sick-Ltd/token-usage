@@ -8,6 +8,8 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Codex runtime**: native plugin, report skill, MCP default, fail-open hooks, rollout discovery, response/cumulative deduplication, linked subagent rollups and all report formats. Standard API price estimates for current GPT models; see `docs/codex-adapter.md` for confidence and billing limits.
+
 - **Cursor runtime support** — token-usage is no longer Claude-only. A
   `RuntimeAdapter` seam (`ClaudeAdapter`, `CursorAdapter`) discovers, parses and
   describes sessions per runtime; Claude Code remains the default and its
