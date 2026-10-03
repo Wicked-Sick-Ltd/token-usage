@@ -1,7 +1,7 @@
 # Cursor adapter — evidence and contract
 
 This note records what is **official**, what was **reverse-engineered**, what we
-**observed** in exports, and how a future **Gemini/Codex** adapter should plug
+**observed** in exports, and how a future adapter (for example **Gemini**) should plug
 in. It supports the public MIT `token-usage` Cursor Plugin
 (`.cursor-plugin/plugin.json`) and the `CursorAdapter` in `scripts/token_usage.py`.
 
@@ -130,7 +130,9 @@ CLI and MCP accept `--runtime` / `runtime`: `claude` (default), `cursor`, or
 - SQLite and exports are read locally; hook ledger stores truncated prompts only.
 - See [SECURITY.md](../SECURITY.md) for hook commands and ledger paths.
 
-## Future adapter contract (Gemini, Codex, others)
+## Future adapter contract (Gemini, others)
+
+The Codex adapter shipped in 0.7.0 on this contract; see [codex-adapter.md](codex-adapter.md).
 
 Any new runtime adapter added to `get_runtime_adapter()` should document, before
 claiming parity with Claude or Cursor:
@@ -179,7 +181,8 @@ exporter can map this stable schema without breaking JSONL consumers.
 | User-configurable insight thresholds | **Deferred (YAGNI)** — fixed rules stay predictable |
 | Fleet / multi-machine aggregation | **Out of scope** |
 | LLM-generated insights | **Out of scope** — `insights` stays rule-based arithmetic |
-| Gemini, Codex, other runtimes | **Future adapters** — implement `RuntimeAdapter` per the contract above; dashboard/export need no runtime-specific code once summaries are canonical |
+| Codex | **Shipped in 0.7.0** — `CodexAdapter`; see [codex-adapter.md](codex-adapter.md) |
+| Gemini, other runtimes | **Future adapters** — implement `RuntimeAdapter` per the contract above; dashboard/export need no runtime-specific code once summaries are canonical |
 
 ### Statusline vs live (Cursor)
 

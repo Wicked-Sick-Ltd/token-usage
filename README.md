@@ -1,8 +1,8 @@
 # token-usage
 
-**Where did my tokens go?** A public MIT plugin for **Claude Code** and **Cursor** that attributes token usage to the work that consumed it — per-activity breakdowns (slash commands in Claude Code, composer generations in Cursor), subagent rollups, cross-session history, optional live ledgers, and cache-aware API-price estimates.
+**Where did my tokens go?** A public MIT plugin for **Claude Code**, **Codex** and **Cursor** that attributes token usage to the work that consumed it — per-activity breakdowns (slash commands and skills in Claude Code and Cowork, turns and skills in Codex, composer generations in Cursor), subagent rollups, cross-session history, optional live ledgers, and cache-aware API-price estimates.
 
-📖 **Documentation:** [discovery.wickedsick.com/token-usage-claude-code-plugin-documentation](https://discovery.wickedsick.com/token-usage-claude-code-plugin-documentation) — overview, use cases, and how it works, kept in step with each release.
+📖 **Documentation:** this README and the [`docs/`](docs/README.md) folder are the documentation — [use cases](docs/use-cases.md), [architecture and configuration](docs/architecture.md), and the [Codex](docs/codex-adapter.md) and [Cursor](docs/cursor-adapter.md) runtime notes.
 
 Claude Code tells you session totals (`/cost`, OTel metrics) and tools like ccusage aggregate by day/model — but nothing answers *"the PR review cost 120k tokens, the refactor cost 800k"*. token-usage fills that gap.
 
@@ -57,9 +57,13 @@ Requires `python3` (3.9+, stdlib only — no dependencies).
 # Test locally
 claude --plugin-dir /path/to/token-usage
 
-# Or install from a marketplace once published
-/plugin install token-usage
+# Or install from the Wicked Sick marketplace
+claude plugin marketplace add Wicked-Sick-Ltd/ai-marketplace
+claude plugin install token-usage@wickedsick
 ```
+
+Once the plugin is listed in Anthropic's plugin directory it will also install with
+`/plugin install token-usage`.
 
 The Claude manifest is `.claude-plugin/plugin.json` (MCP server, Stop hook, report skill).
 
@@ -107,6 +111,19 @@ hook ledgers without the full plugin bundle.
 This repository intentionally has **no** root `mcp.json`: Claude Code also reads that
 file as *project-scope* MCP inside a checkout, which would register a broken server for
 contributors.
+
+### Codex
+
+```bash
+codex plugin marketplace add Wicked-Sick-Ltd/ai-marketplace --sparse .agents/plugins
+codex plugin add token-usage@wickedsick
+```
+
+The Codex manifest `.codex-plugin/plugin.json` bundles the report skill
+(`codex-skills/report/`), the stdio MCP server (`.mcp-codex.json`, which sets
+`TOKEN_USAGE_RUNTIME=codex`) and fail-open `Stop`/`SubagentStop` hooks
+(`hooks/hooks-codex.json`). Review the hooks through `/hooks` after installing;
+installation never grants hook trust. See [docs/codex-adapter.md](docs/codex-adapter.md).
 
 ## Usage
 
@@ -183,20 +200,21 @@ python3 scripts/token_usage.py insights --runtime cursor
 
 # Self-contained HTML dashboard from indexed history (inline CSS/SVG only — no CDN)
 python3 scripts/token_usage.py dashboard [--since 30d] [--project SUBSTRING] \
-  [--output token-usage-dashboard.html] [--runtime claude|cursor|auto]
+  [--output token-usage-dashboard.html] [--runtime claude|cursor|codex|auto]
 
 # Terminal live view — repolls the current or explicit session (Ctrl-C exits 0)
 python3 scripts/token_usage.py live [TRANSCRIPT] [--interval 2] [--iterations N] \
-  [--agents] [--models] [--runtime claude|cursor|auto]
+  [--agents] [--models] [--runtime claude|cursor|codex|auto]
 
 # Structured JSONL aggregates for external spend tooling (not OTLP wire format)
 python3 scripts/token_usage.py export [--scope session|history] [--by project|day|command|model] \
-  [--since 30d] [--project SUBSTRING] [--output usage.jsonl] [--runtime claude|cursor|auto]
+  [--since 30d] [--project SUBSTRING] [--output usage.jsonl] [--runtime claude|cursor|codex|auto]
 python3 scripts/token_usage.py export [TRANSCRIPT] --scope session --output -
 ```
 
-`--runtime` accepts `claude` (default), `cursor`, or `auto`. `auto` picks one runtime
-when unambiguous and never mixes Claude transcripts with Cursor composers in one call.
+`--runtime` accepts `claude` (the default, or whatever `TOKEN_USAGE_RUNTIME` names), `cursor`,
+`codex`, or `auto`. `auto` picks one runtime when unambiguous and never mixes runtimes in one
+call. Codex examples: `report --runtime codex [rollout.jsonl]`, `history --runtime codex --since 7d`.
 
 With no argument, `report` and `json` pick the most recent session for the current directory's project; failing that, the Cowork sandbox mount; failing that too, the newest transcript under **any** project on the machine. That last step means running these outside a directory with its own Claude Code history can pick up a different project's most recent session rather than reporting "not found" — pass an explicit transcript path when it matters which session gets analysed.
 
@@ -261,6 +279,9 @@ no install). When the plugin is enabled, Claude Code starts it and the tools app
 | `diff` | Per-activity cost and output deltas between two sessions (paths or session ids). |
 | `top_consumers` | Costliest sessions or command labels in a window (`by`, `since`, `project`, `limit`). |
 
+Every tool also takes `runtime` (`claude`, `cursor`, `codex` or `auto`; default `claude`, or
+the server's `TOKEN_USAGE_RUNTIME`, which the Codex plugin sets to `codex`).
+
 Every tool takes `format`: `json` (default — the CLI's JSON shapes plus `transcript`,
 `resolved_via` and `warnings`) or `markdown` (the rendered table, with the same warnings
 as `Warning:` footnotes). Failures come back as tool results with `isError`, never as
@@ -312,6 +333,24 @@ That route starts the server without `TOKEN_USAGE_PROJECT_DIR`, but Claude Code 
 The server reads `~/.claude/projects` on the host, so a desktop session sees the same
 history the CLI does. No caching in-process: pricing overlay edits apply on the next call
 (and a malformed overlay comes back in the result's `warnings`).
+
+## Configuration
+
+token-usage has no config file. Optional environment variables (all read from
+`scripts/token_usage.py` or `scripts/mcp_server.py`):
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `TOKEN_USAGE_BUDGET_USD` | unset (no nudges) | Session budget in USD for the Stop-hook nudge and the `insights` budget-pace rule. Must be a number greater than 0. |
+| `TOKEN_USAGE_LEDGER_DIR` | `~/.cache/token-usage` | Where ledgers, `latest.json`, the `index/` cache and Cursor hook ledgers are written. |
+| `TOKEN_USAGE_PROJECTS_DIR` | `~/.claude/projects` | Claude Code transcript root. |
+| `TOKEN_USAGE_TRANSCRIPT` | unset | Transcript to use when no path or session id is given. |
+| `TOKEN_USAGE_RUNTIME` | `claude` | Default `--runtime` for the CLI and the MCP server. |
+| `TOKEN_USAGE_PROJECT_DIR` | unset | MCP only: project to anchor "current session" on (the Claude manifest sets it from `${CLAUDE_PROJECT_DIR}`); falls back to `CLAUDE_PROJECT_DIR`. |
+| `TOKEN_USAGE_CURSOR_DIR` | Cursor's user directory for the OS | Cursor Desktop data root. |
+| `TOKEN_USAGE_CODEX_HOME` | `$CODEX_HOME`, else `~/.codex` | Codex home holding `sessions/` and `archived_sessions/`. |
+| `CODEX_THREAD_ID` | set by Codex | Current Codex thread, used for current-session discovery. |
+| `XDG_CONFIG_HOME` | `~/.config` | Parent of the user pricing overlay `token-usage/pricing.json`. |
 
 ## Insights
 
@@ -378,6 +417,9 @@ Details: [docs/cursor-adapter.md](docs/cursor-adapter.md).
 - `--since` filters sessions by their first timestamp; sessions whose transcripts carry no timestamps are skipped.
 - Day buckets in `history --by day` use local time. As of 0.5.0, a session is split across every local day it touched (not just its start day), so daily figures for the same underlying data shift vs 0.4.0 — same class of change as the 0.2.0 sticky-attribution rework.
 - Brand-new models render `—` and are named in a footnote until you add rates to the user overlay.
+- Attribution granularity is the command or skill segment: a command owns every turn until the next one, and there is no finer per-message split within a segment.
+- The pricing table holds one rate per model, so time-limited introductory or promotional prices are not modelled; edit the overlay when a rate changes.
+- In Cowork the hooks don't run, so there is no live ledger, statusline or budget nudge there; reports parse the sandbox-mounted transcript on demand instead.
 
 ## License
 
