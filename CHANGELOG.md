@@ -6,8 +6,29 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-10-03
+
+Release for resubmission to Anthropic's plugin directory. It ships the Codex and
+Cursor runtimes and the dashboard, live and export commands that were unreleased
+since 0.6.1, and makes every manifest agree on one version.
+
 ### Added
 
+- **Directory readiness checks** — `tests/test_directory_readiness.py` fails on the
+  repository-level problems the plugin directory blocks or holds (files at or over
+  256 KiB, more than 512 files, binaries, symlinks, OS junk files, non-portable file
+  names, archive-rewriting `.gitattributes`, a README under 40 words, a missing
+  licence, hook or MCP commands using variables other than `${CLAUDE_PLUGIN_ROOT}`,
+  inline programs or unpinned package launchers) and when the Claude, Codex and
+  Cursor manifest versions disagree with each other or with this changelog.
+- **CI `plugin-validate` job** — runs `claude plugin validate .` with a pinned Claude
+  Code release on every push and pull request; warnings are allowed, errors fail.
+- **README "Privacy and data handling"** — one section listing what is read per
+  runtime, what is written under `~/.cache/token-usage/` (including the 120-character
+  prompt excerpts), retention, network (none) and what the hooks and MCP server run.
+- **Claude manifest listing fields** — `displayName` ("Token Usage Profiler"),
+  `homepage`, `documentationUrl`, `supportUrl` and `privacyPolicyUrl`; a shorter
+  `description` that leads with per-command, skill and subagent attribution.
 - **Codex runtime**: native plugin, report skill, MCP default, fail-open hooks, rollout discovery, response/cumulative deduplication, linked subagent rollups and all report formats. Standard API price estimates for current GPT models; see `docs/codex-adapter.md` for confidence and billing limits.
 
 - **Cursor runtime support** — token-usage is no longer Claude-only. A
@@ -69,6 +90,12 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Version 0.7.0 everywhere** — `.claude-plugin/plugin.json`, `.cursor-plugin/plugin.json`
+  and `.codex-plugin/plugin.json` all carry 0.7.0 (the Codex manifest already did).
+  The non-standard `version` key is removed from `skills/report/SKILL.md` front
+  matter; the manifests are the single version source.
+- **SUBMISSION.md** — rewritten for the developer portal at claude.ai/directory/manage
+  (the earlier Console and claude.ai admin forms are retired).
 - **Statusline docs** — clarify `statusline.ps1` targets Claude Code's ledger
   layout on Windows, needs PowerShell 7+, and reads `session_id` from stdin;
   Cursor users should use `live --runtime cursor` because hook storage is JSONL
@@ -556,7 +583,8 @@ Initial release.
 - Standalone CLI: `python3 scripts/token_usage.py report|json [transcript]`.
 - Optional statusline example (`examples/statusline.sh`, requires `jq`).
 
-[Unreleased]: https://github.com/Wicked-Sick-Ltd/token-usage/compare/v0.6.1...HEAD
+[Unreleased]: https://github.com/Wicked-Sick-Ltd/token-usage/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/Wicked-Sick-Ltd/token-usage/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/Wicked-Sick-Ltd/token-usage/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/Wicked-Sick-Ltd/token-usage/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/Wicked-Sick-Ltd/token-usage/compare/v0.4.0...v0.5.0

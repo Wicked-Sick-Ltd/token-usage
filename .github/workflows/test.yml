@@ -21,3 +21,12 @@ jobs:
       # interpreters — the same gate the contributor guide sets locally.
       - run: python3 -m pytest tests/ -v -W error
       - run: ruff check scripts tests
+  plugin-validate:
+    # Anthropic's own manifest check, pinned so a new Claude Code release cannot
+    # change the result under an unchanged commit. Warnings (for example the
+    # contributor CLAUDE.md at the root) are allowed; errors fail the job.
+    # Uses the runner's preinstalled Node.js.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: npx --yes @anthropic-ai/claude-code@2.1.288 plugin validate .

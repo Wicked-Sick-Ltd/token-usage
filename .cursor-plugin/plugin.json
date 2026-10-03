@@ -1,6 +1,6 @@
 {
   "name": "token-usage",
-  "version": "0.6.1",
+  "version": "0.7.0",
   "description": "Attribute Claude Code, Cowork, and Cursor token usage to the work that consumed it — per-activity breakdowns, subagent rollups, cross-session history, live session ledger, cache-aware API-price estimates, and a bundled MCP server with optional Cursor hook attribution",
   "author": {
     "name": "Craig Fletcher",

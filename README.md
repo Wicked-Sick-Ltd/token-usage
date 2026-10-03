@@ -47,6 +47,62 @@ Claude Code tells you session totals (`/cost`, OTel metrics) and tools like ccus
   whose cost is only a priced subtotal (some of its usage ran on an unpriced model) is
   marked `*` and footnoted, since the rows are ranked on that number.
 
+## Privacy and data handling
+
+token-usage runs entirely on your machine. It is Python standard library only and
+makes **no network calls**: there is no telemetry, no remote API, no update check and
+no third-party service. Nothing it reads or writes leaves the machine.
+
+**What it reads** (read-only, and only for the runtime you ask about):
+
+| Runtime | Location | Override |
+|---|---|---|
+| Claude Code | `~/.claude/projects/<project-slug>/<session-id>.jsonl`, plus subagent transcripts and their `.meta.json` files under `<session-id>/subagents/` | `TOKEN_USAGE_PROJECTS_DIR` |
+| Cowork | the read-only sandbox mount `~/mnt/.claude/projects/…` and `/sessions/*/mnt/.claude/projects/…` | — |
+| Cursor | the hook ledgers below; Cursor Desktop's `state.vscdb`, opened with SQLite `mode=ro`, and `workspaceStorage/*/workspace.json` under Cursor's user directory; a Cloud Agent export `.json` only when you pass its path | `TOKEN_USAGE_CURSOR_DIR` |
+| Codex | rollout JSONL under `$CODEX_HOME/sessions` and `archived_sessions` (default `~/.codex`) | `TOKEN_USAGE_CODEX_HOME` |
+| All | the bundled `data/pricing.json` and your optional overlay `~/.config/token-usage/pricing.json` (honours `XDG_CONFIG_HOME`) | — |
+
+Transcripts contain your prompts and code. token-usage reads them only to count tokens
+and label activities. It reads no credentials or auth files.
+
+**What it writes.** Everything goes under `~/.cache/token-usage/` (override with
+`TOKEN_USAGE_LEDGER_DIR`):
+
+- `<session-id>.json` (Claude Code) and `codex-<session-id>.json` (Codex): the session
+  aggregate the Stop/SubagentStop hooks keep current. It holds token counts, cost
+  estimates, activity labels (slash command, skill or agent names), the transcript path,
+  and **the first 120 characters of the prompt that opened each segment**.
+- `latest.json`: a best-effort symlink to the most recently written session aggregate.
+- `index/`: the per-transcript summary cache used by `history`, `insights`,
+  `top_consumers`, `dashboard` and `export`. It holds transcript paths, project names,
+  activity labels and token/cost totals.
+- `cursor/<hash>.jsonl`: the append-only Cursor hook ledger. It holds the conversation
+  id, UTC timestamps, workspace roots, the hook's raw token fields, and **the first 120
+  characters of each prompt and subagent task**. The directory is created owner-only
+  (`0700`) where the filesystem supports it.
+
+`dashboard` and `export` also write the one file you name with `--output` (dashboard
+defaults to `token-usage-dashboard.html` in the current directory; `--output -` writes
+to stdout).
+
+**Retention.** token-usage never deletes or prunes anything. The data stays until you
+remove it; deleting `~/.cache/token-usage/` (or your `TOKEN_USAGE_LEDGER_DIR`) removes all
+of it, and the next run rebuilds the cache from your transcripts.
+
+**What runs.**
+
+- **Hooks** (Claude Code: `Stop` and `SubagentStop`; Codex: `Stop` and `SubagentStop`;
+  Cursor: `beforeSubmitPrompt`, `stop`, `subagentStart` and `subagentStop`) run
+  `scripts/token_usage.py` with a 15-second timeout. They fail open: they always exit 0
+  and never block the session. On stdout, a Claude Code or Codex hook prints nothing but
+  the optional budget `systemMessage` (only when `TOKEN_USAGE_BUDGET_USD` is set), and the
+  Cursor hook prints `{}`.
+- **MCP server**: `scripts/mcp_server.py`, a local stdio process the host starts. It has
+  no network listener and offers only the five reporting tools listed under
+  [MCP server](#mcp-server). They read the locations above and may refresh the `index/`
+  cache; they never modify transcripts.
+
 ## Installation
 
 Requires `python3` (3.9+, stdlib only — no dependencies).
