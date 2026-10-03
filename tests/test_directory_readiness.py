@@ -40,6 +40,7 @@ def shipped_files():
         if names:
             return [PLUGIN_ROOT / n for n in names]
     except (OSError, subprocess.CalledProcessError):
+        # No git checkout (e.g. a source tarball): fall back to walking the tree below.
         pass
     skip = {".git", "__pycache__", ".pytest_cache", ".ruff_cache", ".venv", "venv"}
     return [p for p in PLUGIN_ROOT.rglob("*")
