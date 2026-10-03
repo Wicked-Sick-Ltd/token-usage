@@ -72,8 +72,9 @@ def test_changelog_describes_latest_json_as_a_pointer_not_an_aggregate():
     # latest.json is a symlink to the newest per-session ledger, not a
     # separate corpus-wide aggregate file.
     changelog = (PLUGIN_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-    unreleased = changelog.split("## [Unreleased]", 1)[1].split("\n## ", 1)[0]
-    flat = " ".join(unreleased.split())
+    # The statusline entry shipped in 0.7.0: check Unreleased plus that release.
+    recent = changelog.split("## [Unreleased]", 1)[1].split("\n## [0.6.1]", 1)[0]
+    flat = " ".join(recent.split())
     assert "aggregate `TOKEN_USAGE_LEDGER_DIR/latest.json`" not in flat
     assert "aggregate `latest.json`" not in flat
     assert "latest session aggregate" in flat

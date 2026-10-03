@@ -1,21 +1,28 @@
 {
   "name": "token-usage",
-  "version": "0.6.1",
-  "description": "Attribute Claude Code and Cowork token usage to the work that consumed it — per-command, per-skill, per-agent and per-model breakdowns, cross-session history, live session ledger, cost estimates, and a bundled MCP server",
+  "displayName": "Token Usage Profiler",
+  "version": "0.7.0",
+  "description": "A token profiler, not a cost meter: attributes Claude Code and Cowork usage to the slash command, skill or subagent that consumed it.",
   "author": {
     "name": "Craig Fletcher",
     "email": "craig@wickedsick.com"
   },
+  "homepage": "https://github.com/Wicked-Sick-Ltd/token-usage#readme",
   "repository": "https://github.com/Wicked-Sick-Ltd/token-usage",
   "license": "MIT",
   "keywords": [
     "tokens",
     "usage",
     "cost",
+    "profiler",
     "observability",
     "analytics",
-    "cowork"
+    "cowork",
+    "mcp"
   ],
+  "documentationUrl": "https://github.com/Wicked-Sick-Ltd/token-usage#readme",
+  "supportUrl": "https://github.com/Wicked-Sick-Ltd/token-usage/issues",
+  "privacyPolicyUrl": "https://github.com/Wicked-Sick-Ltd/token-usage#privacy-and-data-handling",
   "mcpServers": {
     "token-usage": {
       "command": "python3",
