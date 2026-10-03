@@ -12,8 +12,12 @@ welcome.
 - **Never block the session.** The Stop hook must always exit 0. Anything
   that can fail (missing transcript, malformed JSONL, unwritable cache dir)
   must fail silently or degrade gracefully.
-- **Local-only.** No network calls, no telemetry. The plugin reads
-  `~/.claude/projects/` and writes `~/.cache/token-usage/` — nothing else.
+- **Local-only.** No network calls, no telemetry. The plugin reads local
+  session data only (Claude Code `~/.claude/projects/`, the Cowork mount, Cursor's
+  local data read-only, Codex rollouts under `~/.codex`) plus the pricing files, and
+  writes only under `~/.cache/token-usage/` (and the one file `dashboard` or `export`
+  is told to write). Keep the README's privacy and data-handling disclosures true
+  to the code: update them in the same PR as any change to what is read or written.
 - **Totals must reconcile.** Any attribution change must keep the invariant
   that segment rows sum to the session total. Dedup by `requestId` is
   load-bearing — see "Correct dedup" in the README before touching it.
@@ -69,16 +73,18 @@ than guessing.
 
 ## Style
 
-- Match the existing code: small functions, type hints, no classes unless
-  state genuinely demands one.
+- Match the existing code: small functions, no classes unless state
+  genuinely demands one (the runtime adapters are the main exception).
 - Keep the parser streaming — transcripts can be hundreds of MB; never load
   the whole file into memory.
 - One change per PR. Refactors separate from behaviour changes.
 
 ## Releases
 
-Versioning is semver in `.claude-plugin/plugin.json`; user-visible changes
-get a line in `CHANGELOG.md` under Unreleased, which is rolled into a
+Versioning is semver. Keep `version` identical in `.claude-plugin/plugin.json`,
+`.codex-plugin/plugin.json` and `.cursor-plugin/plugin.json`, and raise it for every
+release: the Claude plugin directory treats each version separately. User-visible
+changes get a line in `CHANGELOG.md` under Unreleased, which is rolled into a
 version heading at release time.
 
 ## Reporting issues
