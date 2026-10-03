@@ -443,3 +443,7 @@ Native Codex plugin support includes the report skill, local MCP server, Stop ho
 `--runtime codex` across reports, history, insights, comparisons, live views, dashboards
 and exports. Reads local rollouts and rolls linked subagents into their parent once.
 See [setup, accounting and limitations](docs/codex-adapter.md).
+
+## Credit
+
+Released under the MIT licence by Wicked Sick Limited. You are free to use, modify and redistribute it; please keep the copyright notice and credit Wicked Sick Limited.
