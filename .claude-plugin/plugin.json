@@ -1,7 +1,7 @@
 {
   "name": "token-usage",
   "displayName": "Token Usage Profiler",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "A token profiler, not a cost meter: attributes Claude Code and Cowork usage to the slash command, skill or subagent that consumed it.",
   "author": {
     "name": "Craig Fletcher",
@@ -30,6 +30,7 @@
         "${CLAUDE_PLUGIN_ROOT}/scripts/mcp_server.py"
       ],
       "env": {
+        "TOKEN_USAGE_RUNTIME": "claude",
         "TOKEN_USAGE_PROJECT_DIR": "${CLAUDE_PROJECT_DIR}"
       }
     }

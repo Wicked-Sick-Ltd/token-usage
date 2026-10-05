@@ -17,6 +17,8 @@ MANIFESTS = {
     "claude": CLAUDE_MANIFEST,
     "codex": PLUGIN_ROOT / ".codex-plugin" / "plugin.json",
     "cursor": PLUGIN_ROOT / ".cursor-plugin" / "plugin.json",
+    "gemini": PLUGIN_ROOT / "gemini-extension.json",
+    "copilot": PLUGIN_ROOT / ".plugin" / "plugin.json",
 }
 
 MAX_FILE_BYTES = 256 * 1024

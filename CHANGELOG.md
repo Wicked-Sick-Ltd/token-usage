@@ -6,6 +6,27 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.8.0] — Unreleased candidate
+
+### Added
+
+- Gemini CLI extension and runtime: legacy JSON/current JSONL recording discovery,
+  cached/thought/tool token accounting, duplicate-message handling and nested
+  subagent rollups across reports, MCP tools and corpus commands.
+- GitHub Copilot CLI plugin and runtime: a native, fail-open usage collector using
+  the host-bundled SDK, command/skill attribution, subagent subsets, and cumulative
+  shutdown-total recovery when per-call events were not captured.
+- Synthetic regression coverage and an opt-in native Copilot offline test with
+  OpenAI/Anthropic wire formats, resumed sessions and prompt-redaction checks.
+- Five-host support matrix, installation paths, verification evidence and privacy
+  documentation. Gemini/Copilot integrations target the CLI products.
+
+### Fixed
+
+- Codex MCP startup: resolve the server script from a plugin-relative working
+  directory instead of passing an unexpanded `${PLUGIN_ROOT}` argument to Python.
+- Fill the Codex plugin listing's description, publisher and website fields.
+
 ## [0.7.0] — 2026-10-03
 
 Release for resubmission to Anthropic's plugin directory. It ships the Codex and
@@ -584,6 +605,7 @@ Initial release.
 - Optional statusline example (`examples/statusline.sh`, requires `jq`).
 
 [Unreleased]: https://github.com/Wicked-Sick-Ltd/token-usage/compare/v0.7.0...HEAD
+[0.8.0]: https://github.com/Wicked-Sick-Ltd/token-usage/compare/v0.7.0...HEAD
 [0.7.0]: https://github.com/Wicked-Sick-Ltd/token-usage/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/Wicked-Sick-Ltd/token-usage/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/Wicked-Sick-Ltd/token-usage/compare/v0.5.0...v0.6.0

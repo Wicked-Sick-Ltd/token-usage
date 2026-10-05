@@ -6,8 +6,7 @@ and is no longer updated.
 
 ## Start here
 
-- [README](../README.md): what token-usage is, installation for Claude Code, Codex and
-  Cursor, every CLI command, the MCP server, configuration, insights, cost disclaimer and
+- [README](../README.md): what token-usage is, installation for Claude Code, Codex, Cursor, Gemini CLI and Copilot CLI, every CLI command, the MCP server, configuration, insights, cost disclaimer and
   limitations.
 - [Use cases](use-cases.md): the problem token-usage solves and the questions it answers.
 - [Architecture](architecture.md): how the code is laid out, how a report is built, and
@@ -18,6 +17,9 @@ and is no longer updated.
 - [Codex runtime](codex-adapter.md): setup, accounting, prices and privacy for Codex.
 - [Cursor runtime](cursor-adapter.md): attribution sources, measurement levels,
   limitations and privacy for Cursor.
+
+- [Gemini and Copilot CLI](gemini-copilot.md): installation, usage capture, accounting,
+  privacy, limitations and native verification evidence.
 
 ## Project records
 

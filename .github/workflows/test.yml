@@ -30,3 +30,29 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - run: npx --yes @anthropic-ai/claude-code@2.1.288 plugin validate .
+  native-copilot:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - run: pip install pytest
+      - run: npm install --prefix "${{ runner.temp }}/copilot-test" --no-audit --no-fund @github/copilot@1.0.91
+      - name: Select native executable
+        shell: python
+        run: |
+          import os
+          from pathlib import Path
+          package = "copilot-win32-x64/copilot.exe" if os.name == "nt" else "copilot-linux-x64/copilot"
+          path = Path(os.environ["RUNNER_TEMP"]) / "copilot-test/node_modules/@github" / package
+          assert path.is_file(), path
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
+              env.write(f"COPILOT_TEST_CLI={path}\n")
+      - run: python -m pytest tests/test_codex.py tests/test_gemini.py tests/test_copilot.py tests/test_copilot_native.py tests/test_directory_readiness.py -v -W error

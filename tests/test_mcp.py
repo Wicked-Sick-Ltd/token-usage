@@ -127,7 +127,7 @@ def test_tools_list_names_and_schema_shape(mcp):
         assert "format" in s["properties"]
         assert s["properties"]["format"]["enum"] == ["json", "markdown"]
         rt = s["properties"]["runtime"]
-        assert rt["enum"] == ["claude", "cursor", "codex", "auto"]
+        assert rt["enum"] == ["claude", "cursor", "codex", "gemini", "copilot", "auto"]
     by_name = {t["name"]: t for t in tools}
     assert by_name["diff"]["inputSchema"]["required"] == ["old", "new"]
     assert by_name["history"]["inputSchema"]["properties"]["by"]["enum"] == \
@@ -469,7 +469,8 @@ def test_plugin_manifest_registers_server_inline_not_via_mcp_json():
     srv = cfg["mcpServers"]["token-usage"]
     assert srv["command"] == "python3"
     assert srv["args"] == ["${CLAUDE_PLUGIN_ROOT}/scripts/mcp_server.py"]
-    assert srv["env"] == {"TOKEN_USAGE_PROJECT_DIR": "${CLAUDE_PROJECT_DIR}"}
+    assert srv["env"] == {"TOKEN_USAGE_PROJECT_DIR": "${CLAUDE_PROJECT_DIR}",
+                          "TOKEN_USAGE_RUNTIME": "claude"}
 
 
 def test_end_to_end_over_pipes(tmp_path, monkeypatch):
@@ -883,7 +884,7 @@ def seed_cursor(tmp_path, monkeypatch):
 
 def test_invalid_runtime_is_a_tool_error(mcp, tmp_path, monkeypatch):
     seed(tmp_path, monkeypatch)
-    text, err = call(mcp, "history", runtime="gemini")
+    text, err = call(mcp, "history", runtime="not-a-runtime")
     assert err and "runtime must be one of" in text
 
 

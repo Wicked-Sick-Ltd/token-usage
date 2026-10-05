@@ -1,11 +1,17 @@
 # Cursor adapter — evidence and contract
 
 This note records what is **official**, what was **reverse-engineered**, what we
-**observed** in exports, and how a future adapter (for example **Gemini**) should plug
-in. It supports the public MIT `token-usage` Cursor Plugin
+**observed** in exports, and the common adapter contract used by the other runtimes. It supports the public MIT `token-usage` Cursor Plugin
 (`.cursor-plugin/plugin.json`) and the `CursorAdapter` in `scripts/token_usage.py`.
 
 ## Official Cursor surfaces (authoritative)
+
+Verification on 2026-10-05: Cursor CLI `2026.10.01-e373342`, using an isolated
+project's manual MCP configuration, reported the server `ready` and listed all
+five tools. `agent mcp list` does not load `--plugin-dir` contributions in this
+version. The Desktop marketplace/local-plugin UI and a model-driven Cursor turn
+have not been exercised; the plugin manifest and hooks are covered by synthetic
+tests. This is manual MCP evidence, not a claim of completed marketplace publication.
 
 | Surface | What token-usage uses | Source |
 | --- | --- | --- |
@@ -182,7 +188,8 @@ exporter can map this stable schema without breaking JSONL consumers.
 | Fleet / multi-machine aggregation | **Out of scope** |
 | LLM-generated insights | **Out of scope** — `insights` stays rule-based arithmetic |
 | Codex | **Shipped in 0.7.0** — `CodexAdapter`; see [codex-adapter.md](codex-adapter.md) |
-| Gemini, other runtimes | **Future adapters** — implement `RuntimeAdapter` per the contract above; dashboard/export need no runtime-specific code once summaries are canonical |
+| Gemini CLI / Copilot CLI | **0.8.0 candidate** — see [runtime setup and limits](gemini-copilot.md) |
+| Other runtimes | **Future adapters** — implement `RuntimeAdapter` per the contract above; dashboard/export need no runtime-specific code once summaries are canonical |
 
 ### Statusline vs live (Cursor)
 

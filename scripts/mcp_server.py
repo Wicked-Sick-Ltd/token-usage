@@ -29,15 +29,13 @@ FORMAT = {"type": "string", "enum": ["json", "markdown"],
                          "markdown: the rendered table/text."}
 SESSION_SELECTORS = {
     "transcript": {"type": "string",
-                   "description": "Session source: Claude .jsonl transcript, or Cursor cloud "
-                                  "export .json when runtime is cursor."},
+                   "description": "Session recording path for the selected runtime (JSONL or JSON)."},
     "session_id": {"type": "string",
-                   "description": "Claude Code session id (claude) or Cursor composer id "
-                                  "(cursor); searched across the selected runtime."},
+                   "description": "Session id (Cursor composer id); searched across the selected runtime."},
 }
 RUNTIME = {"type": "string", "enum": list(tu.RUNTIME_CHOICES),
            "description": "Agent runtime to read (default: claude). auto picks one corpus "
-                          "when unambiguous; never mixes Claude and Cursor in one call."}
+                          "when unambiguous; never mixes runtimes in one call."}
 SINCE = {"type": "string", "minLength": 1,
          "description": "Window start: Nd (e.g. 7d) or YYYY-MM-DD."}
 PROJECT = {"type": "string", "minLength": 1,
@@ -377,7 +375,9 @@ def pick_session_auto(path=None, session_id=None, project_dir=None, warnings=Non
         raise ToolError("transcript must not be blank")
     transcript_arg = path.strip() if path else None
     if session_id and not transcript_arg:
-        codex = tu.get_runtime_adapter("codex").locate(session_id=session_id.strip())
+        native = [(a, a.locate(session_id=session_id.strip()))
+                  for name, a in tu._RUNTIME_ADAPTERS.items() if name not in ("claude", "cursor")]
+        native = [(a, source) for a, source in native if source is not None]
         claude_t, _ = tu.locate_transcript_with_source(session_id=session_id.strip(),
                                                        project_dir=project_dir)
         try:
@@ -385,10 +385,11 @@ def pick_session_auto(path=None, session_id=None, project_dir=None, warnings=Non
                 session_id=session_id.strip(), project_dir=project_dir)
         except (OSError, ValueError, AttributeError):
             cursor_s = None
-        if codex and (claude_t or cursor_s):
-            raise ToolError("runtime auto is ambiguous; pass runtime claude, cursor or codex")
-        if codex:
-            return tu.get_runtime_adapter("codex"), "codex", codex, "session_id"
+        if native and len(native) + bool(claude_t) + bool(cursor_s) > 1:
+            raise ToolError("runtime auto is ambiguous; pass an explicit runtime")
+        if native:
+            adapter, source = native[0]
+            return adapter, adapter.name, source, "session_id"
         if claude_t and cursor_s:
             raise ToolError("runtime auto is ambiguous — both Claude and Cursor sessions "
                             "match; pass runtime claude or cursor")
@@ -402,8 +403,8 @@ def pick_session_auto(path=None, session_id=None, project_dir=None, warnings=Non
             "auto", transcript_arg=transcript_arg, project_dir=project_dir, warnings=warnings)
     except SystemExit as e:
         _runtime_exit_as_tool_error(e)
-    if adapter.name == "codex":
-        return pick_session("codex", transcript_arg, session_id, warnings)
+    if adapter.name not in ("claude", "cursor"):
+        return pick_session(adapter.name, transcript_arg, session_id, warnings)
     if adapter.name == "claude":
         if transcript_arg:
             t, via = tu.locate_transcript_with_source(transcript_arg, project_dir=project_dir)
@@ -423,17 +424,17 @@ def pick_session(runtime, path=None, session_id=None, warnings=None):
     project_dir = project_dir_from_env()
     if runtime == "auto":
         return pick_session_auto(path, session_id, project_dir=project_dir, warnings=warnings)
-    if runtime == "codex":
+    if runtime not in ("claude", "cursor"):
         if path is not None and not path.strip():
             raise ToolError("transcript must not be blank")
         if session_id is not None and not session_id.strip():
             raise ToolError("session_id must not be blank")
-        adapter = tu.get_runtime_adapter("codex")
+        adapter = tu.get_runtime_adapter(runtime)
         source = adapter.locate(path, session_id=session_id, project_dir=project_dir)
         if source is None:
-            raise ToolError("no Codex session found; pass a rollout transcript or session_id")
+            raise ToolError(f"no {runtime.title()} session found; pass a transcript or session_id")
         via = "explicit" if path else "session_id" if session_id else "project_dir" if project_dir else "any_project"
-        return adapter, "codex", source, via
+        return adapter, runtime, source, via
     if runtime == "cursor":
         source, via = pick_cursor_session(path, session_id, project_dir=project_dir)
         return tu.get_runtime_adapter("cursor"), "cursor", source, via
@@ -619,9 +620,7 @@ def tool_diff(args):
     old_ad, old_src, _old_rn = _resolve_diff_side(args["old"], runtime, warnings)
     new_ad, new_src, _new_rn = _resolve_diff_side(args["new"], runtime, warnings)
     if old_ad.name != new_ad.name:
-        raise ToolError("diff cannot mix Claude and Cursor sessions"
-                        + ("; pass runtime claude or cursor"
-                           if runtime == "auto" else ""))
+        raise ToolError("diff cannot mix runtimes; select two sessions from the same host")
     pricing = tu.load_pricing(warnings)
     if old_ad.name == "claude":
         data = tu.diff_data(old_src, new_src, pricing)
