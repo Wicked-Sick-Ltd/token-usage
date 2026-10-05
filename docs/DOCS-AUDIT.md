@@ -1,5 +1,11 @@
 # Documentation audit — 2026-10-03
 
+2026-10-05 addendum: the unreleased five-host work adds Gemini/Copilot CLI
+integration, fixes the Codex launcher/listing, and updates README, architecture,
+installation and privacy disclosures. See [Gemini/Copilot verification](gemini-copilot.md)
+and the Codex/Cursor runtime notes. The tables below remain the historical 0.7.0
+audit; their line numbers and three-runtime assumptions are not current.
+
 This is a claim-by-claim check of the current-behaviour documents against the code on
 `main` at `19e5534`, for version 0.6.1 going to 0.7.0. Line numbers are for
 `scripts/token_usage.py` unless another file is named. The results are:

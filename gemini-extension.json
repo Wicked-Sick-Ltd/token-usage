@@ -1,0 +1,17 @@
+{
+  "name": "token-usage",
+  "version": "0.8.0",
+  "description": "Local Gemini CLI token accounting, activity reports, model breakdowns and usage history.",
+  "contextFileName": "gemini-context.md",
+  "mcpServers": {
+    "token-usage": {
+      "command": "python",
+      "args": ["${extensionPath}/scripts/mcp_server.py"],
+      "env": {
+        "TOKEN_USAGE_RUNTIME": "gemini",
+        "TOKEN_USAGE_PROJECT_DIR": "${workspacePath}",
+        "PYTHONUTF8": "1"
+      }
+    }
+  }
+}

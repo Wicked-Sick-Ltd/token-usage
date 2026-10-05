@@ -128,7 +128,7 @@ def test_cursor_no_session_error_documents_json_or_discovery_not_composer_positi
 
 def test_invalid_runtime_rejected(tmp_path):
     r = subprocess.run(
-        [sys.executable, str(SCRIPT), "report", "--runtime", "gemini"],
+        [sys.executable, str(SCRIPT), "report", "--runtime", "not-a-runtime"],
         capture_output=True,
         text=True,
         env=_env(tmp_path),
@@ -136,7 +136,7 @@ def test_invalid_runtime_rejected(tmp_path):
     )
     assert r.returncode != 0
     assert "--runtime" in r.stderr
-    assert "gemini" in r.stderr
+    assert "not-a-runtime" in r.stderr
 
 
 def test_auto_session_ambiguous_when_both_corpora_match(tmp_path):

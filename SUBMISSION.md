@@ -6,8 +6,11 @@ through the **developer portal**: claude.ai/directory/manage → **Submit new** 
 https://claude.com/docs/plugins/submit and the automated checks at
 https://claude.com/docs/plugins/pre-submission-checklist.
 
-**Last verified:** 2026-10-03 against plugin version **0.7.0**
-(`.claude-plugin/plugin.json`).
+**Portal procedure last verified:** 2026-10-03 for 0.7.0.
+
+**Current candidate:** 0.8.0, unreleased. Local five-host checks and limits are in
+the runtime guides. Merge, release publication and portal resubmission are pending;
+this document does not record an approved or completed submission.
 
 The earlier Claude Console plugin form and the claude.ai admin-settings form are no
 longer supported. An earlier submission made through them has to be withdrawn or moved
@@ -28,7 +31,7 @@ repository owner.
   webhook).
 - Raise `version` in the manifests and add a CHANGELOG entry for every release; the
   directory treats each version separately. `tests/test_directory_readiness.py` fails if
-  the Claude, Codex and Cursor manifests or the changelog disagree.
+  all five host manifests or the changelog disagree.
 
 ## Source
 
@@ -39,9 +42,9 @@ repository owner.
 | Branch or tag | `main` *(or leave empty for the default branch)* |
 
 Then select **Validate**. Fix anything marked **Blocking**, push, and select
-**Re-validate**. Locally, `claude plugin validate .` reports one accepted warning: the
-contributor `CLAUDE.md` at the root is not loaded as plugin context (it only points
-coding agents at `AGENTS.md`). CI runs the same validator on every pull request.
+**Re-validate**. Locally, `claude plugin validate .` accepts the package with warnings: the three directory listing URL fields are
+ignored by the CLI, and the contributor `CLAUDE.md` at the root is not loaded as
+plugin context (it points coding agents at `AGENTS.md`). CI runs the same validator on every pull request.
 
 ## Listing details
 
@@ -87,7 +90,8 @@ labelled as such for subscription users. Python 3.9+ standard library only: no
 dependencies, no network calls, no telemetry.
 
 The same repository also packages the plugin for Codex (`.codex-plugin/`) and Cursor
-(`.cursor-plugin/`); the directory listing covers the Claude Code plugin.
+(`.cursor-plugin/`), Gemini CLI (`gemini-extension.json`) and GitHub Copilot CLI
+(`.plugin/`); this directory listing covers the Claude Code plugin.
 
 ### Example use cases
 
@@ -111,9 +115,13 @@ These answers must match the README section
 Yes, locally only. It reads the user's own local AI session transcripts, which can
 contain prompts and code: Claude Code `~/.claude/projects/`, the read-only Cowork sandbox
 mount, and (only when asked for those runtimes) Cursor's local `state.vscdb` opened
-read-only and Codex rollouts under `~/.codex`. It stores derived token counts, cost
+read-only, Codex rollouts under `~/.codex`, Gemini recordings under `~/.gemini`,
+and Copilot session events under `~/.copilot`. It stores derived token counts, cost
 estimates, activity labels, transcript paths and prompt excerpts of up to 120 characters
-in `~/.cache/token-usage/` on the user's machine. Nothing leaves the machine.
+in `~/.cache/token-usage/` on the user's machine. Copilot's capture extension also
+stores counters, event IDs, labels and project/session metadata under
+`$COPILOT_HOME/token-usage/`, without prompts or tool output. Reports returned through
+MCP enter the host conversation and follow its data policy.
 
 **Does it send data to services other than its declared connectors?**
 No. It makes no network calls and has no telemetry or third-party services. The bundled
@@ -121,7 +129,8 @@ MCP server is a local stdio process (`scripts/mcp_server.py`).
 
 **How long does it keep data?**
 Until the user deletes it. The plugin never prunes; deleting `~/.cache/token-usage/`
-removes everything it stored.
+removes summary caches and hook ledgers. Remove `$COPILOT_HOME/token-usage/`
+(default `~/.copilot/token-usage/`) separately to remove Copilot capture files.
 
 **Is it intended for people under 18?**
 No. It is a developer tool.

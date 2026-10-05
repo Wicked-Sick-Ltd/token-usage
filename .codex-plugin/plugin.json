@@ -1,11 +1,18 @@
 {
   "name": "token-usage",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "Local Codex token accounting by turn, explicit skill and model, with history, insights, live reports, exports and a bundled MCP server.",
   "author": {"name": "Craig Fletcher"},
   "license": "MIT",
   "skills": "./codex-skills/",
   "mcpServers": "./.mcp-codex.json",
   "hooks": "./hooks/hooks-codex.json",
-  "interface": {"displayName": "Token Usage"}
+  "interface": {
+    "displayName": "Token Usage",
+    "shortDescription": "Local token reports and API cost estimates for Codex sessions.",
+    "longDescription": "Inspect token usage by turn, skill and model, compare sessions, and track local usage history. Costs are API-equivalent estimates, not subscription charges. Requires Python 3.9+ on PATH.",
+    "developerName": "Wicked Sick Limited",
+    "category": "Developer Tools",
+    "websiteURL": "https://github.com/Wicked-Sick-Ltd/token-usage"
+  }
 }

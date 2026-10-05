@@ -133,6 +133,30 @@ def test_native_manifest_targets_exist():
         assert (root / manifest[field]).exists()
 
 
+def test_native_mcp_launcher_initializes():
+    root = SCRIPT.parent.parent
+    config = json.loads((root / ".mcp-codex.json").read_text())["mcpServers"]["token-usage"]
+    # Codex resolves cwd relative to the plugin; legacy MCP args are literal.
+    messages = [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2025-06-18", "capabilities": {},
+            "clientInfo": {"name": "test", "version": "1"}}},
+        {"jsonrpc": "2.0", "method": "notifications/initialized"},
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+    ]
+    proc = subprocess.run(
+        [sys.executable, *config["args"]], cwd=root / config.get("cwd", "."),
+        env=dict(os.environ, **config["env"]),
+        input="".join(json.dumps(msg) + "\n" for msg in messages),
+        text=True, capture_output=True, timeout=10, check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    replies = [json.loads(line) for line in proc.stdout.splitlines()]
+    assert replies[0]["result"]["serverInfo"]["name"] == "token-usage"
+    assert {tool["name"] for tool in replies[1]["result"]["tools"]} == {
+        "session_cost", "history", "insights", "diff", "top_consumers"}
+
+
 def test_children_roll_up_once_and_invalidate_parent_cache(tu, tmp_path, monkeypatch):
     parent = make_rollout(tmp_path, monkeypatch)
     child = make_rollout(tmp_path, monkeypatch, sid="child")

@@ -1,15 +1,23 @@
 ---
 name: report
-description: Generate a per-activity breakdown of Claude Code, Cowork, or Cursor token usage and estimated API cost for the current or a past session, attributing usage to slash commands (Claude Code), skills (Cowork), or Cursor composer generations, including subagent rollups, per-agent-type and per-model breakdowns, cross-session history with burn rate, compare mode, budget nudge status, and rule-based spend insights. This skill should be used when the user asks "where did my tokens go", "token usage report", "how many tokens did that command or skill use", "what did this session cost", "which command/skill/subagent/model used the most tokens", "show me token history", "what did I spend this week", "what's my burn rate", "token history by day/project/command/model", "compare token usage between two sessions", "which sessions cost the most", "costliest sessions", "top consumers", "any tips on my token spend", "analyse my token usage", or "why was this session expensive".
+description: Generate a per-activity breakdown of Claude Code, Cowork, Codex, Cursor, Gemini CLI, or GitHub Copilot CLI token usage and estimated API cost for the current or a past session, attributing usage to slash commands (Claude Code), skills (Cowork), or Cursor composer generations, including subagent rollups, per-agent-type and per-model breakdowns, cross-session history with burn rate, compare mode, budget nudge status, and rule-based spend insights. This skill should be used when the user asks "where did my tokens go", "token usage report", "how many tokens did that command or skill use", "what did this session cost", "which command/skill/subagent/model used the most tokens", "show me token history", "what did I spend this week", "what's my burn rate", "token history by day/project/command/model", "compare token usage between two sessions", "which sessions cost the most", "costliest sessions", "top consumers", "any tips on my token spend", "analyse my token usage", or "why was this session expensive".
 argument-hint: "[transcript-path]"
 allowed-tools: Bash, Read, mcp__plugin_token-usage_token-usage__session_cost, mcp__plugin_token-usage_token-usage__history, mcp__plugin_token-usage_token-usage__insights, mcp__plugin_token-usage_token-usage__diff, mcp__plugin_token-usage_token-usage__top_consumers, mcp__token-usage__session_cost, mcp__token-usage__history, mcp__token-usage__insights, mcp__token-usage__diff, mcp__token-usage__top_consumers
 ---
 
 # token-usage report
 
+Select the runtime for this host: `claude` (Claude Code/Cowork), `codex`, `cursor`,
+`gemini` (Gemini CLI), or `copilot` (GitHub Copilot CLI). Pass that value explicitly to every MCP tool and add
+`--runtime <host>` to every CLI command below when outside Claude. Use `python`
+on Windows and `python3` on macOS/Linux. Never silently report another host's data.
+
 Produce a per-activity token-usage breakdown: slash commands (Claude Code), skills
 (Cowork), or composer activities (Cursor), plus subagent rollups and API-equivalent cost
-estimates. Also handles cross-session history and transcript comparison.
+estimates. Also handles cross-session history and transcript comparison. Gemini reads
+native recordings. Copilot uses its capture extension and saved shutdown totals;
+uncaptured totals cannot be attributed to individual commands. Report `measurement`
+and warnings, and never present activity-only counters as zero spend.
 
 ## Prefer the MCP tools when present
 

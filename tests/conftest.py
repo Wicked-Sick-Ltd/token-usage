@@ -57,6 +57,9 @@ def _isolated_codex_home(monkeypatch, tmp_path):
     monkeypatch.setenv("TOKEN_USAGE_CODEX_HOME", str(tmp_path / "codex"))
     monkeypatch.delenv("CODEX_THREAD_ID", raising=False)
     monkeypatch.delenv("TOKEN_USAGE_RUNTIME", raising=False)
+    monkeypatch.setenv("TOKEN_USAGE_GEMINI_HOME", str(tmp_path / "gemini"))
+    monkeypatch.delenv("GEMINI_SESSION_ID", raising=False)
+    monkeypatch.setenv("TOKEN_USAGE_COPILOT_HOME", str(tmp_path / "copilot"))
 
 
 @pytest.fixture(autouse=True)

@@ -1,6 +1,6 @@
 # token-usage
 
-**Where did my tokens go?** A public MIT plugin for **Claude Code**, **Codex** and **Cursor** that attributes token usage to the work that consumed it — per-activity breakdowns (slash commands and skills in Claude Code and Cowork, turns and skills in Codex, composer generations in Cursor), subagent rollups, cross-session history, optional live ledgers, and cache-aware API-price estimates.
+**Where did my tokens go?** A public MIT plugin for **Claude Code**, **Codex**, **Cursor**, **Gemini CLI** and **GitHub Copilot CLI** that attributes token usage to the work that consumed it — per-activity breakdowns (slash commands and skills in Claude Code and Cowork, turns and skills in Codex, composer generations in Cursor), subagent rollups, cross-session history, optional live ledgers, and cache-aware API-price estimates.
 
 📖 **Documentation:** this README and the [`docs/`](docs/README.md) folder are the documentation — [use cases](docs/use-cases.md), [architecture and configuration](docs/architecture.md), and the [Codex](docs/codex-adapter.md) and [Cursor](docs/cursor-adapter.md) runtime notes.
 
@@ -15,7 +15,26 @@ Claude Code tells you session totals (`/cost`, OTel metrics) and tools like ccus
 | **Total**                     |       |  214k  | 13.8k |      46.1M |        1.5M |    $33.87 |
 ```
 
+## Host support
+
+| Host | Usage source | Attribution and limits |
+|---|---|---|
+| Claude Code / Cowork | Native transcripts and child transcripts | Original command/skill attribution, subagent rollups; Claude Code hooks and budget nudges. |
+| Codex | Native rollouts and linked children | Turns/skills, cache-aware totals, local MCP and trusted Stop hooks. |
+| Cursor | Hook ledger, Desktop SQLite, explicit Cloud export | Uses recorded usage when present; activity-only when the host omits counters. |
+| Gemini CLI | Native JSON/JSONL recordings | User activity labels, nested child rollups; direct polling for live reports. No Stop-hook budget nudges. |
+| GitHub Copilot CLI | Native events plus a small capture extension | Per-call labels and subagent subsets with `--experimental`; uncaptured shutdown totals have partial attribution. |
+
+All five runtimes support the report/history/insights/comparison tools and CLI
+live/dashboard/export commands. Token counts depend on the host's recorded fields;
+unknown prices remain unknown. Copilot support targets its CLI, and Gemini support
+targets Gemini CLI. See [Gemini/Copilot setup and verification](docs/gemini-copilot.md),
+[Codex notes](docs/codex-adapter.md) and [Cursor notes](docs/cursor-adapter.md).
+
 ## Features
+
+The command, hook and budget behavior below describes the original Claude integration;
+the host table above identifies the corresponding capabilities elsewhere.
 
 - **Per-command attribution** — a slash command owns every turn until the next command, so multi-turn exchanges stay attributed to the command that triggered them. `(no command)` covers only turns that occurred before the first command in the session.
 - **Works in Cowork too** — in the Claude desktop app (Cowork), skills run mid-turn via the Skill tool rather than a `<command-name>` prompt; each gets its own sticky segment (e.g. `/pptx`, `/report`). Transcript discovery falls back to the Cowork sandbox mount when there's no Claude Code project directory for the cwd, so `report` just works in both.
@@ -49,9 +68,11 @@ Claude Code tells you session totals (`/cost`, OTel metrics) and tools like ccus
 
 ## Privacy and data handling
 
-token-usage runs entirely on your machine. It is Python standard library only and
+token-usage runs entirely on your machine. The analyser uses only the Python standard library and
 makes **no network calls**: there is no telemetry, no remote API, no update check and
-no third-party service. Nothing it reads or writes leaves the machine.
+no third-party service. The plugin sends no telemetry or remote requests. Reports returned through MCP enter
+the host conversation and follow that host's data policy. Copilot also runs a small
+JavaScript collector using its bundled SDK and Node standard library.
 
 **What it reads** (read-only, and only for the runtime you ask about):
 
@@ -60,13 +81,17 @@ no third-party service. Nothing it reads or writes leaves the machine.
 | Claude Code | `~/.claude/projects/<project-slug>/<session-id>.jsonl`, plus subagent transcripts and their `.meta.json` files under `<session-id>/subagents/` | `TOKEN_USAGE_PROJECTS_DIR` |
 | Cowork | the read-only sandbox mount `~/mnt/.claude/projects/…` and `/sessions/*/mnt/.claude/projects/…` | — |
 | Cursor | the hook ledgers below; Cursor Desktop's `state.vscdb`, opened with SQLite `mode=ro`, and `workspaceStorage/*/workspace.json` under Cursor's user directory; a Cloud Agent export `.json` only when you pass its path | `TOKEN_USAGE_CURSOR_DIR` |
-| Codex | rollout JSONL under `$CODEX_HOME/sessions` and `archived_sessions` (default `~/.codex`) | `TOKEN_USAGE_CODEX_HOME` |
+| Codex | rollout JSONL under `$CODEX_HOME/sessions` and `archived_sessions` (default `~/.codex`) | `TOKEN_USAGE_GEMINI_HOME` | `~/.gemini` (or `$GEMINI_CLI_HOME/.gemini`) | Gemini recording root. |
+| `TOKEN_USAGE_COPILOT_HOME` | `$COPILOT_HOME`, else `~/.copilot` | Copilot reader root; the collector follows `COPILOT_HOME`. |
+| `TOKEN_USAGE_CODEX_HOME` |
+| Gemini CLI | `~/.gemini/tmp/*/chats/` JSON and JSONL recordings | `TOKEN_USAGE_GEMINI_HOME` |
+| Copilot CLI | `~/.copilot/session-state/*/events.jsonl` and `~/.copilot/token-usage/*.jsonl` | `TOKEN_USAGE_COPILOT_HOME`, else `COPILOT_HOME` |
 | All | the bundled `data/pricing.json` and your optional overlay `~/.config/token-usage/pricing.json` (honours `XDG_CONFIG_HOME`) | — |
 
 Transcripts contain your prompts and code. token-usage reads them only to count tokens
 and label activities. It reads no credentials or auth files.
 
-**What it writes.** Everything goes under `~/.cache/token-usage/` (override with
+**What it writes.** Summary caches and Claude/Codex/Cursor hook ledgers go under `~/.cache/token-usage/` (override with
 `TOKEN_USAGE_LEDGER_DIR`):
 
 - `<session-id>.json` (Claude Code) and `codex-<session-id>.json` (Codex): the session
@@ -82,13 +107,17 @@ and label activities. It reads no credentials or auth files.
   characters of each prompt and subagent task**. The directory is created owner-only
   (`0700`) where the filesystem supports it.
 
+Copilot additionally writes `~/.copilot/token-usage/<session-id>.jsonl` under
+`COPILOT_HOME`: event IDs, timestamps, counters, command/skill labels, agent IDs and
+a session/project header. It stores no prompts or tool output. See the
+[collector and retention details](docs/gemini-copilot.md#github-copilot-cli).
+
 `dashboard` and `export` also write the one file you name with `--output` (dashboard
 defaults to `token-usage-dashboard.html` in the current directory; `--output -` writes
 to stdout).
 
 **Retention.** token-usage never deletes or prunes anything. The data stays until you
-remove it; deleting `~/.cache/token-usage/` (or your `TOKEN_USAGE_LEDGER_DIR`) removes all
-of it, and the next run rebuilds the cache from your transcripts.
+remove it; deleting `~/.cache/token-usage/` (or your `TOKEN_USAGE_LEDGER_DIR`) removes those caches and hook ledgers, and the next run rebuilds the cache from your transcripts.
 
 **What runs.**
 
@@ -105,7 +134,7 @@ of it, and the next run rebuilds the cache from your transcripts.
 
 ## Installation
 
-Requires `python3` (3.9+, stdlib only — no dependencies).
+Requires Python 3.9+ (`python3` for Claude/Cursor; `python` for Codex/Gemini/Copilot, stdlib only — no dependencies).
 
 ### Claude Code
 
@@ -180,6 +209,22 @@ The Codex manifest `.codex-plugin/plugin.json` bundles the report skill
 `TOKEN_USAGE_RUNTIME=codex`) and fail-open `Stop`/`SubagentStop` hooks
 (`hooks/hooks-codex.json`). Review the hooks through `/hooks` after installing;
 installation never grants hook trust. See [docs/codex-adapter.md](docs/codex-adapter.md).
+
+### Gemini CLI and GitHub Copilot CLI
+
+From a local checkout:
+
+```bash
+gemini extensions install /absolute/path/to/token-usage
+copilot plugin install /absolute/path/to/token-usage
+copilot --experimental
+```
+
+Gemini discovers the report skill and MCP server through `gemini-extension.json`.
+Copilot uses `.plugin/plugin.json`; experimental extensions capture its transient
+usage events. The expanded integrations are unreleased. Use the checkout until the
+new release and marketplace pins are published. See
+[installation, privacy and limits](docs/gemini-copilot.md).
 
 ## Usage
 
@@ -256,20 +301,20 @@ python3 scripts/token_usage.py insights --runtime cursor
 
 # Self-contained HTML dashboard from indexed history (inline CSS/SVG only — no CDN)
 python3 scripts/token_usage.py dashboard [--since 30d] [--project SUBSTRING] \
-  [--output token-usage-dashboard.html] [--runtime claude|cursor|codex|auto]
+  [--output token-usage-dashboard.html] [--runtime claude|cursor|codex|gemini|copilot|auto]
 
 # Terminal live view — repolls the current or explicit session (Ctrl-C exits 0)
 python3 scripts/token_usage.py live [TRANSCRIPT] [--interval 2] [--iterations N] \
-  [--agents] [--models] [--runtime claude|cursor|codex|auto]
+  [--agents] [--models] [--runtime claude|cursor|codex|gemini|copilot|auto]
 
 # Structured JSONL aggregates for external spend tooling (not OTLP wire format)
 python3 scripts/token_usage.py export [--scope session|history] [--by project|day|command|model] \
-  [--since 30d] [--project SUBSTRING] [--output usage.jsonl] [--runtime claude|cursor|codex|auto]
+  [--since 30d] [--project SUBSTRING] [--output usage.jsonl] [--runtime claude|cursor|codex|gemini|copilot|auto]
 python3 scripts/token_usage.py export [TRANSCRIPT] --scope session --output -
 ```
 
 `--runtime` accepts `claude` (the default, or whatever `TOKEN_USAGE_RUNTIME` names), `cursor`,
-`codex`, or `auto`. `auto` picks one runtime when unambiguous and never mixes runtimes in one
+`codex`, `gemini`, `copilot`, or `auto`. `auto` picks one runtime when unambiguous and never mixes runtimes in one
 call. Codex examples: `report --runtime codex [rollout.jsonl]`, `history --runtime codex --since 7d`.
 
 With no argument, `report` and `json` pick the most recent session for the current directory's project; failing that, the Cowork sandbox mount; failing that too, the newest transcript under **any** project on the machine. That last step means running these outside a directory with its own Claude Code history can pick up a different project's most recent session rather than reporting "not found" — pass an explicit transcript path when it matters which session gets analysed.
@@ -335,7 +380,7 @@ no install). When the plugin is enabled, Claude Code starts it and the tools app
 | `diff` | Per-activity cost and output deltas between two sessions (paths or session ids). |
 | `top_consumers` | Costliest sessions or command labels in a window (`by`, `since`, `project`, `limit`). |
 
-Every tool also takes `runtime` (`claude`, `cursor`, `codex` or `auto`; default `claude`, or
+Every tool also takes `runtime` (`claude`, `cursor`, `codex`, `gemini`, `copilot` or `auto`; default `claude`, or
 the server's `TOKEN_USAGE_RUNTIME`, which the Codex plugin sets to `codex`).
 
 Every tool takes `format`: `json` (default — the CLI's JSON shapes plus `transcript`,
@@ -404,6 +449,8 @@ token-usage has no config file. Optional environment variables (all read from
 | `TOKEN_USAGE_RUNTIME` | `claude` | Default `--runtime` for the CLI and the MCP server. |
 | `TOKEN_USAGE_PROJECT_DIR` | unset | MCP only: project to anchor "current session" on (the Claude manifest sets it from `${CLAUDE_PROJECT_DIR}`); falls back to `CLAUDE_PROJECT_DIR`. |
 | `TOKEN_USAGE_CURSOR_DIR` | Cursor's user directory for the OS | Cursor Desktop data root. |
+| `TOKEN_USAGE_GEMINI_HOME` | `~/.gemini` (or `$GEMINI_CLI_HOME/.gemini`) | Gemini recording root. |
+| `TOKEN_USAGE_COPILOT_HOME` | `$COPILOT_HOME`, else `~/.copilot` | Copilot reader root; the collector follows `COPILOT_HOME`. |
 | `TOKEN_USAGE_CODEX_HOME` | `$CODEX_HOME`, else `~/.codex` | Codex home holding `sessions/` and `archived_sessions/`. |
 | `CODEX_THREAD_ID` | set by Codex | Current Codex thread, used for current-session discovery. |
 | `XDG_CONFIG_HOME` | `~/.config` | Parent of the user pricing overlay `token-usage/pricing.json`. |

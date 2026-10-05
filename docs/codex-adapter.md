@@ -10,6 +10,12 @@ Requires Python 3.9+. The MCP launcher uses `python` on PATH; the hook uses
 the `python` alias where the OS does not. Review hooks through `/hooks` after
 installing; installation never grants hook trust.
 
+The legacy MCP config uses `cwd: "."`, resolved by Codex against the installed
+plugin root, and a relative script argument. Unlike hook commands, its arguments
+do not expand `${PLUGIN_ROOT}`. An install can succeed while MCP startup fails
+if that placeholder is used. Listing descriptions and publisher details come
+from the plugin manifest's `interface`, not the marketplace entry's description.
+
 ## Accounting
 
 Reads rollout JSONL in `$CODEX_HOME/sessions` and `archived_sessions` (default

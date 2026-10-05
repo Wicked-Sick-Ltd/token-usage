@@ -1150,8 +1150,7 @@ def _run_history_core(by="project", since=None, project=None, warnings=None, run
         summary_iter = iter_summaries(pricing, cutoff=cutoff, project=project,
                                       progress=True, skipped=skipped, warnings=warnings)
     else:
-        missing_root = (check_codex_root(warnings) if adapter.name == "codex"
-                        else check_cursor_root(warnings))
+        missing_root = check_adapter_root(adapter, warnings)
         summary_iter = iter_adapter_summaries(adapter, pricing, cutoff=cutoff,
                                               project=project, progress=True,
                                               skipped=skipped, warnings=warnings,
@@ -1280,7 +1279,7 @@ def scan_footnotes(data, unpriced=True):
         notes.append(f"{len(skipped)} {kind}(s) skipped (unreadable): {', '.join(skipped)}")
     if root:
         where = ("readable Cursor session data (Desktop SQLite or hook ledger) at"
-                 if cursor else "readable Codex sessions at" if data.get("runtime") == "codex"
+                 if cursor else f"readable {data['runtime'].title()} sessions at" if data.get("runtime") in ("codex", "gemini", "copilot")
                  else "readable Claude Code projects directory at")
         notes.append(f"No {where} {root} — nothing was scanned.")
     measured = (measurement_scan_note(data.get("measurements") or {})
@@ -1938,7 +1937,7 @@ def run_top_consumers(by="session", since="30d", project=None, limit=10, warning
         summary_iter = iter_summaries(pricing, cutoff=cutoff, project=project,
                                       skipped=skipped, warnings=warnings)
     else:
-        missing_root = check_codex_root(warnings) if adapter.name == "codex" else check_cursor_root(warnings)
+        missing_root = check_adapter_root(adapter, warnings)
         summary_iter = iter_adapter_summaries(adapter, pricing, cutoff=cutoff,
                                               project=project, skipped=skipped,
                                               warnings=warnings,
@@ -2089,7 +2088,7 @@ def compute_baseline(pricing, project, days=30, exclude=None, warnings=None,
         summary_iter = iter_summaries(pricing, cutoff=cutoff, exclude=exclude,
                                         skipped=skipped, warnings=warnings)
     else:
-        missing_root = check_codex_root(warnings) if adapter.name == "codex" else check_cursor_root(warnings)
+        missing_root = check_adapter_root(adapter, warnings)
         summary_iter = iter_adapter_summaries(adapter, pricing, cutoff=cutoff,
                                               exclude=exclude, skipped=skipped,
                                               warnings=warnings,
@@ -2291,7 +2290,7 @@ def run_insights(transcript=None, since=None, project=None, budget=None, warning
             summaries = list(iter_summaries(pricing, cutoff=cutoff, project=project,
                                             skipped=skipped, warnings=warnings))
         else:
-            missing_root = check_codex_root(warnings) if adapter.name == "codex" else check_cursor_root(warnings)
+            missing_root = check_adapter_root(adapter, warnings)
             summaries = list(iter_adapter_summaries(adapter, pricing, cutoff=cutoff,
                                                     project=project, skipped=skipped,
                                                     warnings=warnings,
@@ -2352,8 +2351,7 @@ def run_insights(transcript=None, since=None, project=None, budget=None, warning
         except CursorExplicitSelectorError as e:
             sys.exit(str(e))
         if source is None:
-            sys.exit("token-usage: no Codex session found; pass a rollout .jsonl path"
-                     if adapter.name == "codex" else CURSOR_CLI_SESSION_NOT_FOUND)
+            sys.exit(session_not_found(adapter))
         parsed = adapter.parse(source)
         exclude = adapter.describe(source)
         project_name = adapter.project(source)
@@ -3883,10 +3881,402 @@ def check_codex_root(warnings=None):
     return str(codex_home())
 
 
+def gemini_home():
+    override = os.environ.get("TOKEN_USAGE_GEMINI_HOME")
+    return (Path(override).expanduser() if override else
+            Path(os.environ.get("GEMINI_CLI_HOME") or Path.home()).expanduser() / ".gemini")
+
+
+def gemini_records(path):
+    if Path(path).suffix.lower() == ".json":
+        # ponytail: legacy snapshots need one JSON load; JSONL recordings stream.
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            yield {k: v for k, v in data.items() if k != "messages"}
+            for message in data.get("messages", []):
+                if isinstance(message, dict):
+                    yield message
+    else:
+        yield from iter_jsonl(path)
+
+
+def gemini_metadata(path):
+    for record in gemini_records(path):
+        if isinstance(record.get("sessionId"), str) and isinstance(record.get("projectHash"), str):
+            return record
+    return {}
+
+
+def is_gemini_transcript(path):
+    try:
+        return bool(gemini_metadata(path))
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+class GeminiAdapter(RuntimeAdapter):
+    name = "gemini"
+
+    def all_sessions(self, project_dir=None, warnings=None):
+        target = str(Path(project_dir).expanduser().resolve()) if project_dir else None
+        project_hash = hashlib.sha256(target.encode()).hexdigest() if target else None
+        seen = set()
+        for path in sorted((gemini_home() / "tmp").glob("*/chats/**/*.json*"), reverse=True):
+            if path.suffix not in (".json", ".jsonl"):
+                continue
+            try:
+                meta = gemini_metadata(path)
+            except (OSError, ValueError, TypeError) as exc:
+                warn(f"skipping unreadable Gemini session {path}: {exc}", warnings)
+                continue
+            sid = meta.get("sessionId")
+            if not sid or sid in seen or (project_hash and meta["projectHash"] != project_hash):
+                continue
+            seen.add(sid)
+            yield path
+
+    def iter_sessions(self, project_dir=None, warnings=None):
+        sources = list(self.all_sessions(project_dir, warnings))
+        ids = {self.session_id(p) for p in sources}
+        for path in sources:
+            if path.parent.name not in ids:
+                yield path
+
+    def locate(self, arg=None, session_id=None, project_dir=None):
+        explicit = arg or (os.environ.get("TOKEN_USAGE_TRANSCRIPT") if not session_id else None)
+        if explicit:
+            path = Path(explicit).expanduser()
+            return path if path.is_file() and is_gemini_transcript(path) else None
+        wanted = session_id or os.environ.get("GEMINI_SESSION_ID")
+        if wanted:
+            return next((p for p in self.all_sessions() if self.session_id(p) == wanted), None)
+        candidates = list(self.iter_sessions(project_dir or Path.cwd()))
+        if not candidates and project_dir is None:
+            candidates = list(self.iter_sessions())
+        return max(candidates, key=lambda p: p.stat().st_mtime_ns) if candidates else None
+
+    def session_id(self, source):
+        return gemini_metadata(source).get("sessionId") or Path(source).stem
+
+    def project(self, source):
+        return gemini_metadata(source).get("projectHash") or "gemini:unknown"
+
+    def describe(self, source):
+        return str(source)
+
+    def parse(self, source):
+        parsed = parse_gemini_session(source)
+        parent_id = self.session_id(source)
+        seen = {parent_id}
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", parent_id):
+            parsed["warnings"].append("Invalid Gemini session id; child discovery omitted.")
+            parsed["measurement"] = worst_measurement(parsed["measurement"], "partial")
+            return parsed
+        # Each generation lives beneath chats/<immediate-parent-id>/, so a
+        # grandchild can be in a sibling directory rather than below its parent.
+        root = next((p for p in Path(source).parents if p.name == "chats"), Path(source).parent)
+        children = sorted((root / parent_id).rglob("*.json*"))
+        for path in children:
+            if path.suffix not in (".json", ".jsonl"):
+                continue
+            if not is_gemini_transcript(path) or self.session_id(path) in seen:
+                continue
+            sid = self.session_id(path)
+            seen.add(sid)
+            if re.fullmatch(r"[A-Za-z0-9_-]+", sid):
+                children.extend(sorted((root / sid).rglob("*.json*")))
+            child = parse_gemini_session(path)
+            by_model = {}
+            for seg in child["segments"]:
+                merge_by_model(by_model, seg["by_model"])
+            if child["segments"]:
+                ts = child["segments"][0]["start_ts"]
+                owners = [s for s in parsed["segments"] if not ts or not s["start_ts"] or s["start_ts"] <= ts]
+                if not owners:
+                    parsed["segments"].append({"label": OTHER_LABEL, "start_ts": ts,
+                                               "prompt": "", "by_model": {}, "subagents": []})
+                    owners = parsed["segments"]
+                owner = owners[-1]
+                merge_by_model(owner["by_model"], by_model)
+                owner["subagents"].append({"type": "gemini", "description": sid,
+                                           "by_model": by_model,
+                                           "output_tokens": sum_buckets(by_model)["output"]})
+            parsed["measurement"] = worst_measurement(parsed["measurement"], child["measurement"])
+            parsed["warnings"].extend(w for w in child["warnings"] if w not in parsed["warnings"])
+        return parsed
+
+
+def parse_gemini_session(source):
+    segments, pending, users, warnings = [], {}, set(), []
+    active = None
+    missing = set()
+    partial = False
+    for record in gemini_records(source):
+        kind, sid = record.get("type"), record.get("id")
+        if "$rewindTo" in record or "$patch" in record or "$set" in record:
+            warnings.append("Gemini history edits are present; retained recorded usage includes work before edits.")
+            # Context rewinds do not refund API usage. Do not delete spent tokens.
+            if isinstance(record.get("$set"), dict) and record["$set"].get("messages"):
+                partial = True
+                warnings.append("Legacy Gemini history checkpoints are not attributed; usage may be incomplete.")
+            continue
+        if kind not in ("user", "gemini"):
+            continue
+        if not isinstance(sid, str) or not sid:
+            partial = True
+            warnings.append("Gemini message has no id; omitted because it cannot be deduplicated.")
+            continue
+        if kind == "user" and sid in users:
+            continue
+        if active is None or kind == "user":
+            content = record.get("content", "") if kind == "user" else ""
+            prompt = content if isinstance(content, str) else "".join(
+                p.get("text", "") for p in content if isinstance(p, dict) and isinstance(p.get("text"), str)
+            ) if isinstance(content, list) else ""
+            match = re.match(r"\s*([$\/][A-Za-z0-9][A-Za-z0-9_:-]*)\b", prompt)
+            active = {"label": match.group(1) if match else OTHER_LABEL,
+                      "start_ts": record.get("timestamp"), "prompt": prompt.strip()[:120],
+                      "by_model": {}, "subagents": []}
+            segments.append(active)
+        if kind == "user":
+            users.add(sid)
+            continue
+        counters = record.get("tokens")
+        if not isinstance(counters, dict) or not all(k in counters for k in ("input", "output", "cached")):
+            missing.add(sid)
+            continue
+        values = {k: counters.get(k, 0) for k in ("input", "output", "cached", "thoughts", "tool")}
+        if any(isinstance(v, bool) or not isinstance(v, int) or v < 0 for v in values.values()) or values["cached"] > values["input"]:
+            partial = True
+            warnings.append("Invalid Gemini token counters omitted.")
+            continue
+        missing.discard(sid)
+        flat = {"input": values["input"] - values["cached"] + values["tool"],
+                "output": values["output"] + values["thoughts"],
+                "cache_read": values["cached"], "cache_5m": 0, "cache_1h": 0}
+        if sid in pending:
+            max_flat(pending[sid][2], flat)
+        else:
+            model = record.get("model")
+            pending[sid] = (active, model if isinstance(model, str) and model else "unknown", flat)
+    for seg, model, flat in pending.values():
+        add_flat(seg["by_model"].setdefault(model, empty_usage()), flat)
+    if missing - pending.keys():
+        partial = True
+        warnings.append("Some Gemini messages have no recorded token counters; totals are incomplete.")
+    warnings.append("Gemini reasoning tokens are included in output; cached tokens are included once. Costs are API-equivalent estimates, not subscription charges. Deleted history cannot be reconstructed.")
+    return {"segments": segments, "warnings": list(dict.fromkeys(warnings)),
+            "measurement": ("partial" if partial else "exact") if pending else "activity_only"}
+
+
+def copilot_home():
+    return Path(os.environ.get("TOKEN_USAGE_COPILOT_HOME") or os.environ.get("COPILOT_HOME")
+                or Path.home() / ".copilot").expanduser()
+
+
+def copilot_metadata(path):
+    for record in iter_jsonl(path):
+        data = record.get("data")
+        if (record.get("type") in ("session.start", "token-usage.capture")
+                and isinstance(data, dict) and isinstance(data.get("sessionId"), str)):
+            return data
+    return {}
+
+
+def is_copilot_transcript(path):
+    try:
+        return bool(copilot_metadata(path))
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+class CopilotAdapter(RuntimeAdapter):
+    name = "copilot"
+
+    def iter_sessions(self, project_dir=None, warnings=None):
+        root, seen = copilot_home(), set()
+        paths = list((root / "session-state").glob("*/events.jsonl"))
+        paths += list((root / "token-usage").glob("*.jsonl"))
+        for path in paths:
+            try:
+                meta = copilot_metadata(path)
+                sid = meta.get("sessionId")
+                if not sid or sid in seen:
+                    continue
+                seen.add(sid)
+                cwd = (meta.get("context") or {}).get("cwd")
+                if project_dir and (not cwd or Path(cwd).resolve() != Path(project_dir).resolve()):
+                    continue
+                yield path
+            except (OSError, ValueError, TypeError) as exc:
+                warn(f"skipping unreadable Copilot session {path}: {exc}", warnings)
+
+    def locate(self, arg=None, session_id=None, project_dir=None):
+        explicit = arg or (os.environ.get("TOKEN_USAGE_TRANSCRIPT") if not session_id else None)
+        if explicit:
+            path = Path(explicit).expanduser()
+            return path if path.is_file() and is_copilot_transcript(path) else None
+        if session_id:
+            return next((p for p in self.iter_sessions() if self.session_id(p) == session_id), None)
+        candidates = list(self.iter_sessions(project_dir or Path.cwd()))
+        if not candidates and project_dir is None:
+            candidates = list(self.iter_sessions())
+        return max(candidates, key=lambda p: p.stat().st_mtime_ns) if candidates else None
+
+    def session_id(self, source):
+        return copilot_metadata(source).get("sessionId") or Path(source).stem
+
+    def project(self, source):
+        return (copilot_metadata(source).get("context") or {}).get("cwd") or "copilot:unknown"
+
+    def describe(self, source):
+        return str(source)
+
+    def parse(self, source):
+        sid = self.session_id(source)
+        paths = [Path(source)]
+        if re.fullmatch(r"[A-Za-z0-9_-]+", sid):
+            for path in (copilot_home() / "token-usage" / f"{sid}.jsonl",
+                         copilot_home() / "session-state" / sid / "events.jsonl"):
+                if path.is_file() and path.resolve() != Path(source).resolve():
+                    paths.append(path)
+        import heapq
+        # Both native events and the capture ledger are chronological JSONL.
+        streams = [(r for r in iter_jsonl(p)
+                    if r.get("type") in ("user.message", "skill.invoked", "assistant.usage", "session.shutdown"))
+                   for p in paths]
+        return parse_copilot_records(heapq.merge(*streams, key=lambda r: str(r.get("timestamp") or "")))
+
+
+def copilot_usage(data, warnings):
+    if not isinstance(data, dict) or not all(k in data for k in ("inputTokens", "outputTokens")):
+        return None
+    values = {k: data.get(k, 0) for k in ("inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens")}
+    if (any(isinstance(v, bool) or not isinstance(v, int) or v < 0 for v in values.values())
+            or values["cacheReadTokens"] + values["cacheWriteTokens"] > values["inputTokens"]):
+        warnings.append("Invalid Copilot token counters omitted.")
+        return None
+    flat = empty_usage()
+    flat.update(input=values["inputTokens"] - values["cacheReadTokens"] - values["cacheWriteTokens"],
+                output=values["outputTokens"], cache_read=values["cacheReadTokens"], requests=1)
+    flat["cache_1h" if data.get("cacheTtlSeconds") == 3600 else "cache_5m"] = values["cacheWriteTokens"]
+    if values["cacheWriteTokens"] and data.get("cacheTtlSeconds") not in (300, 3600):
+        warnings.append("Copilot cache-write lifetime is absent; API cost estimates assume the standard 5-minute rate.")
+    return flat
+
+
+def parse_copilot_records(records):
+    segments, active, seen, warnings = [], {}, set(), []
+    measured = partial = False
+
+    def segment(record, label=OTHER_LABEL):
+        seg = {"label": label, "start_ts": record.get("timestamp"), "prompt": "",
+               "by_model": {}, "subagents": []}
+        segments.append(seg)
+        return seg
+
+    for record in records:
+        rid, kind, data = record.get("id"), record.get("type"), record.get("data")
+        if not isinstance(data, dict):
+            continue
+        if not isinstance(rid, str) or not rid:
+            partial = True
+            warnings.append("Copilot event has no id; omitted because it cannot be deduplicated.")
+            continue
+        if rid in seen:
+            continue
+        seen.add(rid)
+        agent = record.get("agentId") or "main"
+        if not isinstance(agent, str):
+            partial = True
+            continue
+        if kind == "user.message":
+            content = data.get("content") or data.get("label") or ""
+            match = re.match(r"\s*([$\/][A-Za-z0-9][A-Za-z0-9_:-]*)\b", content) if isinstance(content, str) else None
+            active[agent] = segment(record, match.group(1) if match else OTHER_LABEL)
+        elif kind == "skill.invoked":
+            name = data.get("name")
+            if isinstance(name, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_:-]*", name):
+                active[agent] = segment(record, "$" + name)
+        elif kind == "assistant.usage":
+            flat = copilot_usage(data, warnings)
+            model = data.get("model")
+            if flat is None or not isinstance(model, str) or not model:
+                partial = True
+                warnings.append("Some Copilot API calls have no usable model/token counters; totals are incomplete.")
+                continue
+            measured = True
+            owner = active.get(agent) or active.get("main")
+            if owner is None:
+                owner = active.setdefault(agent, segment(record))
+            merge_by_model(owner["by_model"], {model: flat})
+            if agent != "main":
+                child = next((s for s in owner["subagents"] if s["description"] == agent), None)
+                if child is None:
+                    child = {"type": "copilot", "description": agent, "by_model": {}, "output_tokens": 0}
+                    owner["subagents"].append(child)
+                merge_by_model(child["by_model"], {model: flat})
+                child["output_tokens"] += flat["output"]
+        elif kind == "session.shutdown" and isinstance(data.get("modelMetrics"), dict):
+            totals = {}
+            for seg in segments:
+                merge_by_model(totals, seg["by_model"])
+            for model, metric in data["modelMetrics"].items():
+                if not isinstance(metric, dict):
+                    partial = True
+                    continue
+                flat = copilot_usage(metric.get("usage"), warnings)
+                requests = metric.get("requests")
+                count = requests.get("count") if isinstance(requests, dict) else None
+                if flat is None or isinstance(count, bool) or not isinstance(count, int) or count < 0:
+                    partial = True
+                    continue
+                measured = True
+                flat["requests"] = count
+                existing = totals.get(model, empty_usage())
+                # Shutdown totals survive resume. Add only usage missing from
+                # captured calls/earlier shutdowns; never charge the snapshot twice.
+                remainder = {k: max(0, flat[k] - existing[k]) for k in flat}
+                # Shutdown metrics omit TTL. Preserve the captured split and
+                # recover only writes missing from both cache buckets together.
+                remainder["cache_5m"] = max(0, flat["cache_5m"] + flat["cache_1h"]
+                                            - existing["cache_5m"] - existing["cache_1h"])
+                remainder["cache_1h"] = 0
+                if any(remainder.values()):
+                    merge_by_model(segment(record)["by_model"], {model: remainder})
+                    partial = True
+                    warnings.append("Copilot shutdown totals recovered uncaptured usage; command, time and subagent attribution for that usage is unavailable.")
+    if not measured:
+        warnings.append("Copilot has no saved usage counters yet. Enable the plugin with --experimental to capture per-call usage, or finish the session for shutdown totals.")
+    warnings.append("Copilot reasoning tokens are already included in output. API cost estimates are not Copilot credits or subscription charges.")
+    return {"segments": segments, "warnings": list(dict.fromkeys(warnings)),
+            "measurement": ("partial" if partial else "exact") if measured else "activity_only"}
+
+
+def check_adapter_root(adapter, warnings=None):
+    if adapter.name == "cursor":
+        return check_cursor_root(warnings)
+    if adapter.name == "codex":
+        return check_codex_root(warnings)
+    root = copilot_home() if adapter.name == "copilot" else gemini_home() / "tmp"
+    if root.is_dir():
+        return None
+    warn(f"no readable {adapter.name} sessions under {root}", warnings)
+    return str(root)
+
+
+def session_not_found(adapter):
+    if adapter.name == "cursor":
+        return CURSOR_CLI_SESSION_NOT_FOUND
+    return f"token-usage: no {adapter.name.title()} session found; pass a transcript path"
+
+
 _RUNTIME_ADAPTERS = {
     "claude": ClaudeAdapter(),
     "cursor": CursorAdapter(),
     "codex": CodexAdapter(),
+    "gemini": GeminiAdapter(),
+    "copilot": CopilotAdapter(),
 }
 
 
@@ -3898,9 +4288,9 @@ def get_runtime_adapter(name):
         raise ValueError(f"unknown runtime {name!r}") from None
 
 
-RUNTIME_CHOICES = ("claude", "cursor", "codex", "auto")
+RUNTIME_CHOICES = (*_RUNTIME_ADAPTERS, "auto")
 
-_DEFAULT_MEASUREMENT = {"claude": "exact", "cursor": "activity_only", "codex": "activity_only"}
+_DEFAULT_MEASUREMENT = {name: "exact" if name == "claude" else "activity_only" for name in _RUNTIME_ADAPTERS}
 
 
 def measurement_for_adapter(adapter, parsed):
@@ -4035,7 +4425,7 @@ def cached_adapter_summary(adapter, source, pricing, warnings=None):
     st = _adapter_source_stat(adapter, source)
     # Codex parent reports include independently growing child rollouts. A
     # parent-only stat cannot validate that cache; recompute the family.
-    if cache_file.exists() and adapter.name != "codex":
+    if cache_file.exists() and adapter.name not in ("codex", "gemini", "copilot"):
         try:
             c = json.loads(cache_file.read_text(encoding="utf-8", errors="replace"))
             if (isinstance(c, dict) and c.get("version") == INDEX_VERSION
@@ -4132,6 +4522,10 @@ def resolve_runtime(name, transcript_arg=None, project_dir=None, warnings=None):
     """Pick one adapter for a single-session command (report/json/insights)."""
     _validate_runtime_name(name)
     if name == "auto":
+        if transcript_arg and is_copilot_transcript(Path(transcript_arg)):
+            return get_runtime_adapter("copilot"), "copilot"
+        if transcript_arg and is_gemini_transcript(Path(transcript_arg)):
+            return get_runtime_adapter("gemini"), "gemini"
         if transcript_arg and is_codex_transcript(Path(transcript_arg)):
             return get_runtime_adapter("codex"), "codex"
         claude = None
@@ -4162,12 +4556,13 @@ def resolve_runtime(name, transcript_arg=None, project_dir=None, warnings=None):
         else:
             claude = locate_transcript(transcript_arg, project_dir=project_dir)
             cursor = locate_cursor()
-        codex = (get_runtime_adapter("codex").locate(project_dir=project_dir)
-                 if not transcript_arg else None)
-        if codex and (claude or cursor):
-            sys.exit("token-usage: --runtime auto is ambiguous; pass --runtime claude, cursor or codex")
-        if codex:
-            return get_runtime_adapter("codex"), "codex"
+        native = ([a for a in _RUNTIME_ADAPTERS.values()
+                   if a.name not in ("claude", "cursor") and a.locate(project_dir=project_dir)]
+                  if not transcript_arg else [])
+        if native and len(native) + bool(claude) + bool(cursor) > 1:
+            sys.exit("token-usage: --runtime auto is ambiguous; pass an explicit --runtime")
+        if native:
+            return native[0], native[0].name
         if claude and cursor:
             sys.exit("token-usage: --runtime auto is ambiguous — both Claude and "
                      "Cursor sessions match; pass --runtime claude or cursor")
@@ -4187,11 +4582,12 @@ def resolve_runtime_corpus(name, project_dir=None, warnings=None):
     has_claude = _corpus_has_claude_sessions()
     has_cursor = _corpus_has_cursor_sessions(project_dir=project_dir,
                                              warnings=warnings)
-    has_codex = next(get_runtime_adapter("codex").iter_sessions(project_dir), None) is not None
-    if has_codex and (has_claude or has_cursor):
-        sys.exit("token-usage: --runtime auto is ambiguous; pass --runtime claude, cursor or codex")
-    if has_codex:
-        return get_runtime_adapter("codex"), "codex"
+    native = [a for a in _RUNTIME_ADAPTERS.values() if a.name not in ("claude", "cursor")
+              and next(a.iter_sessions(project_dir), None) is not None]
+    if native and len(native) + has_claude + has_cursor > 1:
+        sys.exit("token-usage: --runtime auto is ambiguous; pass an explicit --runtime")
+    if native:
+        return native[0], native[0].name
     if has_claude and has_cursor:
         sys.exit("token-usage: --runtime auto is ambiguous — both Claude and "
                  "Cursor corpora have sessions; pass --runtime claude or cursor")
@@ -4474,8 +4870,7 @@ def _session_aggregate(adapter, runtime_name, transcript_arg, pricing, warnings)
         except CursorExplicitSelectorError as e:
             sys.exit(str(e))
         if source is None:
-            sys.exit("token-usage: no Codex session found; pass a rollout .jsonl path"
-                     if adapter.name == "codex" else CURSOR_CLI_SESSION_NOT_FOUND)
+            sys.exit(session_not_found(adapter))
         parsed = adapter.parse(source)
         path_label = adapter.describe(source)
     for w in parsed.get("warnings") or []:
