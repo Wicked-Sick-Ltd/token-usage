@@ -2,17 +2,36 @@
   "name": "token-usage",
   "version": "0.8.0",
   "description": "Local Copilot CLI token reports, command attribution and API cost estimates.",
-  "author": {"name": "Wicked Sick Limited"},
+  "author": {
+    "name": "Wicked Sick Limited",
+    "email": "craig@wickedsick.com",
+    "url": "https://github.com/Wicked-Sick-Ltd"
+  },
   "repository": "https://github.com/Wicked-Sick-Ltd/token-usage",
+  "homepage": "https://github.com/Wicked-Sick-Ltd/token-usage#readme",
   "license": "MIT",
+  "keywords": [
+    "tokens",
+    "usage",
+    "cost",
+    "profiler",
+    "observability",
+    "copilot",
+    "mcp"
+  ],
   "skills": "./skills",
   "hooks": {},
   "extensions": "./copilot-extensions",
   "mcpServers": {
     "token-usage": {
-      "command": "python",
-      "args": ["${PLUGIN_ROOT}/scripts/mcp_server.py"],
-      "env": {"TOKEN_USAGE_RUNTIME": "copilot", "PYTHONUTF8": "1"}
+      "command": "python3",
+      "args": [
+        "${PLUGIN_ROOT}/scripts/mcp_server.py"
+      ],
+      "env": {
+        "TOKEN_USAGE_RUNTIME": "copilot",
+        "PYTHONUTF8": "1"
+      }
     }
   }
 }

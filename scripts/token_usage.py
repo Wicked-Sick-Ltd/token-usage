@@ -4685,10 +4685,12 @@ def _prior_budget_multiple(ledger):
     return 1 if prior.get("budget_notified") else 0   # 0.2.x ledgers: bool only
 
 
-def _write_ledger(ledger, data):
+def _write_ledger(ledger, data, point_latest=True):
     root = ledger_dir()
     root.mkdir(parents=True, exist_ok=True)
     atomic_write_text(ledger, json.dumps(data, indent=1))
+    if not point_latest:
+        return
     link_tmp = root / f".latest.{os.getpid()}.tmp"
     try:
         link_tmp.symlink_to(ledger)
@@ -4772,7 +4774,10 @@ def _run_hook(payload, runtime="claude"):
     data["budget_notified_multiple"] = notified
 
     try:
-        _write_ledger(ledger, data)
+        # latest.json is the Claude Code statusline fallback, so only Claude
+        # ledgers may repoint it (issue #18): a Codex turn must not surface
+        # in the Claude statusline.
+        _write_ledger(ledger, data, point_latest=runtime == "claude")
     except Exception as e:  # noqa: BLE001 — a broken ledger must not break the session
         # stdout is the hook protocol, so the only channel left is stderr:
         # silence here means the budget nudge is dead with no way to find out.

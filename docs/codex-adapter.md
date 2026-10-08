@@ -5,9 +5,11 @@ server and fail-open Stop/SubagentStop hooks. Use `--runtime codex` on every CLI
 reporting command; the Codex MCP configuration sets TOKEN_USAGE_RUNTIME=codex.
 Existing Claude and Cursor defaults and manifests remain independent.
 
-Requires Python 3.9+. The MCP launcher uses `python` on PATH; the hook uses
-`python3` on macOS/Linux and `python` on Windows. A virtual environment can provide
-the `python` alias where the OS does not. Review hooks through `/hooks` after
+Requires Python 3.9+. The MCP launcher uses `python3` on PATH (macOS and most
+Linux distributions ship no bare `python`); the hook uses `python3` on macOS/Linux
+and `python` on Windows. On Windows, the Python install manager provides `python3`;
+with the legacy python.org installer, add a `python3` alias or use a virtual
+environment. Review hooks through `/hooks` after
 installing; installation never grants hook trust.
 
 The legacy MCP config uses `cwd: "."`, resolved by Codex against the installed
@@ -61,7 +63,7 @@ Tests use synthetic data and isolated homes.
 
 ## Verification
 
-`python -m pytest tests/test_codex.py -q -W error` covers native and older usage
+`python3 -m pytest tests/test_codex.py -q -W error` covers native and older usage
 streams, deduplication, cache/reasoning accounting, model changes, child rollups,
 archives, selectors, reports, MCP, hooks, CLI, resets and package resources.
 Run the complete suite and Ruff before release.

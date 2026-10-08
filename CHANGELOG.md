@@ -21,8 +21,22 @@ adheres to [Semantic Versioning](https://semver.org/).
 - Five-host support matrix, installation paths, verification evidence and privacy
   documentation. Gemini/Copilot integrations target the CLI products.
 
+- Grok Build, VS Code agent plugins and generic MCP client install paths in the
+  README; Grok Build loads the Claude plugin unchanged.
+- `NOTICE` with the Wicked Sick Limited credit request (the licence stays standard
+  MIT), `docs/marketplaces.md`, and `.gitleaksignore` for a reviewed test-fixture
+  false positive.
+- Manifest listing metadata: Codex author contact, homepage, keywords, privacy URL
+  and starter prompts; Cursor and Copilot homepage and keywords.
+
 ### Fixed
 
+- Gemini, Copilot and Codex MCP servers launched `python`, which macOS and most
+  Linux distributions do not provide, so the server installed but never connected
+  (Gemini reported it Disconnected). Every manifest now launches `python3`.
+- Codex hooks no longer repoint `latest.json`, the Claude Code statusline fallback
+  (#18).
+- Regression test that the Cursor MCP server pins `TOKEN_USAGE_RUNTIME=cursor` (#17).
 - Codex MCP startup: resolve the server script from a plugin-relative working
   directory instead of passing an unexpanded `${PLUGIN_ROOT}` argument to Python.
 - Fill the Codex plugin listing's description, publisher and website fields.

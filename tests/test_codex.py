@@ -219,3 +219,17 @@ def test_missing_native_counters_never_become_exact_zero(tu, tmp_path, monkeypat
     rows.append(event("token_usage_record", {"response_id": "valid-zero", "usage": usage(0, 0, 0)}))
     write_jsonl(path, rows)
     assert tu.parse_codex_session(path)["measurement"] == "partial"
+
+
+def test_codex_hook_does_not_repoint_claude_latest(tu, tmp_path, monkeypatch):
+    # Issue #18: latest.json is the Claude Code statusline fallback, so a
+    # Codex turn must leave it pointing at the last Claude ledger.
+    p = make_rollout(tmp_path, monkeypatch)
+    root = tu.ledger_dir()
+    root.mkdir(parents=True, exist_ok=True)
+    claude = root / "claude-1.json"
+    claude.write_text("{}")
+    (root / "latest.json").symlink_to(claude)
+    assert tu._run_hook({"session_id": "thread-1", "transcript_path": str(p)}, runtime="codex") == 0
+    assert (root / "codex-thread-1.json").is_file()
+    assert (root / "latest.json").resolve() == claude.resolve()
