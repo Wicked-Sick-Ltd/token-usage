@@ -6,11 +6,14 @@ through the **developer portal**: claude.ai/directory/manage → **Submit new** 
 https://claude.com/docs/plugins/submit and the automated checks at
 https://claude.com/docs/plugins/pre-submission-checklist.
 
-**Portal procedure last verified:** 2026-10-03 for 0.7.0.
+**Portal procedure last verified:** 2026-10-08 for the 0.8.0 candidate.
 
-**Current candidate:** 0.8.0, unreleased. Local five-host checks and limits are in
-the runtime guides. Merge, release publication and portal resubmission are pending;
-this document does not record an approved or completed submission.
+**Current candidate:** 0.8.0, unreleased. Local checks on 2026-10-08 covered Claude
+Code (`claude plugin validate .`), Codex, Gemini CLI, Copilot CLI and Grok Build
+installs; limits are in the runtime guides. Merge, the v0.8.0 release, the
+marketplace pin bump and the portal resubmission are pending; this document does
+not record an approved or completed submission. Other directories are covered in
+[docs/marketplaces.md](docs/marketplaces.md).
 
 The earlier Claude Console plugin form and the claude.ai admin-settings form are no
 longer supported. An earlier submission made through them has to be withdrawn or moved
@@ -91,7 +94,9 @@ dependencies, no network calls, no telemetry.
 
 The same repository also packages the plugin for Codex (`.codex-plugin/`) and Cursor
 (`.cursor-plugin/`), Gemini CLI (`gemini-extension.json`) and GitHub Copilot CLI
-(`.plugin/`); this directory listing covers the Claude Code plugin.
+(`.plugin/`), and Grok Build installs the Claude plugin unchanged; this directory
+listing covers the Claude Code plugin. It is free, pro bono software from Wicked Sick
+Limited under the MIT licence.
 
 ### Example use cases
 

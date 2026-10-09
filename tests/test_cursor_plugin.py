@@ -25,6 +25,8 @@ def test_cursor_plugin_manifest_registers_mcp_skills_and_hooks():
     srv = cfg["mcpServers"]["token-usage"]
     assert srv["command"] == "python3"
     assert srv["args"] == ["${CURSOR_PLUGIN_ROOT}/scripts/mcp_server.py"]
+    # Issue #17: inside Cursor the MCP tools must default to Cursor sessions.
+    assert srv["env"]["TOKEN_USAGE_RUNTIME"] == "cursor"
     assert (PLUGIN_ROOT / "scripts" / "mcp_server.py").is_file()
 
     hooks_path = cfg["hooks"]

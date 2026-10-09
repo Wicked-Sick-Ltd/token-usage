@@ -1,7 +1,8 @@
 # Gemini CLI and GitHub Copilot CLI
 
 Both hosts use the existing local Python analyser and its five stdio MCP tools.
-Install Python 3.9+ with a working `python` command. No Python dependencies are
+Install Python 3.9+ with a working `python3` command (both manifests launch
+`python3`, because macOS and most Linux distributions ship no bare `python`). No Python dependencies are
 required. These integrations target the CLI products, not Gemini web chat,
 Gemini Code Assist, Copilot web chat, or the VS Code Copilot extension.
 
@@ -81,9 +82,9 @@ running. This plugin does not add Copilot budget notifications.
 ## Reporting
 
 ```bash
-python scripts/token_usage.py report --runtime gemini --models --agents
-python scripts/token_usage.py history --runtime copilot --since 7d
-python scripts/token_usage.py live --runtime copilot --iterations 1
+python3 scripts/token_usage.py report --runtime gemini --models --agents
+python3 scripts/token_usage.py history --runtime copilot --since 7d
+python3 scripts/token_usage.py live --runtime copilot --iterations 1
 ```
 
 Both runtimes also support JSON reports, comparisons, insights, top consumers,

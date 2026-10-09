@@ -6,7 +6,7 @@ and is no longer updated.
 
 ## Start here
 
-- [README](../README.md): what token-usage is, installation for Claude Code, Codex, Cursor, Gemini CLI and Copilot CLI, every CLI command, the MCP server, configuration, insights, cost disclaimer and
+- [README](../README.md): what token-usage is, installation for Claude Code, Codex, Cursor, Gemini CLI, Copilot CLI, Grok Build, VS Code agent plugins and any MCP client, every CLI command, the MCP server, configuration, insights, cost disclaimer and
   limitations.
 - [Use cases](use-cases.md): the problem token-usage solves and the questions it answers.
 - [Architecture](architecture.md): how the code is laid out, how a report is built, and
@@ -24,6 +24,8 @@ and is no longer updated.
 ## Project records
 
 - [CHANGELOG](../CHANGELOG.md): every release.
+- [Marketplaces](marketplaces.md): where token-usage is listed, each directory's
+  requirements and the resubmission checklist.
 - [Contributing](../CONTRIBUTING.md) and [Security policy](../SECURITY.md).
 - [Documentation audit](DOCS-AUDIT.md): the claim-by-claim check of these documents
   against the code.

@@ -2,8 +2,23 @@
   "name": "token-usage",
   "version": "0.8.0",
   "description": "Local Codex token accounting by turn, explicit skill and model, with history, insights, live reports, exports and a bundled MCP server.",
-  "author": {"name": "Craig Fletcher"},
+  "author": {
+    "name": "Wicked Sick Limited",
+    "email": "craig@wickedsick.com",
+    "url": "https://github.com/Wicked-Sick-Ltd"
+  },
+  "homepage": "https://github.com/Wicked-Sick-Ltd/token-usage#readme",
+  "repository": "https://github.com/Wicked-Sick-Ltd/token-usage",
   "license": "MIT",
+  "keywords": [
+    "tokens",
+    "usage",
+    "cost",
+    "profiler",
+    "observability",
+    "codex",
+    "mcp"
+  ],
   "skills": "./codex-skills/",
   "mcpServers": "./.mcp-codex.json",
   "hooks": "./hooks/hooks-codex.json",
@@ -13,6 +28,11 @@
     "longDescription": "Inspect token usage by turn, skill and model, compare sessions, and track local usage history. Costs are API-equivalent estimates, not subscription charges. Requires Python 3.9+ on PATH.",
     "developerName": "Wicked Sick Limited",
     "category": "Developer Tools",
-    "websiteURL": "https://github.com/Wicked-Sick-Ltd/token-usage"
+    "websiteURL": "https://github.com/Wicked-Sick-Ltd/token-usage",
+    "privacyPolicyURL": "https://github.com/Wicked-Sick-Ltd/token-usage#privacy-and-data-handling",
+    "defaultPrompt": [
+      "Where did my tokens go this session?",
+      "Which Codex sessions cost the most this week?"
+    ]
   }
 }

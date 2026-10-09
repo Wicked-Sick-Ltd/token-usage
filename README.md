@@ -1,6 +1,6 @@
 # token-usage
 
-**Where did my tokens go?** A public MIT plugin for **Claude Code**, **Codex**, **Cursor**, **Gemini CLI** and **GitHub Copilot CLI** that attributes token usage to the work that consumed it — per-activity breakdowns (slash commands and skills in Claude Code and Cowork, turns and skills in Codex, composer generations in Cursor), subagent rollups, cross-session history, optional live ledgers, and cache-aware API-price estimates.
+**Where did my tokens go?** A free, public MIT plugin from Wicked Sick Limited for **Claude Code**, **Codex**, **Cursor**, **Gemini CLI** and **GitHub Copilot CLI** (it also installs unchanged in **Grok Build**, VS Code agent plugins and any MCP client) that attributes token usage to the work that consumed it — per-activity breakdowns (slash commands and skills in Claude Code and Cowork, turns and skills in Codex, composer generations in Cursor), subagent rollups, cross-session history, optional live ledgers, and cache-aware API-price estimates.
 
 📖 **Documentation:** this README and the [`docs/`](docs/README.md) folder are the documentation — [use cases](docs/use-cases.md), [architecture and configuration](docs/architecture.md), and the [Codex](docs/codex-adapter.md) and [Cursor](docs/cursor-adapter.md) runtime notes.
 
@@ -24,8 +24,10 @@ Claude Code tells you session totals (`/cost`, OTel metrics) and tools like ccus
 | Cursor | Hook ledger, Desktop SQLite, explicit Cloud export | Uses recorded usage when present; activity-only when the host omits counters. |
 | Gemini CLI | Native JSON/JSONL recordings | User activity labels, nested child rollups; direct polling for live reports. No Stop-hook budget nudges. |
 | GitHub Copilot CLI | Native events plus a small capture extension | Per-call labels and subagent subsets with `--experimental`; uncaptured shutdown totals have partial attribution. |
+| Grok Build | Loads the Claude plugin unchanged | MCP tools and the report skill work and analyse your Claude Code, Codex, Cursor, Gemini and Copilot sessions. Grok's own sessions are not attributed yet, and the Stop hook is a silent no-op there. |
+| VS Code agent plugins / any MCP client | The bundled stdio MCP server | The five reporting tools over whichever runtime you name with `runtime`. No hooks. |
 
-All five runtimes support the report/history/insights/comparison tools and CLI
+All five native runtimes support the report/history/insights/comparison tools and CLI
 live/dashboard/export commands. Token counts depend on the host's recorded fields;
 unknown prices remain unknown. Copilot support targets its CLI, and Gemini support
 targets Gemini CLI. See [Gemini/Copilot setup and verification](docs/gemini-copilot.md),
@@ -81,10 +83,8 @@ JavaScript collector using its bundled SDK and Node standard library.
 | Claude Code | `~/.claude/projects/<project-slug>/<session-id>.jsonl`, plus subagent transcripts and their `.meta.json` files under `<session-id>/subagents/` | `TOKEN_USAGE_PROJECTS_DIR` |
 | Cowork | the read-only sandbox mount `~/mnt/.claude/projects/…` and `/sessions/*/mnt/.claude/projects/…` | — |
 | Cursor | the hook ledgers below; Cursor Desktop's `state.vscdb`, opened with SQLite `mode=ro`, and `workspaceStorage/*/workspace.json` under Cursor's user directory; a Cloud Agent export `.json` only when you pass its path | `TOKEN_USAGE_CURSOR_DIR` |
-| Codex | rollout JSONL under `$CODEX_HOME/sessions` and `archived_sessions` (default `~/.codex`) | `TOKEN_USAGE_GEMINI_HOME` | `~/.gemini` (or `$GEMINI_CLI_HOME/.gemini`) | Gemini recording root. |
-| `TOKEN_USAGE_COPILOT_HOME` | `$COPILOT_HOME`, else `~/.copilot` | Copilot reader root; the collector follows `COPILOT_HOME`. |
-| `TOKEN_USAGE_CODEX_HOME` |
-| Gemini CLI | `~/.gemini/tmp/*/chats/` JSON and JSONL recordings | `TOKEN_USAGE_GEMINI_HOME` |
+| Codex | rollout JSONL under `$CODEX_HOME/sessions` and `archived_sessions` (default `~/.codex`) | `TOKEN_USAGE_CODEX_HOME` |
+| Gemini CLI | `~/.gemini/tmp/*/chats/` JSON and JSONL recordings (or `$GEMINI_CLI_HOME/.gemini`) | `TOKEN_USAGE_GEMINI_HOME` |
 | Copilot CLI | `~/.copilot/session-state/*/events.jsonl` and `~/.copilot/token-usage/*.jsonl` | `TOKEN_USAGE_COPILOT_HOME`, else `COPILOT_HOME` |
 | All | the bundled `data/pricing.json` and your optional overlay `~/.config/token-usage/pricing.json` (honours `XDG_CONFIG_HOME`) | — |
 
@@ -98,7 +98,8 @@ and label activities. It reads no credentials or auth files.
   aggregate the Stop/SubagentStop hooks keep current. It holds token counts, cost
   estimates, activity labels (slash command, skill or agent names), the transcript path,
   and **the first 120 characters of the prompt that opened each segment**.
-- `latest.json`: a best-effort symlink to the most recently written session aggregate.
+- `latest.json`: a best-effort symlink to the most recently written Claude Code session
+  aggregate (the statusline fallback). Codex ledgers never repoint it.
 - `index/`: the per-transcript summary cache used by `history`, `insights`,
   `top_consumers`, `dashboard` and `export`. It holds transcript paths, project names,
   activity labels and token/cost totals.
@@ -134,7 +135,21 @@ remove it; deleting `~/.cache/token-usage/` (or your `TOKEN_USAGE_LEDGER_DIR`) r
 
 ## Installation
 
-Requires Python 3.9+ (`python3` for Claude/Cursor; `python` for Codex/Gemini/Copilot, stdlib only — no dependencies).
+Requires Python 3.9+ reachable as `python3` on PATH (standard library only, no
+dependencies). Every host manifest launches `python3`. macOS, Linux and the Windows
+Python install manager provide it; with the legacy python.org Windows installer, use
+the `py` launcher or add a `python3` alias.
+
+| Host | Install | Status |
+|---|---|---|
+| Claude Code | `claude plugin install token-usage@wickedsick` | Wicked Sick marketplace; Anthropic directory resubmission pending |
+| Codex | `codex plugin add token-usage@wickedsick` | Wicked Sick marketplace |
+| Cursor | Cursor Marketplace, or manual MCP | Marketplace listing pending |
+| Gemini CLI | `gemini extensions install https://github.com/Wicked-Sick-Ltd/token-usage` | Direct from GitHub |
+| GitHub Copilot CLI | `copilot plugin install token-usage@wickedsick` | Wicked Sick marketplace |
+| Grok Build | `grok plugin install Wicked-Sick-Ltd/token-usage --trust` | Direct from GitHub |
+| VS Code agent plugins | `chat.plugins.marketplaces` | Wicked Sick marketplace |
+| Any MCP client | stdio `python3 scripts/mcp_server.py` | Manual |
 
 ### Claude Code
 
@@ -222,9 +237,59 @@ copilot --experimental
 
 Gemini discovers the report skill and MCP server through `gemini-extension.json`.
 Copilot uses `.plugin/plugin.json`; experimental extensions capture its transient
-usage events. The expanded integrations are unreleased. Use the checkout until the
-new release and marketplace pins are published. See
+usage events. Once 0.8.0 is released, Gemini also installs straight from GitHub
+(`gemini extensions install https://github.com/Wicked-Sick-Ltd/token-usage`) and Copilot
+from the marketplace (`copilot plugin marketplace add Wicked-Sick-Ltd/ai-marketplace`,
+then `copilot plugin install token-usage@wickedsick`). Until then, use the checkout. See
 [installation, privacy and limits](docs/gemini-copilot.md).
+
+### Grok Build
+
+Grok Build reads Claude Code plugins natively, so the Claude plugin installs unchanged:
+
+```bash
+grok plugin install Wicked-Sick-Ltd/token-usage --trust
+# or through the Wicked Sick marketplace
+grok plugin marketplace add Wicked-Sick-Ltd/ai-marketplace
+grok plugin install token-usage@wickedsick --trust
+grok mcp doctor          # token-usage should report 5 tools
+```
+
+The MCP tools and `/token-usage:report` work in Grok and report on your Claude Code,
+Codex, Cursor, Gemini and Copilot sessions (pass `runtime`). Grok's own sessions are not
+attributed yet: Grok's Stop hook sends no `transcript_path`, so the hook exits 0 without
+writing anything. For Grok's own spend, use `grok usage <session-id>`.
+
+### VS Code agent plugins
+
+With `chat.plugins.enabled` on, add the Wicked Sick marketplace to your settings and
+install **token-usage** from the Extensions view (`@agentPlugins`):
+
+```json
+"chat.plugins.marketplaces": ["Wicked-Sick-Ltd/ai-marketplace"]
+```
+
+VS Code reads the Claude and Copilot plugin formats. You get the MCP tools and the
+report skill; VS Code Copilot Chat's own usage is not attributed yet.
+
+### Any MCP client
+
+The server is a stdlib stdio process, so any MCP client can launch it:
+
+```json
+{
+  "mcpServers": {
+    "token-usage": {
+      "command": "python3",
+      "args": ["/absolute/path/to/token-usage/scripts/mcp_server.py"],
+      "env": {"TOKEN_USAGE_RUNTIME": "auto"}
+    }
+  }
+}
+```
+
+Set `TOKEN_USAGE_RUNTIME` to the runtime you want by default (`claude`, `codex`,
+`cursor`, `gemini`, `copilot` or `auto`), or pass `runtime` per call.
 
 ## Usage
 
@@ -524,10 +589,6 @@ Details: [docs/cursor-adapter.md](docs/cursor-adapter.md).
 - The pricing table holds one rate per model, so time-limited introductory or promotional prices are not modelled; edit the overlay when a rate changes.
 - In Cowork the hooks don't run, so there is no live ledger, statusline or budget nudge there; reports parse the sandbox-mounted transcript on demand instead.
 
-## License
-
-MIT
-
 <!-- repository-guidance:begin -->
 ## Contributing and agent guidance
 
@@ -540,13 +601,9 @@ MIT
 MIT licensed; see [LICENSE](LICENSE). Preserve third-party notices.
 <!-- repository-guidance:end -->
 
-## Codex
+## Licence and credit
 
-Native Codex plugin support includes the report skill, local MCP server, Stop hooks, and
-`--runtime codex` across reports, history, insights, comparisons, live views, dashboards
-and exports. Reads local rollouts and rolls linked subagents into their parent once.
-See [setup, accounting and limitations](docs/codex-adapter.md).
-
-## Credit
-
-Released under the MIT licence by Wicked Sick Limited. You are free to use, modify and redistribute it; please keep the copyright notice and credit Wicked Sick Limited.
+token-usage is free, pro bono software. Copyright (c) 2026 Wicked Sick Limited,
+released under the [MIT licence](LICENSE). You are free to use, modify and redistribute
+it; please keep the copyright notice and credit Wicked Sick Limited (see
+[NOTICE](NOTICE)).

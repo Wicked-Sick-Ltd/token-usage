@@ -1,0 +1,4 @@
+# False positive: a model id string ("claude-mystery-9") under a "key" field in
+# a synthetic dashboard test fixture, not a credential. Reviewed 2026-10-08.
+f4078277e79c007993e0cb595bb95f924a2a8777:tests/test_dashboard.py:generic-api-key:674
+tests/test_dashboard.py:generic-api-key:674

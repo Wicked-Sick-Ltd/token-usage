@@ -2,7 +2,7 @@
 
 ## Project Structure
 
-Claude Code plugin: per-command token usage attribution — where did my tokens go? Subagent rollups, live session ledger, cache-aware cost estimates.
+Cross-agent token usage plugin (Claude Code, Codex, Cursor, Gemini CLI, GitHub Copilot CLI; installs unchanged in Grok Build and any MCP client): per-activity token attribution, subagent rollups, live session ledger, cache-aware cost estimates. MIT, copyright Wicked Sick Limited.
 
 - `tests/` — automated tests and fixtures.
 - `scripts/` — development and operational scripts.
