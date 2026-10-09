@@ -1,5 +1,20 @@
 # Documentation audit — 2026-10-03
 
+2026-10-09 addendum: user-doc gap pass against `scripts/token_usage.py` and
+`scripts/mcp_server.py` at `868ef04` (before this change). Already present: host
+install sections, a feature list, CLI examples, an MCP tool summary, a
+configuration table, runtime notes, and contributor issue guidance in
+CONTRIBUTING.md. Added on this pass: a README quick start, a short "What it
+does" summary, [docs/reference.md](reference.md) (CLI flags, rejected
+combinations, MCP arguments; local stdio only), the environment variables the
+scripts read that the table omitted (`GEMINI_SESSION_ID`, `GEMINI_CLI_HOME`,
+`CODEX_HOME`, `COPILOT_HOME`, `CLAUDE_PROJECT_DIR`, `APPDATA`), the pricing
+overlay shape, platform defaults for the Cursor data directory, and a GitHub
+Issues section for bugs and feature requests (security stays in SECURITY.md).
+The Gemini and Copilot rows in the install table now match the
+checkout-until-published steps already written further down the README. The
+historical tables below were not re-checked line by line.
+
 2026-10-05 addendum: the unreleased five-host work adds Gemini/Copilot CLI
 integration, fixes the Codex launcher/listing, and updates README, architecture,
 installation and privacy disclosures. See [Gemini/Copilot verification](gemini-copilot.md)

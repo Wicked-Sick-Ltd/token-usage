@@ -2,9 +2,9 @@
 
 **Where did my tokens go?** A free, public MIT plugin from Wicked Sick Limited for **Claude Code**, **Codex**, **Cursor**, **Gemini CLI** and **GitHub Copilot CLI** (it also installs unchanged in **Grok Build**, VS Code agent plugins and any MCP client) that attributes token usage to the work that consumed it — per-activity breakdowns (slash commands and skills in Claude Code and Cowork, turns and skills in Codex, composer generations in Cursor), subagent rollups, cross-session history, optional live ledgers, and cache-aware API-price estimates.
 
-📖 **Documentation:** this README and the [`docs/`](docs/README.md) folder are the documentation — [use cases](docs/use-cases.md), [architecture and configuration](docs/architecture.md), and the [Codex](docs/codex-adapter.md) and [Cursor](docs/cursor-adapter.md) runtime notes.
+📖 **Documentation:** this README (quick start, what the plugin does, install, configuration) and the [`docs/`](docs/README.md) folder. The [CLI and MCP reference](docs/reference.md) lists every flag and tool argument. Also: [use cases](docs/use-cases.md), [architecture](docs/architecture.md), and the [Codex](docs/codex-adapter.md), [Cursor](docs/cursor-adapter.md) and [Gemini/Copilot](docs/gemini-copilot.md) notes.
 
-Claude Code tells you session totals (`/cost`, OTel metrics) and tools like ccusage aggregate by day/model — but nothing answers *"the PR review cost 120k tokens, the refactor cost 800k"*. token-usage fills that gap.
+Claude Code tells you session totals (`/cost`, OTel metrics) and tools like ccusage aggregate by day/model, but nothing answers *"the PR review cost 120k tokens, the refactor cost 800k"*. token-usage fills that gap.
 
 ```
 | Activity                      | Calls | Output | Input | Cache read | Cache write | Est. cost |
@@ -14,6 +14,30 @@ Claude Code tells you session totals (`/cost`, OTel metrics) and tools like ccus
 | `/commit`                     |     2 |   2.4k |  0.8k |     310.0k |       18.0k |     $0.27 |
 | **Total**                     |       |  214k  | 13.8k |      46.1M |        1.5M |    $33.87 |
 ```
+
+## Quick start
+
+You need Python 3.9 or newer, available as `python3` on your PATH. The script uses only the Python standard library, so there is nothing else to install for the analyser itself.
+
+From a checkout of this repository:
+
+```bash
+python3 scripts/token_usage.py report
+```
+
+That prints a per-activity table for the newest session it can find for the current directory. Pass a recording path when you want one session in particular. Pass `--runtime cursor`, `codex`, `gemini` or `copilot` when that session is not a Claude Code transcript.
+
+To ask from inside an agent, install the plugin for that host ([Installation](#installation)), then ask "where did my tokens go this session?" or run `/token-usage:report` where the report skill is loaded.
+
+## What it does
+
+token-usage reads usage the agent host has already recorded on this machine and attributes it to the work that consumed it. It does not call a model, and it does not send usage anywhere.
+
+- **One session.** Which command, skill, turn or activity used the tokens, with subagents rolled into the work that spawned them.
+- **Across sessions.** History by project, day, command or model; the costliest sessions or labels; rule-based insights.
+- **Optional views.** A terminal live view, one HTML file, and a JSONL export. Those three are command-line commands. The MCP server exposes the five reporting tools.
+
+Figures are estimates at published API prices, not a subscription invoice. The host table below is what each client can measure. Claude Code detail is under [Features](#features). Per-flag and per-tool detail is in the [reference](docs/reference.md).
 
 ## Host support
 
@@ -135,18 +159,29 @@ remove it; deleting `~/.cache/token-usage/` (or your `TOKEN_USAGE_LEDGER_DIR`) r
 
 ## Installation
 
-Requires Python 3.9+ reachable as `python3` on PATH (standard library only, no
-dependencies). Every host manifest launches `python3`. macOS, Linux and the Windows
-Python install manager provide it; with the legacy python.org Windows installer, use
-the `py` launcher or add a `python3` alias.
+Requires Python 3.9 or newer. The analyser uses only the standard library.
+
+### Platforms
+
+macOS and Linux need `python3` on PATH. On Windows, the Python install manager provides `python3`. With the legacy python.org installer, use the `py` launcher or add a `python3` alias. Every MCP launcher runs `python3`. The Codex hook on Windows runs `python`, from `commandWindows` in `hooks/hooks-codex.json`. The Cursor, Codex, Gemini and Copilot MCP entries set `PYTHONUTF8=1` so that process uses UTF-8 on Windows.
+
+When `TOKEN_USAGE_CURSOR_DIR` is unset, Cursor Desktop data is read from:
+
+| Platform | Default Cursor user directory |
+|---|---|
+| macOS | `~/Library/Application Support/Cursor/User` |
+| Linux | `~/.config/Cursor/User` |
+| Windows | `%APPDATA%\Cursor\User`, or `~/AppData/Roaming/Cursor/User` when `APPDATA` is unset |
+
+Claude Code on Windows can use the PowerShell statusline under [Statusline](#statusline-optional).
 
 | Host | Install | Status |
 |---|---|---|
 | Claude Code | `claude plugin install token-usage@wickedsick` | Wicked Sick marketplace; Anthropic directory resubmission pending |
 | Codex | `codex plugin add token-usage@wickedsick` | Wicked Sick marketplace |
 | Cursor | Cursor Marketplace, or manual MCP | Marketplace listing pending |
-| Gemini CLI | `gemini extensions install https://github.com/Wicked-Sick-Ltd/token-usage` | Direct from GitHub |
-| GitHub Copilot CLI | `copilot plugin install token-usage@wickedsick` | Wicked Sick marketplace |
+| Gemini CLI | `gemini extensions install /absolute/path/to/token-usage` | Checkout until 0.8.0 is published; GitHub URL after that |
+| GitHub Copilot CLI | `copilot plugin install /absolute/path/to/token-usage` | Checkout until 0.8.0 is published; then `token-usage@wickedsick` |
 | Grok Build | `grok plugin install Wicked-Sick-Ltd/token-usage --trust` | Direct from GitHub |
 | VS Code agent plugins | `chat.plugins.marketplaces` | Wicked Sick marketplace |
 | Any MCP client | stdio `python3 scripts/mcp_server.py` | Manual |
@@ -293,6 +328,8 @@ Set `TOKEN_USAGE_RUNTIME` to the runtime you want by default (`claude`, `codex`,
 
 ## Usage
 
+Flag defaults, combinations the script rejects, and every MCP argument are in the [CLI and MCP reference](docs/reference.md).
+
 ### `/token-usage:report`
 
 Ask for a breakdown any time:
@@ -394,7 +431,7 @@ Polls every `--interval` seconds (default 2), re-rendering the session report ea
 
 ### Structured export (`export`)
 
-Emits one RFC-8259 JSON object per line with schema `token-usage.aggregate.v1` and OTel-style metric names (for example `gen_ai.usage.output_tokens`, `gen_ai.estimated_cost.usd`). This is a stable local interchange format — **not** OTLP protobuf/HTTP. Default scope is `history` (grouped by project); `--scope session` emits one `total` row plus one row per activity label. `gen_ai.estimated_cost.usd` is JSON `null` when unpriced or unmeasured. Lines include project slugs, command labels, and model IDs — redact before sharing. File output uses atomic replace; stdout streams directly.
+Emits one RFC-8259 JSON object per line with schema `token-usage.aggregate.v1` and OTel-style metric names (for example `gen_ai.usage.output_tokens`, `gen_ai.estimated_cost.usd`). This is a local JSONL interchange format. It is separate from OTLP protobuf and from any HTTP export. Default scope is `history` (grouped by project). Default output is stdout (`--output -`); a file path is replaced atomically. `--scope session` emits one `total` row plus one row per activity label. Session scope rejects `--by`, `--since` and `--project`. History scope rejects a positional recording path. `gen_ai.estimated_cost.usd` is JSON `null` when unpriced or unmeasured. Lines include project slugs, command labels, and model IDs, so redact them before sharing.
 
 History-scope records also carry `measurement_counts`, the scan's per-session tally (for example `{"exact": 99, "activity_only": 1}`). `measurement` alone is the worst level any session reported, so it cannot tell one weak session from a corpus nobody measured, nor either from a scan that matched nothing — an empty tally is how you spot the last case. Session-scope records cover one session and carry no tally.
 
@@ -502,8 +539,7 @@ history the CLI does. No caching in-process: pricing overlay edits apply on the 
 
 ## Configuration
 
-token-usage has no config file. Optional environment variables (all read from
-`scripts/token_usage.py` or `scripts/mcp_server.py`):
+Settings are the environment variables below, plus the optional pricing overlay. The table lists every name read from `scripts/token_usage.py` or `scripts/mcp_server.py`:
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -512,13 +548,31 @@ token-usage has no config file. Optional environment variables (all read from
 | `TOKEN_USAGE_PROJECTS_DIR` | `~/.claude/projects` | Claude Code transcript root. |
 | `TOKEN_USAGE_TRANSCRIPT` | unset | Transcript to use when no path or session id is given. |
 | `TOKEN_USAGE_RUNTIME` | `claude` | Default `--runtime` for the CLI and the MCP server. |
-| `TOKEN_USAGE_PROJECT_DIR` | unset | MCP only: project to anchor "current session" on (the Claude manifest sets it from `${CLAUDE_PROJECT_DIR}`); falls back to `CLAUDE_PROJECT_DIR`. |
-| `TOKEN_USAGE_CURSOR_DIR` | Cursor's user directory for the OS | Cursor Desktop data root. |
-| `TOKEN_USAGE_GEMINI_HOME` | `~/.gemini` (or `$GEMINI_CLI_HOME/.gemini`) | Gemini recording root. |
-| `TOKEN_USAGE_COPILOT_HOME` | `$COPILOT_HOME`, else `~/.copilot` | Copilot reader root; the collector follows `COPILOT_HOME`. |
-| `TOKEN_USAGE_CODEX_HOME` | `$CODEX_HOME`, else `~/.codex` | Codex home holding `sessions/` and `archived_sessions/`. |
+| `TOKEN_USAGE_PROJECT_DIR` | unset | MCP only: project to anchor "current session" on (the Claude manifest sets it from `${CLAUDE_PROJECT_DIR}`). Read before `CLAUDE_PROJECT_DIR`. |
+| `CLAUDE_PROJECT_DIR` | set by Claude Code on stdio MCP servers | MCP fallback when `TOKEN_USAGE_PROJECT_DIR` is unset. A blank value, or one that still starts with `${`, counts as unset. |
+| `TOKEN_USAGE_CURSOR_DIR` | Cursor's user directory for the OS | Cursor Desktop data root. See [Platforms](#platforms). On Windows the default uses `APPDATA` when that variable is set. |
+| `APPDATA` | set by Windows | Used only to locate Cursor's user directory when `TOKEN_USAGE_CURSOR_DIR` is unset. |
+| `TOKEN_USAGE_GEMINI_HOME` | unset | Gemini recording root. When unset, recordings are read from `$GEMINI_CLI_HOME/.gemini` or `~/.gemini`. |
+| `GEMINI_CLI_HOME` | home directory | Gemini's own home. Used only when `TOKEN_USAGE_GEMINI_HOME` is unset, as the parent of `.gemini`. |
+| `GEMINI_SESSION_ID` | unset | Gemini session id for current-session discovery when no path or session id was passed. |
+| `TOKEN_USAGE_COPILOT_HOME` | unset | Copilot reader root. When unset, the reader uses `COPILOT_HOME`. |
+| `COPILOT_HOME` | `~/.copilot` | Copilot home. The capture extension follows this variable. The reader uses it when `TOKEN_USAGE_COPILOT_HOME` is unset. |
+| `TOKEN_USAGE_CODEX_HOME` | unset | Codex home holding `sessions/` and `archived_sessions/`. When unset, `CODEX_HOME` is used. |
+| `CODEX_HOME` | `~/.codex` | Codex home. Used only when `TOKEN_USAGE_CODEX_HOME` is unset. Codex sets this. |
 | `CODEX_THREAD_ID` | set by Codex | Current Codex thread, used for current-session discovery. |
 | `XDG_CONFIG_HOME` | `~/.config` | Parent of the user pricing overlay `token-usage/pricing.json`. |
+
+### Pricing overlay
+
+To price a model the bundled table omits, or to replace one bundled rate, create `~/.config/token-usage/pricing.json` (under `$XDG_CONFIG_HOME` when that variable is set):
+
+```json
+{
+  "my-model-id": {"input": 1.0, "output": 5.0, "cache_read": 0.1}
+}
+```
+
+`input` and `output` are required US dollars per million tokens. `cache_read` is optional. Each rate must be a finite number greater than or equal to zero (`0` is a valid free tier). A key replaces the bundled rate for that same key. The analyser matches the longest prefix that ends on a segment boundary, so a dated model id can use the undated key. A malformed file is ignored. An invalid entry is skipped. Either case is reported as a warning, and the remaining rates still apply. The file is read on the next CLI command or MCP call.
 
 ## Insights
 
@@ -532,7 +586,7 @@ $ python3 scripts/token_usage.py insights
 
 Session mode (`insights [transcript]`) checks: cost outlier vs the 30-day project median (warn ≥3×, info ≥2×; needs at least 5 prior sessions), prompt-cache regression per command (warn on a ≥20 percentage-point drop in cache-read ratio vs that command's norm), ad-hoc-work dominance (info at ≥50% of spend), unpriced models (warn), agent fan-out concentration (info at ≥70% of a command's cost coming from its subagents), and budget pace (info at 75–100% of `TOKEN_USAGE_BUDGET_USD`).
 
-Window mode (`insights --since 7d|30d|DATE [--project SUB]`) checks: spend trend between the first and second half of the window (warn ≥+50%, info ≥±25%), the top mover behind an increase (≥30% of it), and unpriced models anywhere in the window.
+Window mode (`insights --since 7d|30d|DATE [--project SUB]`) checks: spend trend between the first and second half of the window (warn ≥+50%, info ≥±25%), the top mover behind an increase (≥30% of it), and unpriced models anywhere in the window. Pass a transcript or `--since`, not both. `--project` applies only with `--since`; without it the command exits with an error.
 
 No findings is a normal, healthy result — the tool prints `No notable findings.` rather than manufacturing something to say. It also says when it *couldn't* fully look: a window that matched no sessions prints `No sessions in window — nothing was scanned.`, and a trailing `(baseline: …)` names rules that were switched off — `(baseline: N prior session(s); the comparison rules need 5)` in session mode when the project has fewer than the five prior sessions rules 1–2 need, and in window mode `(baseline: no sessions in the window's first half; the trend rules need both halves)` when every matched session lands after the window's midpoint, or `(baseline: no spend in the window's first half; …)` when the first half held sessions but no spend. That qualifier is appended whether or not anything fired: several rules need no baseline, so findings are no evidence the rest ran. `--json` returns the same findings as structured data for scripting, with the counts behind the qualifier under `baseline` (`sessions`, and in window mode `first_half_sessions` / `first_half_cost` / `first_half_spend` — the last being the rules' own unrounded predicate).
 
@@ -588,6 +642,16 @@ Details: [docs/cursor-adapter.md](docs/cursor-adapter.md).
 - Attribution granularity is the command or skill segment: a command owns every turn until the next one, and there is no finer per-message split within a segment.
 - The pricing table holds one rate per model, so time-limited introductory or promotional prices are not modelled; edit the overlay when a rate changes.
 - In Cowork the hooks don't run, so there is no live ledger, statusline or budget nudge there; reports parse the sandbox-mounted transcript on demand instead.
+
+## Suggest a feature or report an issue
+
+Bugs and feature requests belong on [GitHub Issues](https://github.com/Wicked-Sick-Ltd/token-usage/issues).
+
+- **Something broke:** open a [bug report](https://github.com/Wicked-Sick-Ltd/token-usage/issues/new?template=bug_report.md). Include the plugin version (the `version` field in the host manifest), the host (Claude Code, Codex, Cursor, Gemini CLI, Copilot CLI, or another MCP client), your OS, and the Python version. For a wrong total, attach a **redacted** transcript snippet: the `usage` blocks and `requestId`s, not the conversation text, plus the table you got and the table you expected.
+- **Something missing:** open a [feature request](https://github.com/Wicked-Sick-Ltd/token-usage/issues/new?template=feature_request.md). Describe who is affected, the behaviour you want, and how you would tell that it works.
+- **A security problem:** do not open a public issue. Use the private report path in [SECURITY.md](SECURITY.md).
+
+The issue templates are [bug_report.md](.github/ISSUE_TEMPLATE/bug_report.md) and [feature_request.md](.github/ISSUE_TEMPLATE/feature_request.md). Development setup, tests, and pricing-table updates are in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 <!-- repository-guidance:begin -->
 ## Contributing and agent guidance
