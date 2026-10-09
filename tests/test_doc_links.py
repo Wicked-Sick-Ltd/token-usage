@@ -4,6 +4,8 @@ Covers the README, the contributor/security/submission docs and docs/*.md. The d
 records under docs/superpowers/ are historical and are not checked.
 """
 import re
+import subprocess
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -56,6 +58,61 @@ def test_local_doc_links_resolve():
             if anchor and dest.suffix == ".md" and anchor not in anchors(dest):
                 broken.append(f"{doc.relative_to(ROOT)}: {target} (missing anchor)")
     assert not broken, "\n".join(broken)
+
+
+def test_user_docs_cover_the_expected_sections():
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    for heading in ("## Quick start\n", "## What it does\n", "## Installation\n",
+                    "### Platforms\n", "## Configuration\n",
+                    "## Suggest a feature or report an issue\n"):
+        assert heading in readme
+    assert "docs/reference.md" in readme
+    reference = (ROOT / "docs" / "reference.md").read_text(encoding="utf-8")
+    for name in ("report", "json", "history", "insights", "top_consumers",
+                 "dashboard", "live", "export", "session_cost", "diff"):
+        assert name in reference
+    index = (ROOT / "docs" / "README.md").read_text(encoding="utf-8")
+    assert "reference.md" in index
+
+
+def test_readme_configuration_names_every_env_var_the_scripts_read():
+    names = set()
+    for path in (ROOT / "scripts").glob("*.py"):
+        text = path.read_text(encoding="utf-8")
+        names.update(re.findall(r'os\.environ(?:\.get)?\(\s*["\']([A-Z0-9_]+)["\']', text))
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    start = readme.index("## Configuration\n")
+    rest = readme[start:]
+    end = rest.find("\n## ", len("## Configuration\n"))
+    section = rest[:end]
+    missing = sorted(name for name in names if name not in section)
+    assert not missing, missing
+
+
+def test_reference_mentions_every_cli_flag():
+    """docs/reference.md stays aligned with argparse, including flags --help hides the meaning of."""
+    reference = (ROOT / "docs" / "reference.md").read_text(encoding="utf-8")
+    script = ROOT / "scripts" / "token_usage.py"
+    top = subprocess.run([sys.executable, str(script), "--help"],
+                         check=True, capture_output=True, text=True)
+    commands = re.findall(r"\{([a-z0-9_,-]+)\}", top.stdout)
+    assert commands, top.stdout
+    missing = []
+    for group in commands:
+        for cmd in group.split(","):
+            if cmd not in reference:
+                missing.append(cmd)
+            help_out = subprocess.run(
+                [sys.executable, str(script), cmd, "--help"],
+                check=True, capture_output=True, text=True).stdout
+            for line in help_out.splitlines():
+                stripped = line.strip()
+                if not stripped.startswith("--"):
+                    continue
+                flag = stripped.split()[0].split("[")[0]
+                if flag not in reference:
+                    missing.append(f"{cmd} {flag}")
+    assert not missing, missing
 
 
 def test_slug_matches_github_style():

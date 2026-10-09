@@ -54,7 +54,10 @@ only the turns before the session's first command.
 9. **Asking without a shell.** With the plugin enabled, the bundled MCP server answers
    "where did my tokens go?" or "which sessions cost the most this month?" through the
    `session_cost`, `insights` and `top_consumers` tools.
-10. **The same questions in Codex and Cursor.** `--runtime codex` and `--runtime cursor`
-    run the same reports over Codex rollouts and Cursor sessions; see the
-    [Codex](codex-adapter.md) and [Cursor](cursor-adapter.md) notes for what each can
-    measure.
+10. **The same questions on the other hosts.** `--runtime codex`, `cursor`, `gemini`
+    or `copilot` runs the reports over that host's local recordings. See the
+    [Codex](codex-adapter.md), [Cursor](cursor-adapter.md) and
+    [Gemini and Copilot](gemini-copilot.md) notes for what each can measure.
+    Gemini has no Stop-hook budget nudge. Copilot can recover a shutdown total
+    when the capture extension missed the calls, and that recovered portion is
+    labelled `partial`.

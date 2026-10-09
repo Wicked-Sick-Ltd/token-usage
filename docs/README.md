@@ -6,8 +6,8 @@ and is no longer updated.
 
 ## Start here
 
-- [README](../README.md): what token-usage is, installation for Claude Code, Codex, Cursor, Gemini CLI, Copilot CLI, Grok Build, VS Code agent plugins and any MCP client, every CLI command, the MCP server, configuration, insights, cost disclaimer and
-  limitations.
+- [README](../README.md): quick start, what token-usage does, installation for Claude Code, Codex, Cursor, Gemini CLI, Copilot CLI, Grok Build, VS Code agent plugins and any MCP client, configuration, insights, how to open a GitHub issue, cost disclaimer and limitations.
+- [CLI and MCP reference](reference.md): every command flag, the combinations the script rejects, and every stdio MCP tool argument.
 - [Use cases](use-cases.md): the problem token-usage solves and the questions it answers.
 - [Architecture](architecture.md): how the code is laid out, how a report is built, and
   the extension points.
