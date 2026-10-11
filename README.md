@@ -1,5 +1,7 @@
 # token-usage
 
+<p align="center"><img src="assets/logo.svg" alt="token-usage logo" width="96"></p>
+
 **Where did my tokens go?** A free, public MIT plugin from Wicked Sick Limited for **Claude Code**, **Codex**, **Cursor**, **Gemini CLI** and **GitHub Copilot CLI** (it also installs unchanged in **Grok Build**, VS Code agent plugins and any MCP client) that attributes token usage to the work that consumed it — per-activity breakdowns (slash commands and skills in Claude Code and Cowork, turns and skills in Codex, composer generations in Cursor), subagent rollups, cross-session history, optional live ledgers, and cache-aware API-price estimates.
 
 📖 **Documentation:** this README (quick start, what the plugin does, install, configuration) and the [`docs/`](docs/README.md) folder. The [CLI and MCP reference](docs/reference.md) lists every flag and tool argument. Also: [use cases](docs/use-cases.md), [architecture](docs/architecture.md), and the [Codex](docs/codex-adapter.md), [Cursor](docs/cursor-adapter.md) and [Gemini/Copilot](docs/gemini-copilot.md) notes.
@@ -180,8 +182,8 @@ Claude Code on Windows can use the PowerShell statusline under [Statusline](#sta
 | Claude Code | `claude plugin install token-usage@wickedsick` | Wicked Sick marketplace; Anthropic directory resubmission pending |
 | Codex | `codex plugin add token-usage@wickedsick` | Wicked Sick marketplace |
 | Cursor | Cursor Marketplace, or manual MCP | Marketplace listing pending |
-| Gemini CLI | `gemini extensions install /absolute/path/to/token-usage` | Checkout until 0.8.0 is published; GitHub URL after that |
-| GitHub Copilot CLI | `copilot plugin install /absolute/path/to/token-usage` | Checkout until 0.8.0 is published; then `token-usage@wickedsick` |
+| Gemini CLI | `gemini extensions install https://github.com/Wicked-Sick-Ltd/token-usage` | Direct from GitHub (or a local checkout path) |
+| GitHub Copilot CLI | `copilot plugin install token-usage@wickedsick` | Wicked Sick marketplace (or `copilot plugin install /absolute/path/to/token-usage`) |
 | Grok Build | `grok plugin install Wicked-Sick-Ltd/token-usage --trust` | Direct from GitHub |
 | VS Code agent plugins | `chat.plugins.marketplaces` | Wicked Sick marketplace |
 | Any MCP client | stdio `python3 scripts/mcp_server.py` | Manual |
@@ -325,6 +327,15 @@ The server is a stdlib stdio process, so any MCP client can launch it:
 
 Set `TOKEN_USAGE_RUNTIME` to the runtime you want by default (`claude`, `codex`,
 `cursor`, `gemini`, `copilot` or `auto`), or pass `runtime` per call.
+
+## Troubleshooting
+
+- **`python3: command not found` / MCP server fails to start**: install Python 3.9+ and make sure `python3` is on PATH (on Windows see the note under [Installation](#installation)). Check with `python3 --version`.
+- **Report is empty or shows no sessions**: the analyser reads the host's local transcripts. Run one session in the host first, then ask again; check the paths in [docs/reference.md](docs/reference.md) exist for your host.
+- **Plugin installed but skills/commands missing**: restart the host after installing, and for Claude Code run `/plugin` to confirm `token-usage` is enabled.
+- **Codex hooks not running**: hooks need explicit trust; review and approve them via `/hooks`.
+- **Garbled characters on Windows**: run with `PYTHONUTF8=1` (the bundled MCP entries already set it).
+- **Still stuck?** Open an issue at https://github.com/Wicked-Sick-Ltd/token-usage/issues or email hello@wickedsick.com.
 
 ## Usage
 
