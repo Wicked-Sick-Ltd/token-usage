@@ -8,11 +8,11 @@ https://claude.com/docs/plugins/pre-submission-checklist.
 
 **Portal procedure last verified:** 2026-10-08 for the 0.8.0 candidate.
 
-**Current candidate:** 0.8.0, unreleased. Local checks on 2026-10-08 covered Claude
-Code (`claude plugin validate .`), Codex, Gemini CLI, Copilot CLI and Grok Build
-installs; limits are in the runtime guides. Merge, the v0.8.0 release, the
-marketplace pin bump and the portal resubmission are pending; this document does
-not record an approved or completed submission. Other directories are covered in
+**Current release:** 0.8.0, released 2026-10-11 (tag `v0.8.0`). Local checks on
+2026-10-08 covered Claude Code (`claude plugin validate .`), Codex, Gemini CLI,
+Copilot CLI and Grok Build installs; limits are in the runtime guides. The portal
+resubmission is pending; this document does not record an approved or completed
+submission. Other directories are covered in
 [docs/marketplaces.md](docs/marketplaces.md).
 
 The earlier Claude Console plugin form and the claude.ai admin-settings form are no
@@ -42,7 +42,7 @@ repository owner.
 |---|---|
 | Repository | `Wicked-Sick-Ltd/token-usage` |
 | Plugin path | *(leave empty: `.claude-plugin/plugin.json` is at the repository root)* |
-| Branch or tag | `main` *(or leave empty for the default branch)* |
+| Branch or tag | `v0.8.0` or `main` *(or leave empty for the default branch)* |
 
 Then select **Validate**. Fix anything marked **Blocking**, push, and select
 **Re-validate**. Locally, `claude plugin validate .` accepts the package with warnings: the three directory listing URL fields are
@@ -59,7 +59,7 @@ The portal reads these from the repository:
 | Display name | `plugin.json` `displayName` | Token Usage Profiler |
 | Description | `plugin.json` `description` | A token profiler, not a cost meter: attributes Claude Code and Cowork usage to the slash command, skill or subagent that consumed it. |
 | Homepage and documentation | `homepage`, `documentationUrl` | https://github.com/Wicked-Sick-Ltd/token-usage#readme |
-| Support | `supportUrl` | https://github.com/Wicked-Sick-Ltd/token-usage/issues |
+| Support | `supportUrl` | https://github.com/Wicked-Sick-Ltd/token-usage/issues (email: hello@wickedsick.com) |
 | Privacy | `privacyPolicyUrl` | https://github.com/Wicked-Sick-Ltd/token-usage#privacy-and-data-handling |
 | Repository | `repository` | https://github.com/Wicked-Sick-Ltd/token-usage |
 | Licence | `license` and `LICENSE` | MIT |
@@ -67,6 +67,14 @@ The portal reads these from the repository:
 | Long description | `README.md` | the README |
 
 Category, if asked: productivity.
+
+Assets: `assets/logo.svg` (square logo, if an icon is requested). No screenshots are
+bundled; the README shows example report output as text.
+
+Release: 0.8.0, tag `v0.8.0` (https://github.com/Wicked-Sick-Ltd/token-usage/releases/tag/v0.8.0).
+New in 0.8.0: Gemini CLI extension and GitHub Copilot CLI plugin runtimes, Grok Build,
+VS Code agent plugin and generic MCP client install paths, and a five-host support
+matrix (see [CHANGELOG.md](CHANGELOG.md)).
 
 ### Long description (if a field asks for one)
 
@@ -142,7 +150,7 @@ No. It is a developer tool.
 
 ## Compliance
 
-- Contact email: `craig@wickedsick.com`
+- Contact email (support): `hello@wickedsick.com`
 - Read the Anthropic Software Directory Terms and Software Directory Policy, then tick
   the four acknowledgements.
 

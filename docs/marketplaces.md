@@ -4,14 +4,14 @@ Where token-usage is listed, what each directory requires, and what is still to 
 Nothing in this repository submits anything: every submission and listing PR is a
 manual step for the repository owner.
 
-**Last verified:** 2026-10-08, for the 0.8.0 candidate.
+**Last verified:** 2026-10-11, for the 0.8.0 release.
 
 ## Status
 
 | Directory | How it lists | Status |
 |---|---|---|
 | Claude plugin directory (Anthropic) | Developer portal, reviewed | Not listed. Resubmit 0.8.0; see [SUBMISSION.md](../SUBMISSION.md). |
-| Wicked Sick marketplace (`Wicked-Sick-Ltd/ai-marketplace`) | Claude, Codex and Copilot catalogues, commit-pinned | Listed at the 0.8.0 candidate commit; bump the pins after the release. Cursor catalogue empty. |
+| Wicked Sick marketplace (`Wicked-Sick-Ltd/ai-marketplace`) | Claude, Codex and Copilot catalogues, commit-pinned | Pinned to the v0.8.0 release commit. Cursor catalogue empty. |
 | Cursor Marketplace | cursor.com/marketplace/publish, manually reviewed | Not listed. Ready to submit after the release. |
 | cursor.directory | Community submission | Not listed. Optional. |
 | Gemini CLI extensions gallery | Automatic crawl of public repos | Not listed. Needs the `gemini-cli-extension` topic and a release tag. |
@@ -52,7 +52,7 @@ manual step for the repository owner.
 - The gallery indexes public repositories automatically, once a day, when they have
   `gemini-extension.json` at the root, the GitHub topic `gemini-cli-extension`, and a
   release tag. Keep the manifest `version` in step with the tag.
-- To do: add the topic to `Wicked-Sick-Ltd/token-usage` and publish v0.8.0.
+- Done for 0.8.0: topic added and v0.8.0 published.
 
 ## Grok Build
 
