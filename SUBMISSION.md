@@ -8,11 +8,11 @@ https://claude.com/docs/plugins/pre-submission-checklist.
 
 **Portal procedure last verified:** 2026-10-08 for the 0.8.0 candidate.
 
-**Current candidate:** 0.8.0, unreleased. Local checks on 2026-10-08 covered Claude
-Code (`claude plugin validate .`), Codex, Gemini CLI, Copilot CLI and Grok Build
-installs; limits are in the runtime guides. Merge, the v0.8.0 release, the
-marketplace pin bump and the portal resubmission are pending; this document does
-not record an approved or completed submission. Other directories are covered in
+**Current release:** 0.8.0, released 2026-10-11 (tag `v0.8.0`). Local checks on
+2026-10-08 covered Claude Code (`claude plugin validate .`), Codex, Gemini CLI,
+Copilot CLI and Grok Build installs; limits are in the runtime guides. The portal
+resubmission is pending; this document does not record an approved or completed
+submission. Other directories are covered in
 [docs/marketplaces.md](docs/marketplaces.md).
 
 The earlier Claude Console plugin form and the claude.ai admin-settings form are no
@@ -42,7 +42,7 @@ repository owner.
 |---|---|
 | Repository | `Wicked-Sick-Ltd/token-usage` |
 | Plugin path | *(leave empty: `.claude-plugin/plugin.json` is at the repository root)* |
-| Branch or tag | `main` *(or leave empty for the default branch)* |
+| Branch or tag | `v0.8.0` or `main` *(or leave empty for the default branch)* |
 
 Then select **Validate**. Fix anything marked **Blocking**, push, and select
 **Re-validate**. Locally, `claude plugin validate .` accepts the package with warnings: the three directory listing URL fields are
