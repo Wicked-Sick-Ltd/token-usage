@@ -1,5 +1,76 @@
 # Plugin directory submission — token-usage
 
+Copy-paste fields for marketplace and directory submissions. Nothing in this
+repository submits automatically; each listing is a manual step for the repository
+owner.
+
+---
+
+## Cursor Marketplace
+
+Submit at https://cursor.com/marketplace/publish (public Git repository link).
+Process and checklist: https://cursor.com/docs/reference/plugins#submitting-a-plugin.
+Every listing is manually reviewed and must be open source.
+
+**Procedure last verified:** 2026-10-16 for the 0.8.0 candidate.
+
+### Source
+
+| Field | Value |
+|---|---|
+| Repository | `https://github.com/Wicked-Sick-Ltd/token-usage` |
+| Plugin path | *(repository root — `.cursor-plugin/plugin.json`)* |
+| Branch or tag | `main` or `v0.8.0` |
+
+### Listing details (from `.cursor-plugin/plugin.json`)
+
+| Listing field | Value |
+|---|---|
+| Name | `token-usage` |
+| Display name | Token Usage Profiler |
+| Description | Attribute Cursor, Claude Code, Cowork, Codex, Gemini CLI, and Copilot CLI token usage to the work that consumed it — per-activity breakdowns, subagent rollups, cross-session history, live session ledger, cache-aware API-price estimates, and a bundled MCP server with optional Cursor hook attribution |
+| Category | Developer Tools |
+| Homepage and documentation | https://github.com/Wicked-Sick-Ltd/token-usage#readme |
+| Support | https://github.com/Wicked-Sick-Ltd/token-usage/issues (email: hello@wickedsick.com) |
+| Privacy | https://github.com/Wicked-Sick-Ltd/token-usage#privacy-and-data-handling |
+| Repository | https://github.com/Wicked-Sick-Ltd/token-usage |
+| Licence | MIT (`LICENSE`) |
+| Author | Craig Fletcher, hello@wickedsick.com |
+| Logo | `assets/logo.svg` (referenced as `"logo": "assets/logo.svg"` in the manifest) |
+| Long description | `README.md` (install: [README § Cursor](README.md#cursor)) |
+
+### What the Cursor plugin contains
+
+- 1 skill: `skills/report/` (`/report` — token usage breakdown; prefers MCP tools when present).
+- 4 hooks in `hooks/hooks-cursor.json` (`version` 1): `beforeSubmitPrompt`, `stop`,
+  `subagentStart`, `subagentStop` — each runs
+  `python3 "${CURSOR_PLUGIN_ROOT}/scripts/token_usage.py" cursor-hook` with a
+  15-second timeout, fail-open (always exit 0).
+- 1 stdio MCP server: `python3 ${CURSOR_PLUGIN_ROOT}/scripts/mcp_server.py` with
+  `TOKEN_USAGE_RUNTIME=cursor` (five reporting tools; see README).
+- Python 3.9+ standard library only in `scripts/token_usage.py` and
+  `scripts/mcp_server.py`.
+
+### Local verification before submit
+
+```bash
+python3 -m pytest tests/test_cursor_plugin.py tests/test_directory_readiness.py -v -W error
+```
+
+Copy the plugin tree to `~/.cursor/plugins/local/token-usage/` (include
+`.cursor-plugin/plugin.json`) and reload the window, or use manual MCP per
+[README § Cursor](README.md#cursor). See [docs/cursor-adapter.md](docs/cursor-adapter.md)
+for attribution limits.
+
+### Data handling (review questions)
+
+Use the answers in [Privacy and data handling](README.md#privacy-and-data-handling).
+Support contact: `hello@wickedsick.com`.
+
+---
+
+## Claude plugin directory (Anthropic)
+
 Copy-paste source for submitting token-usage to Anthropic's Claude plugin directory
 through the **developer portal**: claude.ai/directory/manage → **Submit new** →
 **Plugin bundle**. Anthropic's process is described at

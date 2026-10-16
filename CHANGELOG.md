@@ -6,6 +6,10 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- **Cursor marketplace readiness** — `.cursor-plugin/plugin.json` lists `logo`,
+  `category`, listing URLs, and support contact `hello@wickedsick.com`; `SUBMISSION.md`
+  adds a Cursor Marketplace section; `docs/marketplaces.md` documents the committed logo.
+
 ## [0.8.0] — 2026-10-11
 
 ### Added
