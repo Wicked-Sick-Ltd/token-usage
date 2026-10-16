@@ -267,6 +267,8 @@ def _resilient_stdin():
         try:
             sys.stdin.reconfigure(errors="replace")
         except (AttributeError, ValueError, OSError):
+            # Best-effort fallback only: if reconfigure is unavailable/fails,
+            # continue with existing stdin (or empty stream below).
             pass
         # Started with stdin closed, sys.stdin is None and serve() would do
         # `for line in None`: an empty stream ends the loop cleanly instead.
@@ -704,4 +706,6 @@ if __name__ == "__main__":
     try:
         serve()
     except (KeyboardInterrupt, BrokenPipeError):
-        pass
+        # Expected shutdown paths for a stdio server (user interrupt or closed pipe):
+        # exit quietly without printing a traceback.
+        sys.exit(0)
