@@ -21,6 +21,16 @@ def test_cursor_plugin_manifest_registers_mcp_skills_and_hooks():
     assert cfg.get("license") == "MIT"
     assert cfg.get("repository") == "https://github.com/Wicked-Sick-Ltd/token-usage"
     assert cfg.get("name") == "token-usage"
+    assert cfg.get("displayName") == "Token Usage Profiler"
+    assert cfg.get("homepage") == "https://github.com/Wicked-Sick-Ltd/token-usage#readme"
+    assert cfg.get("category") == "Developer Tools"
+    assert cfg.get("logo") == "assets/logo.svg"
+    assert (PLUGIN_ROOT / cfg["logo"]).is_file()
+    assert cfg["author"]["email"] == "hello@wickedsick.com"
+    assert cfg["author"]["name"]
+    for key in ("documentationUrl", "supportUrl", "privacyPolicyUrl"):
+        assert cfg.get(key, "").startswith("https://"), key
+    assert "cursor" in cfg.get("keywords", [])
 
     srv = cfg["mcpServers"]["token-usage"]
     assert srv["command"] == "python3"

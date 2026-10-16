@@ -12,7 +12,7 @@ manual step for the repository owner.
 |---|---|---|
 | Claude plugin directory (Anthropic) | Developer portal, reviewed | Not listed. Resubmit 0.8.0; see [SUBMISSION.md](../SUBMISSION.md). |
 | Wicked Sick marketplace (`Wicked-Sick-Ltd/ai-marketplace`) | Claude, Codex and Copilot catalogues, commit-pinned | Pinned to the v0.8.0 release commit. Cursor catalogue empty. |
-| Cursor Marketplace | cursor.com/marketplace/publish, manually reviewed | Not listed. Ready to submit after the release. |
+| Cursor Marketplace | cursor.com/marketplace/publish, manually reviewed | Not listed. Metadata and `SUBMISSION.md` Cursor section ready for review (0.8.0). |
 | cursor.directory | Community submission | Not listed. Optional. |
 | Gemini CLI extensions gallery | Automatic crawl of public repos | Not listed. Needs the `gemini-cli-extension` topic and a release tag. |
 | Grok Build (`xai-org/plugin-marketplace`) | Pull request, SHA-pinned | Not listed. Installs directly from GitHub today. |
@@ -41,8 +41,8 @@ manual step for the repository owner.
 - Submit at https://cursor.com/marketplace/publish. Every plugin is reviewed by hand
   and must be open source.
 - Checklist: kebab-case `name`, a description, valid skill frontmatter, relative
-  paths, a README, tested locally. A logo committed to the repository and referenced
-  by relative path is optional; token-usage has none yet.
+  paths, a README, tested locally. Commit a logo and set `"logo": "assets/logo.svg"`
+  in `.cursor-plugin/plugin.json` (token-usage does this).
 - Manifest: `.cursor-plugin/plugin.json` (MCP server, hooks, report skill).
 - After it is published, also add the entry to the Cursor catalogue in
   `Wicked-Sick-Ltd/ai-marketplace` (`.cursor-plugin/marketplace.json`).
