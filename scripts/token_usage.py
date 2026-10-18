@@ -3900,10 +3900,87 @@ def gemini_records(path):
         yield from iter_jsonl(path)
 
 
+def _is_antigravity_record(record):
+    return (isinstance(record, dict)
+            and not isinstance(record.get("step_index"), bool)
+            and isinstance(record.get("step_index"), int)
+            and record.get("type") in ("USER_INPUT", "PLANNER_RESPONSE", "GENERIC", "SYSTEM_MESSAGE")
+            and isinstance(record.get("source"), str))
+
+
+def _unquote_arg(val):
+    if isinstance(val, str) and len(val) >= 2 and val.startswith('"') and val.endswith('"'):
+        try:
+            unquoted = json.loads(val)
+            if isinstance(unquoted, str):
+                return unquoted
+        except ValueError:
+            return val.strip('"')
+    return val
+
+
+def _antigravity_cwd_from_record(record):
+    for key in ("cwd", "workspacePath", "projectDir"):
+        val = record.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    ws = record.get("workspacePaths")
+    if isinstance(ws, list) and ws and isinstance(ws[0], str) and ws[0].strip():
+        return ws[0].strip()
+    for tc in record.get("tool_calls") or []:
+        if not isinstance(tc, dict):
+            continue
+        args = tc.get("args")
+        if isinstance(args, str) and "Cwd" in args:
+            try:
+                args = json.loads(args)
+            except ValueError:
+                args = None
+        if isinstance(args, dict) and isinstance(args.get("Cwd"), str):
+            cwd = _unquote_arg(args["Cwd"]).strip()
+            if cwd:
+                return cwd
+    return None
+
+
 def gemini_metadata(path):
-    for record in gemini_records(path):
+    p = Path(path)
+    antigravity_seen = False
+    parent_sid = None
+    cwd = None
+    for idx, record in enumerate(gemini_records(p)):
         if isinstance(record.get("sessionId"), str) and isinstance(record.get("projectHash"), str):
             return record
+        if _is_antigravity_record(record):
+            antigravity_seen = True
+            if idx == 0 and record.get("type") == "SYSTEM_MESSAGE" and isinstance(record.get("content"), str):
+                m = re.search(r"\[Message\]\s+timestamp=\S+\s+sender=([A-Za-z0-9_-]+)(?:\s|$)", record["content"])
+                if m:
+                    parent_sid = m.group(1)
+            if cwd is None:
+                cwd = _antigravity_cwd_from_record(record)
+    if antigravity_seen:
+        if len(p.parents) >= 3 and p.parent.name == "logs" and p.parents[1].name == ".system_generated":
+            sid = p.parents[2].name
+        else:
+            sid = p.stem
+        resolved_cwd = None
+        project_hash = None
+        if cwd:
+            try:
+                resolved_cwd = str(Path(cwd).expanduser().resolve())
+                project_hash = hashlib.sha256(resolved_cwd.encode()).hexdigest()
+            except OSError:
+                resolved_cwd = cwd
+        if parent_sid == sid:
+            parent_sid = None
+        return {
+            "sessionId": sid,
+            "projectHash": project_hash,
+            "project": resolved_cwd,
+            "parentSessionId": parent_sid,
+            "format": "antigravity",
+        }
     return {}
 
 
@@ -3921,7 +3998,10 @@ class GeminiAdapter(RuntimeAdapter):
         target = str(Path(project_dir).expanduser().resolve()) if project_dir else None
         project_hash = hashlib.sha256(target.encode()).hexdigest() if target else None
         seen = set()
-        for path in sorted((gemini_home() / "tmp").glob("*/chats/**/*.json*"), reverse=True):
+        home = gemini_home()
+        candidates = sorted((home / "tmp").glob("*/chats/**/*.json*"), reverse=True)
+        candidates += sorted(home.glob("antigravity*/brain/*/.system_generated/logs/transcript.jsonl"), reverse=True)
+        for path in candidates:
             if path.suffix not in (".json", ".jsonl"):
                 continue
             try:
@@ -3930,7 +4010,7 @@ class GeminiAdapter(RuntimeAdapter):
                 warn(f"skipping unreadable Gemini session {path}: {exc}", warnings)
                 continue
             sid = meta.get("sessionId")
-            if not sid or sid in seen or (project_hash and meta["projectHash"] != project_hash):
+            if not sid or sid in seen or (project_hash and meta.get("projectHash") != project_hash):
                 continue
             seen.add(sid)
             yield path
@@ -3939,7 +4019,8 @@ class GeminiAdapter(RuntimeAdapter):
         sources = list(self.all_sessions(project_dir, warnings))
         ids = {self.session_id(p) for p in sources}
         for path in sources:
-            if path.parent.name not in ids:
+            meta = gemini_metadata(path)
+            if path.parent.name not in ids and not meta.get("parentSessionId"):
                 yield path
 
     def locate(self, arg=None, session_id=None, project_dir=None):
@@ -3959,23 +4040,40 @@ class GeminiAdapter(RuntimeAdapter):
         return gemini_metadata(source).get("sessionId") or Path(source).stem
 
     def project(self, source):
-        return gemini_metadata(source).get("projectHash") or "gemini:unknown"
+        meta = gemini_metadata(source)
+        return meta.get("project") or meta.get("projectHash") or "gemini:unknown"
 
     def describe(self, source):
         return str(source)
 
     def parse(self, source):
         parsed = parse_gemini_session(source)
-        parent_id = self.session_id(source)
+        meta = gemini_metadata(source)
+        parent_id = meta.get("sessionId") or Path(source).stem
         seen = {parent_id}
         if not re.fullmatch(r"[A-Za-z0-9_-]+", parent_id):
             parsed["warnings"].append("Invalid Gemini session id; child discovery omitted.")
             parsed["measurement"] = worst_measurement(parsed["measurement"], "partial")
             return parsed
-        # Each generation lives beneath chats/<immediate-parent-id>/, so a
-        # grandchild can be in a sibling directory rather than below its parent.
-        root = next((p for p in Path(source).parents if p.name == "chats"), Path(source).parent)
-        children = sorted((root / parent_id).rglob("*.json*"))
+        if meta.get("format") == "antigravity":
+            p = Path(source)
+            brain_root = p.parents[3] if len(p.parents) >= 4 and p.parents[2].parent.name == "brain" else None
+            by_parent = {}
+            if brain_root and brain_root.is_dir():
+                for cand in sorted(brain_root.glob("*/.system_generated/logs/transcript.jsonl")):
+                    if cand == p:
+                        continue
+                    cmeta = gemini_metadata(cand)
+                    psid = cmeta.get("parentSessionId")
+                    if psid:
+                        by_parent.setdefault(psid, []).append(cand)
+            children = list(by_parent.get(parent_id, []))
+        else:
+            # Each generation lives beneath chats/<immediate-parent-id>/, so a
+            # grandchild can be in a sibling directory rather than below its parent.
+            root = next((p for p in Path(source).parents if p.name == "chats"), Path(source).parent)
+            children = sorted((root / parent_id).rglob("*.json*"))
+            by_parent = None
         for path in children:
             if path.suffix not in (".json", ".jsonl"):
                 continue
@@ -3984,7 +4082,10 @@ class GeminiAdapter(RuntimeAdapter):
             sid = self.session_id(path)
             seen.add(sid)
             if re.fullmatch(r"[A-Za-z0-9_-]+", sid):
-                children.extend(sorted((root / sid).rglob("*.json*")))
+                if by_parent is not None:
+                    children.extend(by_parent.get(sid, []))
+                else:
+                    children.extend(sorted((root / sid).rglob("*.json*")))
             child = parse_gemini_session(path)
             by_model = {}
             for seg in child["segments"]:
@@ -4006,12 +4107,121 @@ class GeminiAdapter(RuntimeAdapter):
         return parsed
 
 
-def parse_gemini_session(source):
+def _parse_antigravity_session(records):
     segments, pending, users, warnings = [], {}, set(), []
     active = None
     missing = set()
     partial = False
-    for record in gemini_records(source):
+    current_model = "gemini-antigravity"
+    for record in records:
+        if not _is_antigravity_record(record):
+            continue
+        kind = record.get("type")
+        sid = str(record.get("step_index"))
+        ts = record.get("created_at") if isinstance(record.get("created_at"), str) else None
+        content = record.get("content") if isinstance(record.get("content"), str) else ""
+        if kind == "USER_INPUT" and "<USER_SETTINGS_CHANGE>" in content and "<CONTEXT_SUMMARY>" not in content:
+            m_model = re.search(
+                r"<USER_SETTINGS_CHANGE>\s*The user changed setting `Model Selection` from .*? to ([A-Za-z0-9][^.\n<]+)",
+                content,
+            )
+            if m_model and m_model.group(1).strip():
+                current_model = m_model.group(1).strip()
+        if kind == "USER_INPUT":
+            if sid in users:
+                continue
+            users.add(sid)
+            if "<CONTEXT_SUMMARY>" in content and "<USER_REQUEST>" not in content:
+                continue
+            m_req = re.search(r"<USER_REQUEST>\s*(.*?)\s*</USER_REQUEST>", content, re.DOTALL)
+            prompt = m_req.group(1) if m_req else content
+            match = re.match(r"\s*([$\/][A-Za-z0-9][A-Za-z0-9_:-]*)\b", prompt)
+            active = {
+                "label": match.group(1) if match else OTHER_LABEL,
+                "start_ts": ts,
+                "prompt": prompt.strip()[:120],
+                "by_model": {},
+                "subagents": [],
+            }
+            segments.append(active)
+            continue
+        if kind != "PLANNER_RESPONSE":
+            continue
+        for tc in record.get("tool_calls") or []:
+            if not isinstance(tc, dict):
+                continue
+            args = tc.get("args")
+            if isinstance(args, str) and "SKILL.md" in args:
+                try:
+                    args = json.loads(args)
+                except ValueError:
+                    args = {}
+            if isinstance(args, dict):
+                for raw_val in args.values():
+                    val = _unquote_arg(raw_val)
+                    if isinstance(val, str):
+                        sm = re.search(r"[/\\]skills[/\\]([A-Za-z0-9][A-Za-z0-9_:-]*)[/\\]SKILL\.md$", val)
+                        if sm:
+                            active = {
+                                "label": "$" + sm.group(1),
+                                "start_ts": ts or (active["start_ts"] if active else None),
+                                "prompt": active["prompt"] if active else "",
+                                "by_model": {},
+                                "subagents": [],
+                            }
+                            segments.append(active)
+                            break
+        if active is None:
+            active = {"label": OTHER_LABEL, "start_ts": ts, "prompt": "", "by_model": {}, "subagents": []}
+            segments.append(active)
+        if "input_tokens" not in record or "output_tokens" not in record:
+            missing.add(sid)
+            continue
+        values = {
+            "input": record.get("input_tokens", 0),
+            "output": record.get("output_tokens", 0),
+            "cached": record.get("cache_read_tokens", 0),
+            "cache_write": record.get("cache_write_tokens", 0),
+        }
+        if any(isinstance(v, bool) or not isinstance(v, int) or v < 0 for v in values.values()):
+            partial = True
+            warnings.append("Invalid Gemini token counters omitted.")
+            continue
+        missing.discard(sid)
+        flat = {
+            "input": values["input"],
+            "output": values["output"],
+            "cache_read": values["cached"],
+            "cache_5m": values["cache_write"],
+            "cache_1h": 0,
+        }
+        if sid in pending:
+            max_flat(pending[sid][2], flat)
+        else:
+            model = record.get("model") or record.get("modelName") or current_model
+            pending[sid] = (active, model if isinstance(model, str) and model else "gemini-antigravity", flat)
+    for seg, model, flat in pending.values():
+        add_flat(seg["by_model"].setdefault(model, empty_usage()), flat)
+    if missing - pending.keys():
+        partial = True
+        warnings.append("Some Gemini messages have no recorded token counters; totals are incomplete.")
+    warnings.append("Gemini reasoning tokens are included in output; cached tokens are included once. Costs are API-equivalent estimates, not subscription charges. Deleted history cannot be reconstructed.")
+    return {
+        "segments": segments,
+        "warnings": list(dict.fromkeys(warnings)),
+        "measurement": ("partial" if partial else "exact") if pending else "activity_only",
+    }
+
+
+def parse_gemini_session(source):
+    records = list(gemini_records(source))
+    if any(_is_antigravity_record(r) for r in records):
+        return _parse_antigravity_session(records)
+    segments, pending, users, warnings = [], {}, set(), []
+    active = None
+    missing = set()
+    partial = False
+    for record in records:
         kind, sid = record.get("type"), record.get("id")
         if "$rewindTo" in record or "$patch" in record or "$set" in record:
             warnings.append("Gemini history edits are present; retained recorded usage includes work before edits.")
@@ -4258,7 +4468,13 @@ def check_adapter_root(adapter, warnings=None):
         return check_cursor_root(warnings)
     if adapter.name == "codex":
         return check_codex_root(warnings)
-    root = copilot_home() if adapter.name == "copilot" else gemini_home() / "tmp"
+    if adapter.name == "gemini":
+        home = gemini_home()
+        if (home / "tmp").is_dir() or any(p.is_dir() for p in home.glob("antigravity*/brain")):
+            return None
+        root = home / "tmp"
+    else:
+        root = copilot_home()
     if root.is_dir():
         return None
     warn(f"no readable {adapter.name} sessions under {root}", warnings)

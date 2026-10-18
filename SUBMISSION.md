@@ -12,7 +12,7 @@ Submit at https://cursor.com/marketplace/publish (public Git repository link).
 Process and checklist: https://cursor.com/docs/reference/plugins#submitting-a-plugin.
 Every listing is manually reviewed and must be open source.
 
-**Procedure last verified:** 2026-10-16 for the 0.8.0 candidate.
+**Procedure last verified:** 2026-10-18 for the 0.9.0 release.
 
 ### Source
 
@@ -20,7 +20,7 @@ Every listing is manually reviewed and must be open source.
 |---|---|
 | Repository | `https://github.com/Wicked-Sick-Ltd/token-usage` |
 | Plugin path | *(repository root — `.cursor-plugin/plugin.json`)* |
-| Branch or tag | `main` or `v0.8.0` |
+| Branch or tag | `main` or `v0.9.0` |
 
 ### Listing details (from `.cursor-plugin/plugin.json`)
 
@@ -28,7 +28,7 @@ Every listing is manually reviewed and must be open source.
 |---|---|
 | Name | `token-usage` |
 | Display name | Token Usage Profiler |
-| Description | Attribute Cursor, Claude Code, Cowork, Codex, Gemini CLI, and Copilot CLI token usage to the work that consumed it — per-activity breakdowns, subagent rollups, cross-session history, live session ledger, cache-aware API-price estimates, and a bundled MCP server with optional Cursor hook attribution |
+| Description | Attribute Cursor, Claude Code, Cowork, Codex, Google Antigravity, Gemini CLI, and Copilot CLI token usage to the work that consumed it — per-activity breakdowns, subagent rollups, cross-session history, live session ledger, cache-aware API-price estimates, and a bundled MCP server with optional Cursor hook attribution |
 | Category | Developer Tools |
 | Homepage and documentation | https://github.com/Wicked-Sick-Ltd/token-usage#readme |
 | Support | https://github.com/Wicked-Sick-Ltd/token-usage/issues (email: hello@wickedsick.com) |
@@ -77,10 +77,10 @@ through the **developer portal**: claude.ai/directory/manage → **Submit new** 
 https://claude.com/docs/plugins/submit and the automated checks at
 https://claude.com/docs/plugins/pre-submission-checklist.
 
-**Portal procedure last verified:** 2026-10-08 for the 0.8.0 candidate.
+**Portal procedure last verified:** 2026-10-18 for the 0.9.0 release.
 
-**Current release:** 0.8.0, released 2026-10-11 (tag `v0.8.0`). Local checks on
-2026-10-08 covered Claude Code (`claude plugin validate .`), Codex, Gemini CLI,
+**Current release:** 0.9.0, released 2026-10-18 (tag `v0.9.0`). Local checks covered
+Claude Code (`claude plugin validate .`), Codex, Google Antigravity, Gemini CLI,
 Copilot CLI and Grok Build installs; limits are in the runtime guides. The portal
 resubmission is pending; this document does not record an approved or completed
 submission. Other directories are covered in
@@ -113,7 +113,7 @@ repository owner.
 |---|---|
 | Repository | `Wicked-Sick-Ltd/token-usage` |
 | Plugin path | *(leave empty: `.claude-plugin/plugin.json` is at the repository root)* |
-| Branch or tag | `v0.8.0` or `main` *(or leave empty for the default branch)* |
+| Branch or tag | `v0.9.0` or `main` *(or leave empty for the default branch)* |
 
 Then select **Validate**. Fix anything marked **Blocking**, push, and select
 **Re-validate**. Locally, `claude plugin validate .` accepts the package with warnings: the three directory listing URL fields are
@@ -142,10 +142,9 @@ Category, if asked: productivity.
 Assets: `assets/logo.svg` (square logo, if an icon is requested). No screenshots are
 bundled; the README shows example report output as text.
 
-Release: 0.8.0, tag `v0.8.0` (https://github.com/Wicked-Sick-Ltd/token-usage/releases/tag/v0.8.0).
-New in 0.8.0: Gemini CLI extension and GitHub Copilot CLI plugin runtimes, Grok Build,
-VS Code agent plugin and generic MCP client install paths, and a five-host support
-matrix (see [CHANGELOG.md](CHANGELOG.md)).
+Release: 0.9.0, tag `v0.9.0` (https://github.com/Wicked-Sick-Ltd/token-usage/releases/tag/v0.9.0).
+New in 0.9.0: Google Antigravity `transcript.jsonl` support (`--runtime gemini`), Cursor
+marketplace metadata, and MCP stdio clean shutdown (see [CHANGELOG.md](CHANGELOG.md)).
 
 ### Long description (if a field asks for one)
 

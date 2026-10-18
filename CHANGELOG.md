@@ -6,9 +6,26 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-10-18
+
+### Added
+
+- **Google Antigravity support (`--runtime gemini`)** — discovers and parses Antigravity
+  `transcript.jsonl` session logs under
+  `~/.gemini/antigravity*/brain/<conversation-id>/.system_generated/logs/transcript.jsonl`
+  (`agy` CLI, Antigravity 2.0 desktop app, and Antigravity IDE) alongside legacy
+  `~/.gemini/tmp/*/chats/` recordings, with slash-command and `SKILL.md` skill
+  attribution, `<USER_SETTINGS_CHANGE>` model selection extraction, `<CONTEXT_SUMMARY>`
+  compaction preservation, workspace path inference, and step-0 `SYSTEM_MESSAGE`
+  subagent rollups.
 - **Cursor marketplace readiness** — `.cursor-plugin/plugin.json` lists `logo`,
   `category`, listing URLs, and support contact `hello@wickedsick.com`; `SUBMISSION.md`
   adds a Cursor Marketplace section; `docs/marketplaces.md` documents the committed logo.
+
+### Fixed
+
+- **MCP stdio shutdown** — `scripts/mcp_server.py` exits cleanly on EOF or broken pipe
+  during stdio shutdown and documents the stdin fallback (#25).
 
 ## [0.8.0] — 2026-10-11
 
@@ -622,7 +639,8 @@ Initial release.
 - Standalone CLI: `python3 scripts/token_usage.py report|json [transcript]`.
 - Optional statusline example (`examples/statusline.sh`, requires `jq`).
 
-[Unreleased]: https://github.com/Wicked-Sick-Ltd/token-usage/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/Wicked-Sick-Ltd/token-usage/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/Wicked-Sick-Ltd/token-usage/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/Wicked-Sick-Ltd/token-usage/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/Wicked-Sick-Ltd/token-usage/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/Wicked-Sick-Ltd/token-usage/compare/v0.6.0...v0.6.1
