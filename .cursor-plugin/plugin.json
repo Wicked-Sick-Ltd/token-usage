@@ -1,8 +1,8 @@
 {
   "name": "token-usage",
   "displayName": "Token Usage Profiler",
-  "version": "0.8.0",
-  "description": "Attribute Cursor, Claude Code, Cowork, Codex, Gemini CLI, and Copilot CLI token usage to the work that consumed it — per-activity breakdowns, subagent rollups, cross-session history, live session ledger, cache-aware API-price estimates, and a bundled MCP server with optional Cursor hook attribution",
+  "version": "0.9.0",
+  "description": "Attribute Cursor, Claude Code, Cowork, Codex, Google Antigravity, Gemini CLI, and Copilot CLI token usage to the work that consumed it — per-activity breakdowns, subagent rollups, cross-session history, live session ledger, cache-aware API-price estimates, and a bundled MCP server with optional Cursor hook attribution",
   "author": {
     "name": "Craig Fletcher",
     "email": "hello@wickedsick.com"

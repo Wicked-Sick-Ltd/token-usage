@@ -2,7 +2,7 @@
 
 <p align="center"><img src="assets/logo.svg" alt="token-usage logo" width="96"></p>
 
-**Where did my tokens go?** A free, public MIT plugin from Wicked Sick Limited for **Claude Code**, **Codex**, **Cursor**, **Gemini CLI** and **GitHub Copilot CLI** (it also installs unchanged in **Grok Build**, VS Code agent plugins and any MCP client) that attributes token usage to the work that consumed it — per-activity breakdowns (slash commands and skills in Claude Code and Cowork, turns and skills in Codex, composer generations in Cursor), subagent rollups, cross-session history, optional live ledgers, and cache-aware API-price estimates.
+**Where did my tokens go?** A free, public MIT plugin from Wicked Sick Limited for **Claude Code**, **Codex**, **Cursor**, **Google Antigravity / Gemini CLI** and **GitHub Copilot CLI** (it also installs unchanged in **Grok Build**, VS Code agent plugins and any MCP client) that attributes token usage to the work that consumed it — per-activity breakdowns (slash commands and skills in Claude Code, Cowork, and Antigravity; turns and skills in Codex; composer generations in Cursor), subagent rollups, cross-session history, optional live ledgers, and cache-aware API-price estimates.
 
 📖 **Documentation:** this README (quick start, what the plugin does, install, configuration) and the [`docs/`](docs/README.md) folder. The [CLI and MCP reference](docs/reference.md) lists every flag and tool argument. Also: [use cases](docs/use-cases.md), [architecture](docs/architecture.md), and the [Codex](docs/codex-adapter.md), [Cursor](docs/cursor-adapter.md) and [Gemini/Copilot](docs/gemini-copilot.md) notes.
 
@@ -281,10 +281,10 @@ copilot --experimental
 Antigravity and Gemini CLI discover the report skill and MCP server through
 `gemini-extension.json` (or `~/.gemini/config/plugins/token-usage/`).
 Copilot uses `.plugin/plugin.json`; experimental extensions capture its transient
-usage events. Once 0.8.0 is released, Gemini also installs straight from GitHub
+usage events. Gemini CLI also installs straight from GitHub
 (`gemini extensions install https://github.com/Wicked-Sick-Ltd/token-usage`) and Copilot
 from the marketplace (`copilot plugin marketplace add Wicked-Sick-Ltd/ai-marketplace`,
-then `copilot plugin install token-usage@wickedsick`). Until then, use the checkout. See
+then `copilot plugin install token-usage@wickedsick`). See
 [installation, privacy and limits](docs/gemini-copilot.md).
 
 ### Grok Build

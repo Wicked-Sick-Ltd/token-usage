@@ -14,7 +14,7 @@ JavaScript collector. The same checkout works with all five hosts or as a standa
 | `.claude-plugin/plugin.json` | Claude Code manifest. It declares the MCP server inline; the skill in `skills/` and the hooks in `hooks/hooks.json` load from their default locations. |
 | `.codex-plugin/plugin.json` | Codex manifest: `codex-skills/`, `.mcp-codex.json` and `hooks/hooks-codex.json`. |
 | `.cursor-plugin/plugin.json` | Cursor manifest: `skills/report`, `hooks/hooks-cursor.json` and an inline MCP server. |
-| `gemini-extension.json` | Gemini CLI manifest, MCP server and context instructions. |
+| `gemini-extension.json` | Google Antigravity and Gemini CLI manifest, MCP server and context instructions. |
 | `.plugin/plugin.json` | Copilot CLI manifest, MCP server, skill and native extension. |
 | `copilot-extensions/token-usage/extension.mjs` | Saves transient Copilot usage locally using the host-bundled SDK. |
 | `skills/report/`, `codex-skills/report/` | The report skill (`/token-usage:report` in Claude Code), and its Codex counterpart. |
@@ -30,7 +30,7 @@ Every runtime goes through a `RuntimeAdapter` (`scripts/token_usage.py`) with fi
 session into attributed segments), `project` and `describe`. The adapters are
 `ClaudeAdapter` (Claude Code and Cowork transcripts), `CursorAdapter` (hook ledgers,
 read-only Desktop SQLite and Cloud Agent exports), `CodexAdapter` (Codex rollouts),
-`GeminiAdapter` (JSON/JSONL recordings and children), and `CopilotAdapter` (native
+`GeminiAdapter` (Google Antigravity `transcript.jsonl` logs, legacy Gemini CLI JSON/JSONL recordings, and subagents/children), and `CopilotAdapter` (native
 events plus a minimal usage ledger).
 `--runtime` and the MCP `runtime` argument pick one; `auto` picks a runtime only when the
 choice is unambiguous. Reports, history, insights, the dashboard and export work on the

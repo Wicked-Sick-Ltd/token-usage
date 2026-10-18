@@ -4,17 +4,17 @@ Where token-usage is listed, what each directory requires, and what is still to 
 Nothing in this repository submits anything: every submission and listing PR is a
 manual step for the repository owner.
 
-**Last verified:** 2026-10-11, for the 0.8.0 release.
+**Last verified:** 2026-10-18, for the 0.9.0 release.
 
 ## Status
 
 | Directory | How it lists | Status |
 |---|---|---|
-| Claude plugin directory (Anthropic) | Developer portal, reviewed | Not listed. Resubmit 0.8.0; see [SUBMISSION.md](../SUBMISSION.md). |
-| Wicked Sick marketplace (`Wicked-Sick-Ltd/ai-marketplace`) | Claude, Codex and Copilot catalogues, commit-pinned | Pinned to the v0.8.0 release commit. Cursor catalogue empty. |
-| Cursor Marketplace | cursor.com/marketplace/publish, manually reviewed | Not listed. Metadata and `SUBMISSION.md` Cursor section ready for review (0.8.0). |
+| Claude plugin directory (Anthropic) | Developer portal, reviewed | Not listed. Resubmit 0.9.0; see [SUBMISSION.md](../SUBMISSION.md). |
+| Wicked Sick marketplace (`Wicked-Sick-Ltd/ai-marketplace`) | Claude, Codex and Copilot catalogues, commit-pinned; Cursor vendored | Pinned to the v0.9.0 release commit; Cursor vendored under `plugins/token-usage/`. |
+| Cursor Marketplace | cursor.com/marketplace/publish, manually reviewed | Not listed. Metadata and `SUBMISSION.md` Cursor section ready for review (0.9.0). |
 | cursor.directory | Community submission | Not listed. Optional. |
-| Gemini CLI extensions gallery | Automatic crawl of public repos | Not listed. Needs the `gemini-cli-extension` topic and a release tag. |
+| Google Antigravity / Gemini CLI extensions gallery | Antigravity plugin bundle (`~/.gemini/config/plugins/` or `agy plugin install`); automatic crawl of public repos with `gemini-extension.json` | Antigravity plugin bundle ready; `gemini-cli-extension` topic and release tag published. |
 | Grok Build (`xai-org/plugin-marketplace`) | Pull request, SHA-pinned | Not listed. Installs directly from GitHub today. |
 | GitHub Copilot CLI (`awesome-copilot`) | Pull request to the built-in marketplace | Not listed. Installs from the Wicked Sick marketplace today. |
 | VS Code agent plugins | Any marketplace repo in `chat.plugins.marketplaces` | Works through the Wicked Sick marketplace. |
@@ -44,15 +44,18 @@ manual step for the repository owner.
   paths, a README, tested locally. Commit a logo and set `"logo": "assets/logo.svg"`
   in `.cursor-plugin/plugin.json` (token-usage does this).
 - Manifest: `.cursor-plugin/plugin.json` (MCP server, hooks, report skill).
-- After it is published, also add the entry to the Cursor catalogue in
-  `Wicked-Sick-Ltd/ai-marketplace` (`.cursor-plugin/marketplace.json`).
+- After it is published, also keep the vendored entry in the Cursor catalogue in
+  `Wicked-Sick-Ltd/ai-marketplace` (`.cursor-plugin/marketplace.json`) synced.
 
-## Gemini CLI extensions gallery
+## Google Antigravity and Gemini CLI extensions gallery
 
-- The gallery indexes public repositories automatically, once a day, when they have
-  `gemini-extension.json` at the root, the GitHub topic `gemini-cli-extension`, and a
-  release tag. Keep the manifest `version` in step with the tag.
-- Done for 0.8.0: topic added and v0.8.0 published.
+- In Google Antigravity (`agy` CLI, Antigravity 2.0, Antigravity IDE), install under
+  `~/.gemini/config/plugins/token-usage/` or stage with `agy plugin install`.
+- The legacy Gemini CLI gallery indexes public repositories automatically, once a day,
+  when they have `gemini-extension.json` at the root, the GitHub topic
+  `gemini-cli-extension`, and a release tag. Keep the manifest `version` in step with the
+  tag.
+- Done for 0.8.0 and 0.9.0: topic added and release tags published.
 
 ## Grok Build
 
