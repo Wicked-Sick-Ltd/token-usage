@@ -1,39 +1,53 @@
-# Gemini CLI and GitHub Copilot CLI
+# Google Antigravity, Gemini CLI and GitHub Copilot CLI
 
-Both hosts use the existing local Python analyser and its five stdio MCP tools.
-Install Python 3.9+ with a working `python3` command (both manifests launch
-`python3`, because macOS and most Linux distributions ship no bare `python`). No Python dependencies are
-required. These integrations target the CLI products, not Gemini web chat,
-Gemini Code Assist, Copilot web chat, or the VS Code Copilot extension.
+All hosts use the existing local Python analyser and its five stdio MCP tools.
+Install Python 3.9+ with a working `python3` command (`python` on Windows when
+configuring local `mcp_config.json`; published manifests launch `python3` because
+macOS and most Linux distributions ship no bare `python`). No Python dependencies are
+required. These integrations target Google Antigravity (`agy` CLI, Antigravity 2.0
+desktop app, and Antigravity IDE), legacy Gemini CLI, and GitHub Copilot CLI — not
+Gemini web chat, Copilot web chat, or the VS Code Copilot extension.
 
-## Gemini CLI
+## Google Antigravity and Gemini CLI
 
-From a checkout, run `gemini extensions install /absolute/path/to/token-usage`.
-After publication, use
-`gemini extensions install https://github.com/Wicked-Sick-Ltd/token-usage`.
-Check `gemini extensions list` and `gemini mcp list`, then ask for a token report.
+In Google Antigravity (`agy` CLI, Antigravity 2.0, and Antigravity IDE), install as a
+plugin under `~/.gemini/config/plugins/token-usage/` (with `plugin.json`, `mcp_config.json`,
+`skills/report/`, `scripts/`, and `data/`) or stage via `agy plugin install`. In legacy
+Gemini CLI, run `gemini extensions install /absolute/path/to/token-usage` (or
+`gemini extensions install https://github.com/Wicked-Sick-Ltd/token-usage`).
 The manifest sets `TOKEN_USAGE_RUNTIME=gemini`; explicit tool calls can pass
 `runtime: "gemini"` and a `session_id` or `transcript` path.
 
-The adapter reads legacy JSON snapshots and current append-only JSONL recordings
-under `~/.gemini/tmp/*/chats/`. `TOKEN_USAGE_GEMINI_HOME` points directly at an
-alternative `.gemini` directory. Gemini's own `GEMINI_CLI_HOME` instead names the
-parent home directory. Project filtering compares Gemini's SHA-256 project hash;
-history displays that hash rather than inventing a project name.
+The `gemini` adapter reads:
 
-Repeated message IDs count once, using the largest recorded counters. Cached
-prompt tokens are separated from uncached input. Tool-use prompt tokens count as
-input; thought tokens count as output. Child and grandchild sessions roll into
-the parent once, with child rows shown as subsets. Child ownership uses its start
-timestamp and the latest preceding parent activity; Gemini does not record a
-durable command invocation relationship for this purpose.
+- **Google Antigravity JSONL transcripts** under
+  `~/.gemini/antigravity*/brain/<conversation-id>/.system_generated/logs/transcript.jsonl`
+  (covering Antigravity 2.0 `~/.gemini/antigravity/`, Antigravity IDE
+  `~/.gemini/antigravity-ide/`, and Antigravity CLI `~/.gemini/antigravity-cli/`).
+- **Legacy Gemini CLI recordings** (JSON snapshots and append-only JSONL) under
+  `~/.gemini/tmp/*/chats/`.
 
-Context rewinds retain the API work already consumed. Missing counters produce
-`partial` or `activity_only` reports. Deleted recordings cannot be reconstructed;
-legacy `$set.messages` checkpoints are flagged as incomplete. Unknown model prices
-remain unknown: add an [overlay](../README.md#configuration) to price a model.
-Gemini does not receive the Claude Stop-hook ledger or budget notification.
-`live --runtime gemini` polls the native recording instead.
+`TOKEN_USAGE_GEMINI_HOME` points directly at an alternative `.gemini` directory.
+Legacy Gemini CLI's `GEMINI_CLI_HOME` instead names the parent home directory. For
+Antigravity transcripts, workspace paths are inferred from recorded tool working
+directories (`Cwd` / `workspacePath`) and hashed for project filtering; for legacy
+Gemini CLI recordings, project filtering compares Gemini's SHA-256 project hash.
+
+Repeated message or step IDs count once, using the largest recorded counters. Cached
+prompt tokens are separated from uncached input (Antigravity `PLANNER_RESPONSE` steps
+record `input_tokens` already excluding `cache_read_tokens`, whereas legacy Gemini CLI
+`tokens.input` includes `tokens.cached`). Tool-use prompt tokens count as input; thought
+tokens count as output. In Antigravity, skills activated via `view_file` on
+`skills/<name>/SKILL.md` open `$<name>` segments, and subagent conversations linked via
+step 0 `SYSTEM_MESSAGE` `sender=<parent-session-id>` roll into the parent session once.
+In legacy Gemini CLI, child and grandchild sessions under `chats/<parent-id>/` roll into
+the parent once by start timestamp.
+
+Context rewinds and `<CONTEXT_SUMMARY>` compactions retain the API work already consumed.
+Missing counters produce `partial` or `activity_only` reports. Deleted recordings cannot
+be reconstructed; legacy `$set.messages` checkpoints are flagged as incomplete. Unknown
+model prices remain unknown: add an [overlay](../README.md#configuration) to price a
+model. `live --runtime gemini` polls the native recording directly.
 
 ## GitHub Copilot CLI
 

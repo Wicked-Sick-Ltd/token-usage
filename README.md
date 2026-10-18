@@ -48,7 +48,7 @@ Figures are estimates at published API prices, not a subscription invoice. The h
 | Claude Code / Cowork | Native transcripts and child transcripts | Original command/skill attribution, subagent rollups; Claude Code hooks and budget nudges. |
 | Codex | Native rollouts and linked children | Turns/skills, cache-aware totals, local MCP and trusted Stop hooks. |
 | Cursor | Hook ledger, Desktop SQLite, explicit Cloud export | Uses recorded usage when present; activity-only when the host omits counters. |
-| Gemini CLI | Native JSON/JSONL recordings | User activity labels, nested child rollups; direct polling for live reports. No Stop-hook budget nudges. |
+| Google Antigravity / Gemini CLI | Native Antigravity `transcript.jsonl` and Gemini CLI JSON/JSONL recordings | User activity and skill labels, nested subagent/child rollups; direct polling for live reports. No Stop-hook budget nudges. |
 | GitHub Copilot CLI | Native events plus a small capture extension | Per-call labels and subagent subsets with `--experimental`; uncaptured shutdown totals have partial attribution. |
 | Grok Build | Loads the Claude plugin unchanged | MCP tools and the report skill work and analyse your Claude Code, Codex, Cursor, Gemini and Copilot sessions. Grok's own sessions are not attributed yet, and the Stop hook is a silent no-op there. |
 | VS Code agent plugins / any MCP client | The bundled stdio MCP server | The five reporting tools over whichever runtime you name with `runtime`. No hooks. |
@@ -56,7 +56,7 @@ Figures are estimates at published API prices, not a subscription invoice. The h
 All five native runtimes support the report/history/insights/comparison tools and CLI
 live/dashboard/export commands. Token counts depend on the host's recorded fields;
 unknown prices remain unknown. Copilot support targets its CLI, and Gemini support
-targets Gemini CLI. See [Gemini/Copilot setup and verification](docs/gemini-copilot.md),
+targets Google Antigravity (`agy` CLI, Antigravity 2.0, Antigravity IDE) and Gemini CLI. See [Gemini/Copilot setup and verification](docs/gemini-copilot.md),
 [Codex notes](docs/codex-adapter.md) and [Cursor notes](docs/cursor-adapter.md).
 
 ## Features
@@ -110,7 +110,7 @@ JavaScript collector using its bundled SDK and Node standard library.
 | Cowork | the read-only sandbox mount `~/mnt/.claude/projects/…` and `/sessions/*/mnt/.claude/projects/…` | — |
 | Cursor | the hook ledgers below; Cursor Desktop's `state.vscdb`, opened with SQLite `mode=ro`, and `workspaceStorage/*/workspace.json` under Cursor's user directory; a Cloud Agent export `.json` only when you pass its path | `TOKEN_USAGE_CURSOR_DIR` |
 | Codex | rollout JSONL under `$CODEX_HOME/sessions` and `archived_sessions` (default `~/.codex`) | `TOKEN_USAGE_CODEX_HOME` |
-| Gemini CLI | `~/.gemini/tmp/*/chats/` JSON and JSONL recordings (or `$GEMINI_CLI_HOME/.gemini`) | `TOKEN_USAGE_GEMINI_HOME` |
+| Google Antigravity / Gemini CLI | `~/.gemini/antigravity*/brain/*/.system_generated/logs/transcript.jsonl` and `~/.gemini/tmp/*/chats/` JSON/JSONL recordings (or `$GEMINI_CLI_HOME/.gemini`) | `TOKEN_USAGE_GEMINI_HOME` |
 | Copilot CLI | `~/.copilot/session-state/*/events.jsonl` and `~/.copilot/token-usage/*.jsonl` | `TOKEN_USAGE_COPILOT_HOME`, else `COPILOT_HOME` |
 | All | the bundled `data/pricing.json` and your optional overlay `~/.config/token-usage/pricing.json` (honours `XDG_CONFIG_HOME`) | — |
 
@@ -182,7 +182,7 @@ Claude Code on Windows can use the PowerShell statusline under [Statusline](#sta
 | Claude Code | `claude plugin install token-usage@wickedsick` | Wicked Sick marketplace; Anthropic directory resubmission pending |
 | Codex | `codex plugin add token-usage@wickedsick` | Wicked Sick marketplace |
 | Cursor | Cursor Marketplace, or manual MCP | Marketplace listing pending |
-| Gemini CLI | `gemini extensions install https://github.com/Wicked-Sick-Ltd/token-usage` | Direct from GitHub (or a local checkout path) |
+| Google Antigravity / Gemini CLI | `~/.gemini/config/plugins/token-usage/` or `agy plugin install` / `gemini extensions install` | Local plugin bundle or GitHub checkout |
 | GitHub Copilot CLI | `copilot plugin install token-usage@wickedsick` | Wicked Sick marketplace (or `copilot plugin install /absolute/path/to/token-usage`) |
 | Grok Build | `grok plugin install Wicked-Sick-Ltd/token-usage --trust` | Direct from GitHub |
 | VS Code agent plugins | `chat.plugins.marketplaces` | Wicked Sick marketplace |
@@ -262,17 +262,24 @@ The Codex manifest `.codex-plugin/plugin.json` bundles the report skill
 (`hooks/hooks-codex.json`). Review the hooks through `/hooks` after installing;
 installation never grants hook trust. See [docs/codex-adapter.md](docs/codex-adapter.md).
 
-### Gemini CLI and GitHub Copilot CLI
+### Google Antigravity, Gemini CLI and GitHub Copilot CLI
 
 From a local checkout:
 
 ```bash
+# Google Antigravity (or stage into ~/.gemini/config/plugins/token-usage/)
+agy plugin install /absolute/path/to/token-usage
+
+# Legacy Gemini CLI
 gemini extensions install /absolute/path/to/token-usage
+
+# GitHub Copilot CLI
 copilot plugin install /absolute/path/to/token-usage
 copilot --experimental
 ```
 
-Gemini discovers the report skill and MCP server through `gemini-extension.json`.
+Antigravity and Gemini CLI discover the report skill and MCP server through
+`gemini-extension.json` (or `~/.gemini/config/plugins/token-usage/`).
 Copilot uses `.plugin/plugin.json`; experimental extensions capture its transient
 usage events. Once 0.8.0 is released, Gemini also installs straight from GitHub
 (`gemini extensions install https://github.com/Wicked-Sick-Ltd/token-usage`) and Copilot
