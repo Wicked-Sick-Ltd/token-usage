@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "token-usage": {
+      "command": "python3",
+      "args": [
+        "${PLUGIN_ROOT}/scripts/mcp_server.py"
+      ],
+      "env": {
+        "TOKEN_USAGE_RUNTIME": "gemini",
+        "PYTHONUTF8": "1"
+      }
+    }
+  }
+}

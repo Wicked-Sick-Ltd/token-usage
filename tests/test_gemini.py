@@ -217,3 +217,31 @@ def test_antigravity_accounting_discovery_skills_and_children(tu, mcp, tmp_path,
     assert total_with_child["output"] == 52
     assert with_child["segments"][-1]["subagents"][0]["description"] == "ag-child"
     assert with_child["segments"][-1]["subagents"][0]["output_tokens"] == 12
+
+
+def test_antigravity_stop_hook_and_native_plugin_manifests(tmp_path, monkeypatch):
+    path = antigravity_recording(tmp_path, monkeypatch)
+    ledger_dir = tmp_path / "ledger"
+    env = {**os.environ, "TOKEN_USAGE_LEDGER_DIR": str(ledger_dir), "PYTHONUTF8": "1"}
+    payload = {"conversationId": "ag-parent", "transcriptPath": str(path)}
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), "hook"],
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        env=env,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {}
+    ledger = json.loads((ledger_dir / "gemini-ag-parent.json").read_text(encoding="utf-8"))
+    assert ledger["runtime"] == "gemini"
+    assert ledger["total"]["usage"]["output"] == 40
+
+    plugin_root = SCRIPT.parent.parent
+    assert json.loads((plugin_root / "plugin.json").read_text(encoding="utf-8"))["name"] == "token-usage"
+    mcp_cfg = json.loads((plugin_root / "mcp_config.json").read_text(encoding="utf-8"))
+    assert mcp_cfg["mcpServers"]["token-usage"]["env"]["TOKEN_USAGE_RUNTIME"] == "gemini"
+    hooks_cfg = json.loads((plugin_root / "hooks.json").read_text(encoding="utf-8"))
+    assert "Stop" in hooks_cfg["token-usage"]
