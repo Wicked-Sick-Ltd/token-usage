@@ -6,6 +6,13 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Google Antigravity native plugin manifests (`plugin.json`, `mcp_config.json`, `hooks.json`)** —
+  ships root-level Antigravity plugin configuration alongside `gemini-extension.json`, plus
+  camelCase `Stop` hook support (`conversationId`, `transcriptPath`, `{}` stdout response) and
+  multi-runtime CLI examples in `skills/report/SKILL.md`.
+
 ## [0.9.0] — 2026-10-18
 
 ### Added

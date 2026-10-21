@@ -1,0 +1,11 @@
+{
+  "token-usage": {
+    "Stop": [
+      {
+        "type": "command",
+        "command": "python3 scripts/token_usage.py hook",
+        "timeout": 15
+      }
+    ]
+  }
+}

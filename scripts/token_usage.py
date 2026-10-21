@@ -4952,10 +4952,23 @@ def _flush_stdout():
 def _run_hook(payload, runtime="claude"):
     if payload is None:
         return 0
+    is_antigravity = (
+        ("transcriptPath" in payload or "conversationId" in payload)
+        and "transcript_path" not in payload
+    )
+    if is_antigravity and runtime == "claude":
+        runtime = "gemini"
     transcript = payload.get("transcript_path")
-    session_id = re.sub(r"[^A-Za-z0-9_-]", "", str(payload.get("session_id", "unknown"))) or "unknown"
+    if transcript is None and is_antigravity:
+        transcript = payload.get("transcriptPath")
+    raw_sid = payload.get("session_id")
+    if raw_sid is None and is_antigravity:
+        raw_sid = payload.get("conversationId")
+    session_id = re.sub(r"[^A-Za-z0-9_-]", "", str(raw_sid if raw_sid is not None else "unknown")) or "unknown"
     # A non-string transcript_path is not a path: Path() would raise TypeError.
     if not isinstance(transcript, str) or not transcript or not Path(transcript).exists():
+        if is_antigravity or runtime == "gemini":
+            print("{}")
         return 0
     transcript = Path(transcript)
     if runtime == "claude" and "subagents" in transcript.parts and transcript.name != f"{session_id}.jsonl":
@@ -4967,15 +4980,15 @@ def _run_hook(payload, runtime="claude"):
             return 0  # never ledger sidechain-only data under the session id
         transcript = main
     is_subagent_stop = payload.get("hook_event_name") == "SubagentStop"
-    if runtime == "codex":
-        parsed = get_runtime_adapter("codex").parse(transcript)
+    if runtime in ("codex", "gemini"):
+        parsed = get_runtime_adapter(runtime).parse(transcript)
         data = apply_measurement_costs(aggregate(parsed["segments"], load_pricing()), parsed["measurement"])
-        data.update(runtime="codex", measurement=parsed["measurement"], warnings=parsed["warnings"])
+        data.update(runtime=runtime, measurement=parsed["measurement"], warnings=parsed["warnings"])
     else:
         data = aggregate(parse_session(transcript), load_pricing())
     data["session_id"] = session_id
     data["transcript_path"] = str(transcript)
-    ledger = ledger_dir() / (f"codex-{session_id}.json" if runtime == "codex" else f"{session_id}.json")
+    ledger = ledger_dir() / (f"{runtime}-{session_id}.json" if runtime != "claude" else f"{session_id}.json")
 
     prior_multiple = _prior_budget_multiple(ledger)
     limit = budget_from_env()
@@ -5011,6 +5024,8 @@ def _run_hook(payload, runtime="claude"):
         print(json.dumps({"systemMessage":
             f"token-usage: session estimate ${cost:.2f} has passed "
             f"{passed} — top consumer: {top}"}))
+    elif is_antigravity or runtime == "gemini":
+        print("{}")
     return 0
 
 

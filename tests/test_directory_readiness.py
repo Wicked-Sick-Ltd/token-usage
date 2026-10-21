@@ -18,6 +18,7 @@ MANIFESTS = {
     "codex": PLUGIN_ROOT / ".codex-plugin" / "plugin.json",
     "cursor": PLUGIN_ROOT / ".cursor-plugin" / "plugin.json",
     "gemini": PLUGIN_ROOT / "gemini-extension.json",
+    "antigravity": PLUGIN_ROOT / "plugin.json",
     "copilot": PLUGIN_ROOT / ".plugin" / "plugin.json",
 }
 

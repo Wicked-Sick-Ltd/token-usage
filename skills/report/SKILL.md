@@ -68,9 +68,21 @@ python3 "<plugin-root>/scripts/token_usage.py" top_consumers [--by session|comma
 python3 "<plugin-root>/scripts/token_usage.py" report --runtime cursor
 python3 "<plugin-root>/scripts/token_usage.py" report --runtime cursor /path/to/cloud-export.json
 python3 "<plugin-root>/scripts/token_usage.py" json --runtime cursor
+
+# Google Antigravity / Gemini CLI
+python3 "<plugin-root>/scripts/token_usage.py" report --runtime gemini [transcript-path]
+python3 "<plugin-root>/scripts/token_usage.py" history --runtime gemini --since 7d --by project
+
+# GitHub Copilot CLI
+python3 "<plugin-root>/scripts/token_usage.py" report --runtime copilot [transcript-path]
+python3 "<plugin-root>/scripts/token_usage.py" history --runtime copilot --since 7d --by project
+
+# OpenAI Codex CLI / Desktop
+python3 "<plugin-root>/scripts/token_usage.py" report --runtime codex [transcript-path]
+python3 "<plugin-root>/scripts/token_usage.py" history --runtime codex --since 7d --by project
 ```
 
-- With no argument, `report` and `json` auto-discover the most recently modified session transcript for the current working directory's project (`~/.claude/projects/<cwd-slug>/*.jsonl`) — normally the live session. In **Cowork** (the Claude desktop app), where there is no Claude Code project for the cwd, discovery falls back to the read-only transcript mounted in the session sandbox (`<mount>/.claude/projects/…`, `/sessions/*/mnt/.claude/projects/…`). Failing both of those, it falls back further to the newest transcript under **any** project on the machine — so running `report`/`json`/`insights` from a directory with no Claude Code history of its own will analyse whatever project's session is most recent rather than reporting "not found". Pass an explicit transcript path (or `session_id` for the MCP tools) when it matters which session gets analysed.
+- With no argument, `report` and `json` auto-discover the most recently modified session transcript for the selected runtime and current working directory's project (`~/.claude/projects/<cwd-slug>/*.jsonl` for Claude Code, `~/.gemini/antigravity*/brain/<id>/.system_generated/logs/transcript.jsonl` or `~/.gemini/tmp/*/chats/` for Google Antigravity / Gemini CLI, `~/.copilot/session-state/` for Copilot CLI, `~/.codex/sessions/` for Codex, or Cursor's workspace state) — normally the live session. In **Cowork** (the Claude desktop app), where there is no Claude Code project for the cwd, discovery falls back to the read-only transcript mounted in the session sandbox (`<mount>/.claude/projects/…`, `/sessions/*/mnt/.claude/projects/…`). Failing project-scoped lookup, discovery falls back to the newest transcript under **any** project on the machine for that runtime — so running `report`/`json`/`insights` from a directory with no history of its own will analyse whatever project's session is most recent rather than reporting "not found". Pass an explicit transcript path (or `session_id` for the MCP tools) when it matters which session gets analysed.
 - If the user supplied a path, treat it as the transcript path (a session's `.jsonl`) and pass it through.
 - For `history`, `--since` accepts relative values (`7d`, `30d`) or ISO dates (`2026-06-01`). `--by` defaults to `project`. `--project` is a substring filter that composes with any `--by`. Relative `--since` windows append a burn-rate footer (avg $/day, projected $/week).
 - For `insights`, pass a transcript for session mode OR `--since` for window mode — not both. Session mode checks cost outlier vs the 30-day project median, prompt-cache regression, ad-hoc-work dominance, unpriced models, agent fan-out concentration, and budget pace. Window mode checks spend trend, the top mover behind an increase, and unpriced models across the window. `--project` composes with `--since` the same way it does for `history`; it is a window-mode filter only, so passing it without `--since` is an error rather than a silently ignored flag.
