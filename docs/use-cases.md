@@ -2,10 +2,12 @@
 
 ## The problem it solves
 
-Claude Code tells you session totals (`/cost`, OTel metrics), and community tools
-aggregate by day or model, but nothing answers *"the PR review cost 120k tokens, the
-refactor cost 800k"*. token-usage parses the session transcript and attributes every
-token to the slash command or skill (and its subagents) that consumed it:
+token-usage is an AI agent plugin for case studies of agent-driven work. Hosts
+often show a session total. They do not say which activity in the run consumed
+the tokens, or what the subagents inside that activity added. token-usage
+attributes recorded usage to the command, skill, turn or generation that consumed
+it, on Claude Code, Cowork, Cursor, OpenAI Codex, Google Antigravity, Gemini CLI
+and GitHub Copilot CLI:
 
 ```
 | Activity                      | Calls | Output | Input | Cache read | Cache write | Est. cost |
@@ -37,10 +39,10 @@ only the turns before the session's first command.
    figure such as `⏶ 214k out · $33.87 · top: /code-review`, updated after every turn
    from the live ledger. Set `TOKEN_USAGE_BUDGET_USD` for a nudge when a session crosses
    your budget.
-5. **Auditing a past or headless session.** The standalone CLI
-   (`python3 scripts/token_usage.py report <transcript.jsonl>`) analyses any transcript
-   outside Claude Code, and `json` output feeds dashboards or CI cost tracking of
-   `claude -p` automation.
+5. **Auditing a past or headless run.** The standalone CLI
+   (`python3 scripts/token_usage.py report --runtime <host> <recording>`) analyses a
+   local recording, including a Cursor Cloud Agent export, and `json` output feeds
+   a case study or a CI check. It does not measure wall-clock duration.
 6. **Sanity-checking subagent-heavy sessions.** Sessions with dozens of agents are where
    naive counting fails: Claude Code writes the same request's usage to several
    transcript entries while streaming, so a plain sum overcounts by about 2.5×.
@@ -54,10 +56,12 @@ only the turns before the session's first command.
 9. **Asking without a shell.** With the plugin enabled, the bundled MCP server answers
    "where did my tokens go?" or "which sessions cost the most this month?" through the
    `session_cost`, `insights` and `top_consumers` tools.
-10. **The same questions on the other hosts.** `--runtime codex`, `cursor`, `gemini`
-    or `copilot` runs the reports over that host's local recordings. See the
+10. **The same questions on every supported host.** `--runtime claude`, `codex`,
+    `cursor`, `gemini` or `copilot` reads that host only. See the
     [Codex](codex-adapter.md), [Cursor](cursor-adapter.md) and
     [Gemini and Copilot](gemini-copilot.md) notes for what each can measure.
-    Gemini has no Stop-hook budget nudge. Copilot can recover a shutdown total
-    when the capture extension missed the calls, and that recovered portion is
-    labelled `partial`.
+    Antigravity's `Stop` hook can emit a budget nudge. Legacy Gemini CLI has no
+    hook. Copilot can recover a shutdown total when the capture extension missed
+    the calls, and that recovered portion is labelled `partial`. There is no
+    multi-machine fleet rollup: subagents roll up inside one run, and each
+    command reads one host.

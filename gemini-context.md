@@ -7,6 +7,8 @@ and `python3` on macOS/Linux. Resolve bundled scripts relative to this plugin.
 
 Read only local Antigravity (`~/.gemini/antigravity*/brain/*/.system_generated/logs/transcript.jsonl`)
 and Gemini CLI (`~/.gemini/tmp/*/chats/`) session recordings. Never inspect credentials
-or send transcripts elsewhere. Preserve measurement warnings and unknown prices in the
-answer. Reasoning tokens count as output; cached input counts once. API-equivalent
-cost estimates do not represent subscription charges or remaining quota.
+or send transcripts elsewhere. The Antigravity `Stop` hook writes
+`~/.cache/token-usage/gemini-<session-id>.json` and prints `{}` unless a budget
+nudge fires. Legacy Gemini CLI has no hook. Preserve measurement warnings and
+unknown prices in the answer. Reasoning tokens count as output; cached input counts
+once. API-equivalent cost estimates do not represent subscription charges or remaining quota.

@@ -91,11 +91,11 @@ than guessing.
 ## Releases
 
 Versioning is semver. Keep `version` identical in `.claude-plugin/plugin.json`,
-`.codex-plugin/plugin.json`, `.cursor-plugin/plugin.json`, `.plugin/plugin.json`
-and `gemini-extension.json`, and raise it for every
-release: the Claude plugin directory treats each version separately. User-visible
-changes get a line in `CHANGELOG.md` under Unreleased, which is rolled into a
-version heading at release time.
+`.codex-plugin/plugin.json`, `.cursor-plugin/plugin.json`, `.plugin/plugin.json`,
+`gemini-extension.json` and the Antigravity root `plugin.json`, and raise it
+for every release: the Claude plugin directory treats each version separately.
+User-visible changes get a line in `CHANGELOG.md` under Unreleased, which is
+rolled into a version heading at release time. The current release is 0.9.0.
 
 ## Reporting issues
 

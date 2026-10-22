@@ -10,8 +10,17 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 - **Google Antigravity native plugin manifests (`plugin.json`, `mcp_config.json`, `hooks.json`)** —
   ships root-level Antigravity plugin configuration alongside `gemini-extension.json`, plus
-  camelCase `Stop` hook support (`conversationId`, `transcriptPath`, `{}` stdout response) and
+  camelCase `Stop` hook support (`conversationId`, `transcriptPath`, `{}` stdout response, or a
+  budget `systemMessage` when `TOKEN_USAGE_BUDGET_USD` is crossed) and
   multi-runtime CLI examples in `skills/report/SKILL.md`.
+- **Docs describe a multi-agent plugin.** README, security policy, submission copy,
+  marketplace notes and the runtime guides lead with the assistants this repository
+  supports (Claude Code, Cowork, Cursor, OpenAI Codex, Google Antigravity, Gemini CLI,
+  Copilot CLI, plus Grok Build, VS Code agent plugins and any MCP client). They no
+  longer present token-usage as a Claude-only plugin. Cloud Agent reporting is the
+  explicit export path; local Cursor hooks and MCP do not follow the VM. The security
+  contact is hello@wickedsick.com. Wall-clock duration and multi-machine fleet rollups
+  are documented as unsupported.
 
 ## [0.9.0] — 2026-10-18
 

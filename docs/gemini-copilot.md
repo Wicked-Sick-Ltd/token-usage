@@ -49,6 +49,19 @@ be reconstructed; legacy `$set.messages` checkpoints are flagged as incomplete. 
 model prices remain unknown: add an [overlay](../README.md#configuration) to price a
 model. `live --runtime gemini` polls the native recording directly.
 
+### Antigravity Stop hook
+
+Root `hooks.json` registers `Stop` for Google Antigravity. It runs
+`python3 scripts/token_usage.py hook` with a 15-second timeout and fails open.
+A payload that carries `conversationId` or `transcriptPath` and does not carry
+`transcript_path` is stored as the `gemini` runtime in
+`~/.cache/token-usage/gemini-<session-id>.json` (override `TOKEN_USAGE_LEDGER_DIR`).
+That ledger includes the first 120 characters of each segment prompt and does not
+repoint `latest.json`. Stdout is `{}`, or one budget `systemMessage` when
+`TOKEN_USAGE_BUDGET_USD` is crossed. Antigravity does not register `SubagentStop`.
+Legacy Gemini CLI does not register this hook. This packaging is on `main` and is
+listed under Unreleased; tag `v0.9.0` does not include the root hook file.
+
 ## GitHub Copilot CLI
 
 From a checkout, run `copilot plugin install /absolute/path/to/token-usage`.
@@ -119,7 +132,7 @@ Copilot CLI 1.0.91 installed the plugin and discovered its skill and MCP server.
 provider in offline mode, with OpenAI and Anthropic wire formats. It verifies all
 five tool schemas, captured counters, resumed totals and prompt redaction without
 credentials or model spend. Set `COPILOT_TEST_CLI` to the executable to rerun it.
-It does not claim validation against a paid Copilot account or cloud agent.
+It does not claim validation against a paid Copilot account or a Copilot cloud agent.
 
 Contracts checked on 2026-10-05:
 

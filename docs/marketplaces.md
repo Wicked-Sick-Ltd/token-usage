@@ -1,10 +1,13 @@
 # Marketplaces and directories
 
-Where token-usage is listed, what each directory requires, and what is still to do.
-Nothing in this repository submits anything: every submission and listing PR is a
-manual step for the repository owner.
+Where the token-usage AI agent plugin is listed, what each directory requires,
+and what is still to do. Each directory lists one host package of the same
+plugin. Nothing in this repository submits anything: every submission and
+listing PR is a manual step for the repository owner.
 
-**Last verified:** 2026-10-18, for the 0.9.0 release.
+**Directory status last verified:** 2026-10-18, for the 0.9.0 release. This
+pass did not re-check live marketplace pages. `main` includes unreleased
+Antigravity root plugin files beyond tag `v0.9.0`.
 
 ## Status
 
@@ -51,6 +54,9 @@ manual step for the repository owner.
 
 - In Google Antigravity (`agy` CLI, Antigravity 2.0, Antigravity IDE), install under
   `~/.gemini/config/plugins/token-usage/` or stage with `agy plugin install`.
+  On `main`, that bundle includes root `plugin.json`, `mcp_config.json` and a
+  `Stop` hook in `hooks.json`. Tag `v0.9.0` has the `gemini` runtime and
+  `gemini-extension.json` without that root hook file.
 - The legacy Gemini CLI gallery indexes public repositories automatically, once a day,
   when they have `gemini-extension.json` at the root, the GitHub topic
   `gemini-cli-extension`, and a release tag. Keep the manifest `version` in step with the

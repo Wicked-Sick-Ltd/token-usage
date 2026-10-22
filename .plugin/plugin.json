@@ -1,7 +1,7 @@
 {
   "name": "token-usage",
   "version": "0.9.0",
-  "description": "Local Copilot CLI token reports, command attribution and API cost estimates.",
+  "description": "Copilot CLI package of the token-usage AI agent plugin: local token reports, command attribution and API cost estimates.",
   "author": {
     "name": "Wicked Sick Limited",
     "email": "craig@wickedsick.com",

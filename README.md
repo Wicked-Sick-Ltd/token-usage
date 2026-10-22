@@ -2,11 +2,26 @@
 
 <p align="center"><img src="assets/logo.svg" alt="token-usage logo" width="96"></p>
 
-**Where did my tokens go?** A free, public MIT plugin from Wicked Sick Limited for **Claude Code**, **Codex**, **Cursor**, **Google Antigravity / Gemini CLI** and **GitHub Copilot CLI** (it also installs unchanged in **Grok Build**, VS Code agent plugins and any MCP client) that attributes token usage to the work that consumed it — per-activity breakdowns (slash commands and skills in Claude Code, Cowork, and Antigravity; turns and skills in Codex; composer generations in Cursor), subagent rollups, cross-session history, optional live ledgers, and cache-aware API-price estimates.
+**AI agent plugin: where did my tokens go?** token-usage is a free, public MIT plugin from Wicked Sick Limited for measuring token use across a fleet of agents and across the assistants this repository supports. It attributes recorded usage to the work that consumed it — one row per activity in a run, with subagents rolled into the activity that spawned them — so a case study of agent-driven work can say what the review cost versus the refactor, not only that the session was large.
 
-📖 **Documentation:** this README (quick start, what the plugin does, install, configuration) and the [`docs/`](docs/README.md) folder. The [CLI and MCP reference](docs/reference.md) lists every flag and tool argument. Also: [use cases](docs/use-cases.md), [architecture](docs/architecture.md), and the [Codex](docs/codex-adapter.md), [Cursor](docs/cursor-adapter.md) and [Gemini/Copilot](docs/gemini-copilot.md) notes.
+Current release: **0.9.0**. Manifests agree on that version. `main` also carries the unreleased Antigravity plugin files listed under [Unreleased](CHANGELOG.md#unreleased). History is in [CHANGELOG.md](CHANGELOG.md).
 
-Claude Code tells you session totals (`/cost`, OTel metrics) and tools like ccusage aggregate by day/model, but nothing answers *"the PR review cost 120k tokens, the refactor cost 800k"*. token-usage fills that gap.
+It runs locally, calls no model, and sends nothing off the machine. Figures are cache-aware API-price estimates, not a subscription invoice. Reports do not include wall-clock duration, and they do not roll usage up across machines or accounts. Each call reads one host.
+
+**Supported assistants**
+
+| Assistant | What this repo ships | What it does not attribute |
+|---|---|---|
+| Claude Code and Cowork | `.claude-plugin/` | — |
+| Cursor, including an explicit Cloud Agent export | `.cursor-plugin/` | Cursor plan credits or invoices |
+| OpenAI Codex (CLI and Desktop plugin) | `.codex-plugin/` | ChatGPT subscription charges; the public Codex directory does not list this plugin |
+| Google Antigravity (`agy`, Antigravity 2.0, Antigravity IDE) and legacy Gemini CLI | root `plugin.json`, `mcp_config.json`, `hooks.json`, and `gemini-extension.json` | Gemini web chat |
+| GitHub Copilot CLI | `.plugin/` | Copilot web chat, the VS Code Copilot extension, Copilot credits |
+| Grok Build | the Claude-format package, unchanged | Grok's own sessions |
+| VS Code agent plugins | the Claude-format and Copilot packages via a marketplace | VS Code Copilot Chat's own usage |
+| Any MCP client | stdio `scripts/mcp_server.py` | Hosts with no runtime adapter |
+
+📖 **Documentation:** this README and [`docs/`](docs/README.md). Per-flag detail is in the [CLI and MCP reference](docs/reference.md). Also: [use cases](docs/use-cases.md), [architecture](docs/architecture.md), [marketplaces](docs/marketplaces.md), and the [Codex](docs/codex-adapter.md), [Cursor](docs/cursor-adapter.md) and [Gemini/Copilot](docs/gemini-copilot.md) notes.
 
 ```
 | Activity                      | Calls | Output | Input | Cache read | Cache write | Est. cost |
@@ -17,90 +32,65 @@ Claude Code tells you session totals (`/cost`, OTel metrics) and tools like ccus
 | **Total**                     |       |  214k  | 13.8k |      46.1M |        1.5M |    $33.87 |
 ```
 
+`(+5 agents)` means five subagent transcripts were rolled into that row. They are included once, not added again.
+
 ## Quick start
 
-You need Python 3.9 or newer, available as `python3` on your PATH. The script uses only the Python standard library, so there is nothing else to install for the analyser itself.
+Python 3.9 or newer must be available as `python3`. The analyser uses only the Python standard library.
 
-From a checkout of this repository:
+From a checkout:
 
 ```bash
 python3 scripts/token_usage.py report
+python3 scripts/token_usage.py report --runtime cursor
+python3 scripts/token_usage.py report --runtime codex
+python3 scripts/token_usage.py report --runtime gemini
+python3 scripts/token_usage.py report --runtime copilot
 ```
 
-That prints a per-activity table for the newest session it can find for the current directory. Pass a recording path when you want one session in particular. Pass `--runtime cursor`, `codex`, `gemini` or `copilot` when that session is not a Claude Code transcript.
+With no path, `report` uses the newest session it can find for that runtime and the current directory. Pass a recording path for one session. The default runtime is `claude`, or `TOKEN_USAGE_RUNTIME` when that is set.
 
-To ask from inside an agent, install the plugin for that host ([Installation](#installation)), then ask "where did my tokens go this session?" or run `/token-usage:report` where the report skill is loaded.
+Inside an agent, install the package for that host ([Installation](#installation)), then ask "where did my tokens go this session?" or run `/token-usage:report` where the report skill is loaded. Pass `runtime` on every MCP call so the answer stays on that host.
 
 ## What it does
 
-token-usage reads usage the agent host has already recorded on this machine and attributes it to the work that consumed it. It does not call a model, and it does not send usage anywhere.
+token-usage reads usage the agent host has already recorded on this machine and attributes it to the activity that consumed it.
 
-- **One session.** Which command, skill, turn or activity used the tokens, with subagents rolled into the work that spawned them.
-- **Across sessions.** History by project, day, command or model; the costliest sessions or labels; rule-based insights.
-- **Optional views.** A terminal live view, one HTML file, and a JSONL export. Those three are command-line commands. The MCP server exposes the five reporting tools.
+- **One run.** Which command, skill, turn or composer generation used the tokens. Subagents roll into the parent activity, so a fleet of agents in one run still reconciles to one total.
+- **Across sessions of one host.** History by project, day, command or model; the costliest sessions or labels; rule-based insights. Day buckets and `--since` place runs in calendar time. They are not a duration timer.
+- **Case-study output.** Markdown for a write-up, JSON for a script, CSV from `history`, one HTML file from `dashboard`, and JSONL from `export` for another local tool. The MCP server exposes five reporting tools. `dashboard`, `live` and `export` are command-line only.
 
-Figures are estimates at published API prices, not a subscription invoice. The host table below is what each client can measure. Claude Code detail is under [Features](#features). Per-flag and per-tool detail is in the [reference](docs/reference.md).
-
-## Host support
-
-| Host | Usage source | Attribution and limits |
+| Host | Usage source | Attribution |
 |---|---|---|
-| Claude Code / Cowork | Native transcripts and child transcripts | Original command/skill attribution, subagent rollups; Claude Code hooks and budget nudges. |
-| Codex | Native rollouts and linked children | Turns/skills, cache-aware totals, local MCP and trusted Stop hooks. |
-| Cursor | Hook ledger, Desktop SQLite, explicit Cloud export | Uses recorded usage when present; activity-only when the host omits counters. |
-| Google Antigravity / Gemini CLI | Native Antigravity `transcript.jsonl` and Gemini CLI JSON/JSONL recordings | User activity and skill labels, nested subagent/child rollups; direct polling for live reports. No Stop-hook budget nudges. |
-| GitHub Copilot CLI | Native events plus a small capture extension | Per-call labels and subagent subsets with `--experimental`; uncaptured shutdown totals have partial attribution. |
-| Grok Build | Loads the Claude plugin unchanged | MCP tools and the report skill work and analyse your Claude Code, Codex, Cursor, Gemini and Copilot sessions. Grok's own sessions are not attributed yet, and the Stop hook is a silent no-op there. |
-| VS Code agent plugins / any MCP client | The bundled stdio MCP server | The five reporting tools over whichever runtime you name with `runtime`. No hooks. |
+| Claude Code / Cowork | Native transcripts and child transcripts | Command and skill labels, subagent rollups. Claude Code `Stop` and `SubagentStop` hooks and budget nudges. Cowork has no hooks. |
+| Codex | Native rollouts and linked children | Turns and explicit skills, cache-aware totals, local MCP, trusted `Stop` / `SubagentStop` hooks. |
+| Cursor | Hook ledger, Desktop SQLite, explicit Cloud Agent export | Recorded usage when the host sent counters; activity-only when it did not. |
+| Google Antigravity / Gemini CLI | Antigravity `transcript.jsonl` and Gemini CLI JSON/JSONL | User activity and skill labels, nested subagent rollups. Antigravity's root `Stop` hook updates a `gemini-` ledger. Legacy Gemini CLI has no hook; `live` polls the recording. |
+| GitHub Copilot CLI | Native events plus a capture extension | Per-call labels and subagent subsets with `--experimental`. A recovered shutdown total is `partial`. No hooks. |
+| Grok Build | Loads the Claude-format package | MCP tools and the report skill analyse the runtimes above. Grok's own sessions are not attributed. The `Stop` hook exits 0 and writes nothing when the payload has no `transcript_path`. |
+| VS Code agent plugins / any MCP client | The bundled stdio MCP server | The five reporting tools for the `runtime` you name. No hooks. |
 
-All five native runtimes support the report/history/insights/comparison tools and CLI
-live/dashboard/export commands. Token counts depend on the host's recorded fields;
-unknown prices remain unknown. Copilot support targets its CLI, and Gemini support
-targets Google Antigravity (`agy` CLI, Antigravity 2.0, Antigravity IDE) and Gemini CLI. See [Gemini/Copilot setup and verification](docs/gemini-copilot.md),
-[Codex notes](docs/codex-adapter.md) and [Cursor notes](docs/cursor-adapter.md).
+All five native runtimes (`claude`, `codex`, `cursor`, `gemini`, `copilot`) support report, history, insights, comparison, live, dashboard and export. Unknown prices stay unknown. `auto` picks one runtime when the choice is unambiguous and never mixes hosts in one call.
 
 ## Features
 
-The command, hook and budget behavior below describes the original Claude integration;
-the host table above identifies the corresponding capabilities elsewhere.
+These behaviours are shared. Host limits are in the table above and in the runtime notes.
 
-- **Per-command attribution** — a slash command owns every turn until the next command, so multi-turn exchanges stay attributed to the command that triggered them. `(no command)` covers only turns that occurred before the first command in the session.
-- **Works in Cowork too** — in the Claude desktop app (Cowork), skills run mid-turn via the Skill tool rather than a `<command-name>` prompt; each gets its own sticky segment (e.g. `/pptx`, `/report`). Transcript discovery falls back to the Cowork sandbox mount when there's no Claude Code project directory for the cwd, so `report` just works in both.
-- **Subagent rollup** — agents spawned during a command (sidechains under `<session>/subagents/`) count toward the command that spawned them, labelled `(+N agents)`.
-- **Per-agent-type breakdown** — `report --agents` adds ↳ indented rows showing token usage by agent type (e.g. `↳ claude-code-guide`, `↳ general-purpose`). These rows are **subsets** of their parent row's totals, not additive — the parent already includes them all.
-- **Per-model breakdown** — `report --models` adds ↳ rows splitting each activity by model (e.g. Opus main loop vs Haiku subagents). Subset rows, same as `--agents`; `json` output always carries the `models` arrays.
-- **Cross-session history** — `history` rolls up token usage across all sessions, grouped by project, day (local time), command, or model, with a `--project` substring filter that composes with any grouping and `--csv` for spreadsheet-ready raw numbers. An incremental per-transcript cache (`~/.cache/token-usage/index/`) means transcripts re-parse only when they change; warm scans are near-instant.
-- **Burn rate** — `history --since 7d` appends an average $/day and a projected $/week for the window.
-- **Compare mode** — `report --diff OLD NEW` (and `json --diff`) shows per-label cost and output deltas between two transcripts. Deterministic ordering; when either side has unresolvable model pricing the delta renders as `—` rather than silently faking a saving.
-- **Correct dedup** — Claude Code writes the same API request's usage to multiple transcript entries while streaming. token-usage dedups by `requestId`, keeping per-field maxima across duplicates (robust to partial snapshots); a naive sum overcounts ~2.5×.
-- **Cache-aware cost estimates** — per-model pricing with cache reads at 0.1× the input rate (0.025× on Fable 5.1 and Mythos 5.1), 5-minute cache writes at 1.25×, and 1-hour cache writes at 2×. Mixed-model sessions (e.g. Opus main loop + Haiku subagents) are priced per model, and reports show what prompt caching saved you. Bedrock (`us.anthropic.…`) and OpenRouter-style (`anthropic/…`) model IDs resolve too.
-- **Budget nudges** — set `TOKEN_USAGE_BUDGET_USD` and the Stop hook emits a `systemMessage` warning when the session's estimated cost crosses the threshold, and again at each further multiple (2×, 3×, …). At most one warning per multiple.
-- **Live ledger** — Stop and SubagentStop hooks keep `~/.cache/token-usage/<session-id>.json` current after every turn and every finished subagent, so reports are instant and a statusline stays fresh even during long multi-agent turns.
-- **Insights** — `insights` runs rule-based checks over the current session
-  (cost outlier vs your 30-day project median, prompt-cache regressions,
-  ad-hoc-work dominance, agent fan-out concentration, budget pace, unpriced
-  models) or a window (`insights --since 30d`: spend trend, top mover). Pure
-  arithmetic — no LLM, no network. "No notable findings." is a valid answer.
-- **User pricing overlay** — drop rates into `~/.config/token-usage/pricing.json`
-  to price new models the bundled table doesn't know yet; reports name any
-  unpriced models they encounter.
-- **MCP server** — a bundled stdio MCP server (`scripts/mcp_server.py`, stdlib only)
-  exposes `session_cost`, `history`, `insights`, `diff` and `top_consumers` as tools.
-  Claude Code starts it automatically with the plugin; Claude desktop can register the
-  same script. JSON by default, `format: "markdown"` for the rendered tables.
-  Dashboard, live, and export stay CLI-only (local file writes; not exposed via MCP).
-- **Top consumers** — `top_consumers --by session|command` lists the costliest sessions
-  or command labels in a window, the question `history` could not answer directly. A row
-  whose cost is only a priced subtotal (some of its usage ran on an unpriced model) is
-  marked `*` and footnoted, since the rows are ranked on that number.
+- **Per-activity attribution.** A label sticks until the next command, skill or generation. `(no command)` or `(no activity)` is only the work before the first label. Subagent rows from `--agents` and per-model rows from `--models` are subsets of the parent, not extra totals.
+- **Cross-session history.** `history` groups by project, day (local time), command or model. `--project` filters. `--csv` is for a spreadsheet. An index under `~/.cache/token-usage/index/` re-parses a transcript only when it changes.
+- **Burn rate.** `history --since 7d` adds an average $/day and a projected $/week for that window.
+- **Compare.** `report --diff OLD NEW` shows per-label cost and output deltas. An unpriced side renders `—`.
+- **Cache-aware estimates.** Cache reads at 0.1× input (0.025× on Fable 5.1 and Mythos 5.1), 5-minute cache writes at 1.25×, 1-hour writes at 2×. Mixed-model sessions are priced per model. Bedrock (`us.anthropic.…`) and OpenRouter-style (`anthropic/…`) ids resolve. Rates live in `data/pricing.json` (checked September 2026) plus an optional overlay.
+- **Claude Code dedup.** The same API request is written to several transcript entries while streaming. token-usage dedups by `requestId`, keeping per-field maxima. A naive sum overcounts by about 2.5×.
+- **Budget nudges.** `TOKEN_USAGE_BUDGET_USD` makes the Claude Code, Codex and Antigravity `Stop` hooks emit one `systemMessage` per crossed multiple. Cursor's hook prints `{}` and does not nudge. Copilot and legacy Gemini CLI register no hook.
+- **Insights and top consumers.** `insights` is arithmetic only: no LLM and no network. `top_consumers` ranks sessions or labels. A `*` marks a row priced on only part of its usage.
+- **MCP server.** `scripts/mcp_server.py` exposes `session_cost`, `history`, `insights`, `diff` and `top_consumers`. JSON by default. `format: "markdown"` returns the table. Results are the CLI's JSON shapes plus `transcript`, `resolved_via` and `warnings`.
+
+Per-flag detail is in the [reference](docs/reference.md).
 
 ## Privacy and data handling
 
-token-usage runs entirely on your machine. The analyser uses only the Python standard library and
-makes **no network calls**: there is no telemetry, no remote API, no update check and
-no third-party service. The plugin sends no telemetry or remote requests. Reports returned through MCP enter
-the host conversation and follow that host's data policy. Copilot also runs a small
-JavaScript collector using its bundled SDK and Node standard library.
+token-usage runs entirely on your machine. The analyser uses only the Python standard library and makes **no network calls**: there is no telemetry, no remote API, no update check and no third-party service. The plugin sends no telemetry or remote requests. Reports returned through MCP enter the host conversation and follow that host's data policy. Copilot also runs a small JavaScript collector using its bundled SDK and Node standard library.
 
 **What it reads** (read-only, and only for the runtime you ask about):
 
@@ -114,50 +104,29 @@ JavaScript collector using its bundled SDK and Node standard library.
 | Copilot CLI | `~/.copilot/session-state/*/events.jsonl` and `~/.copilot/token-usage/*.jsonl` | `TOKEN_USAGE_COPILOT_HOME`, else `COPILOT_HOME` |
 | All | the bundled `data/pricing.json` and your optional overlay `~/.config/token-usage/pricing.json` (honours `XDG_CONFIG_HOME`) | — |
 
-Transcripts contain your prompts and code. token-usage reads them only to count tokens
-and label activities. It reads no credentials or auth files.
+Transcripts contain your prompts and code. token-usage reads them only to count tokens and label activities. It reads no credentials or auth files. It does not call Cursor, Codex, Gemini, Copilot or Claude cloud APIs.
 
-**What it writes.** Summary caches and Claude/Codex/Cursor hook ledgers go under `~/.cache/token-usage/` (override with
-`TOKEN_USAGE_LEDGER_DIR`):
+**What it writes.** Summary caches and hook ledgers go under `~/.cache/token-usage/` (override with `TOKEN_USAGE_LEDGER_DIR`):
 
-- `<session-id>.json` (Claude Code) and `codex-<session-id>.json` (Codex): the session
-  aggregate the Stop/SubagentStop hooks keep current. It holds token counts, cost
-  estimates, activity labels (slash command, skill or agent names), the transcript path,
-  and **the first 120 characters of the prompt that opened each segment**.
-- `latest.json`: a best-effort symlink to the most recently written Claude Code session
-  aggregate (the statusline fallback). Codex ledgers never repoint it.
-- `index/`: the per-transcript summary cache used by `history`, `insights`,
-  `top_consumers`, `dashboard` and `export`. It holds transcript paths, project names,
-  activity labels and token/cost totals.
-- `cursor/<hash>.jsonl`: the append-only Cursor hook ledger. It holds the conversation
-  id, UTC timestamps, workspace roots, the hook's raw token fields, and **the first 120
-  characters of each prompt and subagent task**. The directory is created owner-only
-  (`0700`) where the filesystem supports it.
+- `<session-id>.json` (Claude Code), `codex-<session-id>.json` (Codex) and `gemini-<session-id>.json` (Antigravity `Stop`): the session aggregate the hook keeps current. It holds token counts, cost estimates, activity labels, the transcript path, segment timestamps, and **the first 120 characters of the prompt that opened each segment**.
+- `latest.json`: a best-effort symlink to the most recently written Claude Code session aggregate (the statusline fallback). Codex and Gemini ledgers never repoint it.
+- `index/`: the per-transcript summary cache used by `history`, `insights`, `top_consumers`, `dashboard` and `export`. It holds transcript paths, project names, activity labels and token/cost totals.
+- `cursor/<hash>.jsonl`: the append-only Cursor hook ledger. It holds the conversation id, UTC timestamps, workspace roots, the hook's raw token fields, and **the first 120 characters of each prompt and subagent task**. The directory is created owner-only (`0700`) where the filesystem supports it.
 
-Copilot additionally writes `~/.copilot/token-usage/<session-id>.jsonl` under
-`COPILOT_HOME`: event IDs, timestamps, counters, command/skill labels, agent IDs and
-a session/project header. It stores no prompts or tool output. See the
-[collector and retention details](docs/gemini-copilot.md#github-copilot-cli).
+Copilot additionally writes `~/.copilot/token-usage/<session-id>.jsonl` under `COPILOT_HOME`: event IDs, timestamps, counters, command/skill labels, agent IDs and a session/project header. It stores no prompts or tool output. See the [collector and retention details](docs/gemini-copilot.md#github-copilot-cli).
 
-`dashboard` and `export` also write the one file you name with `--output` (dashboard
-defaults to `token-usage-dashboard.html` in the current directory; `--output -` writes
-to stdout).
+`dashboard` and `export` also write the one file you name with `--output` (dashboard defaults to `token-usage-dashboard.html` in the current directory; `--output -` writes to stdout).
 
-**Retention.** token-usage never deletes or prunes anything. The data stays until you
-remove it; deleting `~/.cache/token-usage/` (or your `TOKEN_USAGE_LEDGER_DIR`) removes those caches and hook ledgers, and the next run rebuilds the cache from your transcripts.
+**Retention.** token-usage never deletes or prunes anything. The data stays until you remove it. Deleting `~/.cache/token-usage/` (or your `TOKEN_USAGE_LEDGER_DIR`) removes those caches and hook ledgers. The next run rebuilds the cache from your transcripts. Remove `$COPILOT_HOME/token-usage/` separately to remove Copilot capture files.
 
 **What runs.**
 
-- **Hooks** (Claude Code: `Stop` and `SubagentStop`; Codex: `Stop` and `SubagentStop`;
-  Cursor: `beforeSubmitPrompt`, `stop`, `subagentStart` and `subagentStop`) run
-  `scripts/token_usage.py` with a 15-second timeout. They fail open: they always exit 0
-  and never block the session. On stdout, a Claude Code or Codex hook prints nothing but
-  the optional budget `systemMessage` (only when `TOKEN_USAGE_BUDGET_USD` is set), and the
-  Cursor hook prints `{}`.
-- **MCP server**: `scripts/mcp_server.py`, a local stdio process the host starts. It has
-  no network listener and offers only the five reporting tools listed under
-  [MCP server](#mcp-server). They read the locations above and may refresh the `index/`
-  cache; they never modify transcripts.
+- **Hooks** fail open: they always exit 0 and never block the session. The timeout in each hook file is 15 seconds.
+  - Claude Code (`hooks/hooks.json`): `Stop` and `SubagentStop` run `scripts/token_usage.py hook`. Stdout is empty, or one budget `systemMessage`.
+  - Codex (`hooks/hooks-codex.json`): the same events run `codex-hook`. Ledgers are `codex-` prefixed. Windows uses `python` via `commandWindows`.
+  - Antigravity (root `hooks.json`): `Stop` runs `hook`. A camelCase payload (`conversationId`, `transcriptPath`, and no `transcript_path`) is read as the `gemini` runtime. Stdout is `{}`, or a budget `systemMessage` when a multiple is crossed. Whether the Antigravity UI shows that message is the host's behaviour.
+  - Cursor (`hooks/hooks-cursor.json`): `beforeSubmitPrompt`, `stop`, `subagentStart` and `subagentStop` run `cursor-hook` and print `{}`.
+- **MCP server**: `scripts/mcp_server.py`, a local stdio process. It has no network listener. It exits quietly on stdin EOF or a broken pipe. The five tools read the locations above and may refresh the `index/` cache. They never modify transcripts.
 
 ## Installation
 
@@ -180,7 +149,7 @@ Claude Code on Windows can use the PowerShell statusline under [Statusline](#sta
 | Host | Install | Status |
 |---|---|---|
 | Claude Code | `claude plugin install token-usage@wickedsick` | Wicked Sick marketplace; Anthropic directory resubmission pending |
-| Codex | `codex plugin add token-usage@wickedsick` | Wicked Sick marketplace |
+| Codex | `codex plugin add token-usage@wickedsick` | Wicked Sick marketplace. OpenAI's public plugin directory does not accept this package (local stdio plus lifecycle hooks) |
 | Cursor | Cursor Marketplace, or manual MCP | Marketplace listing pending |
 | Google Antigravity / Gemini CLI | `~/.gemini/config/plugins/token-usage/` or `agy plugin install` / `gemini extensions install` | Local plugin bundle or GitHub checkout |
 | GitHub Copilot CLI | `copilot plugin install token-usage@wickedsick` | Wicked Sick marketplace (or `copilot plugin install /absolute/path/to/token-usage`) |
@@ -199,34 +168,23 @@ claude plugin marketplace add Wicked-Sick-Ltd/ai-marketplace
 claude plugin install token-usage@wickedsick
 ```
 
-Once the plugin is listed in Anthropic's plugin directory it will also install with
-`/plugin install token-usage`.
+Once the plugin is listed in Anthropic's plugin directory it will also install with `/plugin install token-usage`.
 
-The Claude manifest is `.claude-plugin/plugin.json` (MCP server, Stop hook, report skill).
+The Claude manifest is `.claude-plugin/plugin.json` (MCP server, `Stop` hook, report skill). This package is the Claude Code and Cowork install of the same multi-agent plugin. Its MCP server defaults to `runtime=claude` and can still be asked for another runtime.
 
 ### Cursor
 
-Official install path: open **Customize** in the sidebar, find **token-usage** on the
-[Cursor Marketplace](https://cursor.com/marketplace) once this plugin is published, and
-choose **Install** (project or user scope). See
-[Installing plugins](https://cursor.com/docs/plugins#installing-plugins).
+Official install path: open **Customize** in the sidebar, find **token-usage** on the [Cursor Marketplace](https://cursor.com/marketplace) once this plugin is published, and choose **Install** (project or user scope). See [Installing plugins](https://cursor.com/docs/plugins#installing-plugins).
 
 The Cursor manifest `.cursor-plugin/plugin.json` bundles:
 
-- stdio MCP server → `scripts/mcp_server.py`
-- hooks → `hooks/hooks-cursor.json` (`version` 1 flat schema; `beforeSubmitPrompt`,
-  `stop`, `subagentStart`, `subagentStop`)
+- stdio MCP server → `scripts/mcp_server.py` with `TOKEN_USAGE_RUNTIME=cursor`
+- hooks → `hooks/hooks-cursor.json` (`version` 1 flat schema; `beforeSubmitPrompt`, `stop`, `subagentStart`, `subagentStop`)
 - skill → `skills/report/`
 
-**Before marketplace listing / for a git checkout today:** use **manual MCP** (below).
-Cursor also documents copying a plugin into `~/.cursor/plugins/local/<name>/` and
-reloading the window for local testing ([Test plugins locally](https://cursor.com/docs/plugins#test-plugins-local));
-that requires the full plugin tree (including `.cursor-plugin/plugin.json`) and may be
-disabled by team policy (`Allow Local Plugin Imports`).
+**Before marketplace listing / for a git checkout today:** use **manual MCP** (below). Cursor also documents copying a plugin into `~/.cursor/plugins/local/<name>/` and reloading the window for local testing ([Test plugins locally](https://cursor.com/docs/plugins#test-plugins-local)); that requires the full plugin tree (including `.cursor-plugin/plugin.json`) and may be disabled by team policy (`Allow Local Plugin Imports`).
 
-Hook commands use `${CURSOR_PLUGIN_ROOT}`; the MCP entry uses the same variable in
-`args`. See [docs/cursor-adapter.md](docs/cursor-adapter.md) for attribution sources,
-limitations, and privacy.
+Hook commands use `${CURSOR_PLUGIN_ROOT}`; the MCP entry uses the same variable in `args`. See [docs/cursor-adapter.md](docs/cursor-adapter.md).
 
 **Manual MCP (no plugin).** Add to `~/.cursor/mcp.json`:
 
@@ -241,13 +199,26 @@ limitations, and privacy.
 }
 ```
 
-Use MCP tool argument `runtime: "cursor"` (or `"auto"` when Cursor artifacts are
-unambiguous). Register hooks separately via Cursor settings if you want prospective
-hook ledgers without the full plugin bundle.
+Use MCP tool argument `runtime: "cursor"` (or `"auto"` when Cursor artifacts are unambiguous). Register hooks separately via Cursor settings if you want prospective hook ledgers without the full plugin bundle.
 
-This repository intentionally has **no** root `mcp.json`: Claude Code also reads that
-file as *project-scope* MCP inside a checkout, which would register a broken server for
-contributors.
+This repository intentionally has **no** root `mcp.json`: Claude Code also reads that file as *project-scope* MCP inside a checkout, which would register a broken server for contributors.
+
+### Cloud agents
+
+Cursor Cloud Agents do not inherit a developer's local plugin, `~/.cursor` hooks, or `~/.cursor/mcp.json`. Those stay on the machine that installed them. A Cloud Agent runs repository hooks from `.cursor/hooks.json` on its VM. This repository does not ship that file, so a cloud run does not load token-usage unless the VM image or the repository under analysis adds it.
+
+To report a cloud run from a machine that has the export:
+
+```bash
+python3 scripts/token_usage.py report --runtime cursor /path/to/cloud-export.json
+python3 scripts/token_usage.py json --runtime cursor /path/to/cloud-export.json
+```
+
+The same path is the MCP `transcript` argument with `runtime: "cursor"`. The adapter uses token fields only when the export actually contains them. A file with usage on at least one turn is `partial`. A file with none is `activity_only`. Nothing is inferred from message length. token-usage does not call a cloud API and does not read account credentials.
+
+If the VM has the plugin installed, or the repository under analysis contains a `.cursor/hooks.json` whose commands run `python3 …/scripts/token_usage.py cursor-hook`, the hook ledger on that VM is the higher-confidence source. Read it there, or copy the ledger, and pass `--runtime cursor`. Do not expect the developer's laptop ledger to contain the cloud run.
+
+Ask the agent, once the MCP server is on that VM, to call `session_cost` with `runtime: "cursor"` and to include `measurement` and `warnings` in the write-up. Activity-only output is a count of turns, not a token bill.
 
 ### Codex
 
@@ -256,11 +227,9 @@ codex plugin marketplace add Wicked-Sick-Ltd/ai-marketplace --sparse .agents/plu
 codex plugin add token-usage@wickedsick
 ```
 
-The Codex manifest `.codex-plugin/plugin.json` bundles the report skill
-(`codex-skills/report/`), the stdio MCP server (`.mcp-codex.json`, which sets
-`TOKEN_USAGE_RUNTIME=codex`) and fail-open `Stop`/`SubagentStop` hooks
-(`hooks/hooks-codex.json`). Review the hooks through `/hooks` after installing;
-installation never grants hook trust. See [docs/codex-adapter.md](docs/codex-adapter.md).
+The Codex manifest `.codex-plugin/plugin.json` bundles the report skill (`codex-skills/report/`), the stdio MCP server (`.mcp-codex.json`, which sets `TOKEN_USAGE_RUNTIME=codex`) and fail-open `Stop`/`SubagentStop` hooks (`hooks/hooks-codex.json`). Review the hooks through `/hooks` after installing; installation never grants hook trust. See [docs/codex-adapter.md](docs/codex-adapter.md).
+
+This is the OpenAI surface the repository supports: Codex CLI and the Codex Desktop plugin. It does not call the OpenAI API and it does not read ChatGPT web sessions.
 
 ### Google Antigravity, Gemini CLI and GitHub Copilot CLI
 
@@ -278,18 +247,11 @@ copilot plugin install /absolute/path/to/token-usage
 copilot --experimental
 ```
 
-Antigravity and Gemini CLI discover the report skill and MCP server through
-`gemini-extension.json` (or `~/.gemini/config/plugins/token-usage/`).
-Copilot uses `.plugin/plugin.json`; experimental extensions capture its transient
-usage events. Gemini CLI also installs straight from GitHub
-(`gemini extensions install https://github.com/Wicked-Sick-Ltd/token-usage`) and Copilot
-from the marketplace (`copilot plugin marketplace add Wicked-Sick-Ltd/ai-marketplace`,
-then `copilot plugin install token-usage@wickedsick`). See
-[installation, privacy and limits](docs/gemini-copilot.md).
+Antigravity reads root `plugin.json`, `mcp_config.json` (MCP runtime `gemini`) and `hooks.json` (`Stop`). Gemini CLI discovers the report skill and MCP server through `gemini-extension.json`. Copilot uses `.plugin/plugin.json`; experimental extensions capture its transient usage events. Gemini CLI also installs straight from GitHub (`gemini extensions install https://github.com/Wicked-Sick-Ltd/token-usage`) and Copilot from the marketplace (`copilot plugin marketplace add Wicked-Sick-Ltd/ai-marketplace`, then `copilot plugin install token-usage@wickedsick`). See [installation, privacy and limits](docs/gemini-copilot.md).
 
 ### Grok Build
 
-Grok Build reads Claude Code plugins natively, so the Claude plugin installs unchanged:
+Grok Build reads Claude-format plugins, so this repository installs without a separate Grok manifest:
 
 ```bash
 grok plugin install Wicked-Sick-Ltd/token-usage --trust
@@ -299,22 +261,17 @@ grok plugin install token-usage@wickedsick --trust
 grok mcp doctor          # token-usage should report 5 tools
 ```
 
-The MCP tools and `/token-usage:report` work in Grok and report on your Claude Code,
-Codex, Cursor, Gemini and Copilot sessions (pass `runtime`). Grok's own sessions are not
-attributed yet: Grok's Stop hook sends no `transcript_path`, so the hook exits 0 without
-writing anything. For Grok's own spend, use `grok usage <session-id>`.
+The MCP tools and `/token-usage:report` work in Grok and report on Claude Code, Codex, Cursor, Gemini and Copilot sessions (pass `runtime`). Grok's own sessions are not attributed yet: Grok's Stop hook sends no `transcript_path`, so the hook exits 0 without writing anything. For Grok's own spend, use `grok usage <session-id>`.
 
 ### VS Code agent plugins
 
-With `chat.plugins.enabled` on, add the Wicked Sick marketplace to your settings and
-install **token-usage** from the Extensions view (`@agentPlugins`):
+With `chat.plugins.enabled` on, add the Wicked Sick marketplace to your settings and install **token-usage** from the Extensions view (`@agentPlugins`):
 
 ```json
 "chat.plugins.marketplaces": ["Wicked-Sick-Ltd/ai-marketplace"]
 ```
 
-VS Code reads the Claude and Copilot plugin formats. You get the MCP tools and the
-report skill; VS Code Copilot Chat's own usage is not attributed yet.
+VS Code reads the Claude and Copilot plugin formats. You get the MCP tools and the report skill. VS Code Copilot Chat's own usage is not attributed yet.
 
 ### Any MCP client
 
@@ -332,199 +289,97 @@ The server is a stdlib stdio process, so any MCP client can launch it:
 }
 ```
 
-Set `TOKEN_USAGE_RUNTIME` to the runtime you want by default (`claude`, `codex`,
-`cursor`, `gemini`, `copilot` or `auto`), or pass `runtime` per call.
+Set `TOKEN_USAGE_RUNTIME` to the runtime you want by default (`claude`, `codex`, `cursor`, `gemini`, `copilot` or `auto`), or pass `runtime` per call.
 
 ## Troubleshooting
 
 - **`python3: command not found` / MCP server fails to start**: install Python 3.9+ and make sure `python3` is on PATH (on Windows see the note under [Installation](#installation)). Check with `python3 --version`.
-- **Report is empty or shows no sessions**: the analyser reads the host's local transcripts. Run one session in the host first, then ask again; check the paths in [docs/reference.md](docs/reference.md) exist for your host.
-- **Plugin installed but skills/commands missing**: restart the host after installing, and for Claude Code run `/plugin` to confirm `token-usage` is enabled.
-- **Codex hooks not running**: hooks need explicit trust; review and approve them via `/hooks`.
+- **Report is empty or shows no sessions**: the analyser reads the host's local transcripts. Run one session in the host first, then ask again. Check the paths in [docs/reference.md](docs/reference.md).
+- **Plugin installed but skills/commands missing**: restart the host after installing. In Claude Code, run `/plugin` to confirm `token-usage` is enabled.
+- **Codex hooks not running**: hooks need explicit trust. Review and approve them via `/hooks`.
+- **Cloud run shows no tokens**: local Cursor hooks did not run on the VM. Pass the export path, or install the hook on that VM. See [Cloud agents](#cloud-agents).
 - **Garbled characters on Windows**: run with `PYTHONUTF8=1` (the bundled MCP entries already set it).
 - **Still stuck?** Open an issue at https://github.com/Wicked-Sick-Ltd/token-usage/issues or email hello@wickedsick.com.
 
 ## Usage
 
-Flag defaults, combinations the script rejects, and every MCP argument are in the [CLI and MCP reference](docs/reference.md).
+Flag defaults and every MCP argument are in the [CLI and MCP reference](docs/reference.md).
 
 ### `/token-usage:report`
-
-Ask for a breakdown any time:
 
 ```
 /token-usage:report
 ```
 
-Or just ask naturally: *"where did my tokens go this session?"*
+Or ask: *"where did my tokens go this session?"* Name the runtime when the host did not pin it (`runtime: "cursor"`, and so on).
 
-Pass a transcript path to analyse a past session:
+Pass a recording path for a past session:
 
 ```
 /token-usage:report ~/.claude/projects/<project-slug>/<session-id>.jsonl
 ```
 
-### CLI (outside Claude Code)
-
-The parser is a standalone script:
+### CLI
 
 ```bash
-# Current session — markdown table
-python3 scripts/token_usage.py report [transcript.jsonl]
-
-# Add per-agent-type ↳ breakdown rows (subsets of the parent row, not additive)
-python3 scripts/token_usage.py report --agents [transcript.jsonl]
-
-# Add per-model ↳ breakdown rows (also subsets of the parent row)
-python3 scripts/token_usage.py report --models [transcript.jsonl]
-
-# Compare two transcripts — per-label cost and output deltas
-python3 scripts/token_usage.py report --diff OLD.jsonl NEW.jsonl
-
-# Machine-readable JSON
-python3 scripts/token_usage.py json [transcript.jsonl]
-
-# JSON diff between two transcripts
-python3 scripts/token_usage.py json --diff OLD.jsonl NEW.jsonl
-
-# Cross-session history
-python3 scripts/token_usage.py history                         # all sessions, by project
-python3 scripts/token_usage.py history --by day                # grouped by calendar day (local time)
-python3 scripts/token_usage.py history --by command            # grouped by slash command
-python3 scripts/token_usage.py history --by model              # grouped by model (calls = API requests)
-python3 scripts/token_usage.py history --since 7d              # last 7 days (+ burn-rate footer)
-python3 scripts/token_usage.py history --since 2026-06-01      # since a specific date
-python3 scripts/token_usage.py history --project myrepo        # substring filter, composes with --by
-python3 scripts/token_usage.py history --by project --json     # machine-readable
-python3 scripts/token_usage.py history --by day --csv          # raw numbers for spreadsheets
-
-# Insights
-python3 scripts/token_usage.py insights [transcript.jsonl]     # session-mode rule checks
-python3 scripts/token_usage.py insights --since 30d            # window-mode rule checks
-python3 scripts/token_usage.py insights --since 30d --project myrepo
-python3 scripts/token_usage.py insights --json [transcript.jsonl]
-
-# Costliest sessions (or --by command) in the last 30 days
-python3 scripts/token_usage.py top_consumers --since 30d --limit 10
-python3 scripts/token_usage.py top_consumers --by command --project my-repo --json
-
-# Cursor runtime — latest discovered session (hook ledger, then Desktop SQLite)
 python3 scripts/token_usage.py report --runtime cursor
-python3 scripts/token_usage.py json --runtime cursor
-
-# Cursor runtime — explicit Cloud Agent export JSON (activity / any present usage fields)
 python3 scripts/token_usage.py report --runtime cursor /path/to/cloud-export.json
-python3 scripts/token_usage.py json --runtime cursor /path/to/cloud-export.json
+python3 scripts/token_usage.py report --agents --models --runtime gemini
+python3 scripts/token_usage.py report --diff OLD.jsonl NEW.jsonl --runtime codex
+python3 scripts/token_usage.py json --runtime copilot path/to/events-or-ledger
 
 python3 scripts/token_usage.py history --runtime cursor --by day --since 7d
-python3 scripts/token_usage.py insights --runtime cursor
+python3 scripts/token_usage.py history --by command --project myrepo --csv
+python3 scripts/token_usage.py insights --since 30d --runtime codex
+python3 scripts/token_usage.py top_consumers --since 30d --limit 10
 
-# Self-contained HTML dashboard from indexed history (inline CSS/SVG only — no CDN)
-python3 scripts/token_usage.py dashboard [--since 30d] [--project SUBSTRING] \
-  [--output token-usage-dashboard.html] [--runtime claude|cursor|codex|gemini|copilot|auto]
-
-# Terminal live view — repolls the current or explicit session (Ctrl-C exits 0)
-python3 scripts/token_usage.py live [TRANSCRIPT] [--interval 2] [--iterations N] \
-  [--agents] [--models] [--runtime claude|cursor|codex|gemini|copilot|auto]
-
-# Structured JSONL aggregates for external spend tooling (not OTLP wire format)
-python3 scripts/token_usage.py export [--scope session|history] [--by project|day|command|model] \
-  [--since 30d] [--project SUBSTRING] [--output usage.jsonl] [--runtime claude|cursor|codex|gemini|copilot|auto]
-python3 scripts/token_usage.py export [TRANSCRIPT] --scope session --output -
+python3 scripts/token_usage.py dashboard --since 30d --runtime gemini
+python3 scripts/token_usage.py live --runtime cursor --interval 2
+python3 scripts/token_usage.py export --scope history --since 30d --output usage.jsonl
 ```
 
-`--runtime` accepts `claude` (the default, or whatever `TOKEN_USAGE_RUNTIME` names), `cursor`,
-`codex`, `gemini`, `copilot`, or `auto`. `auto` picks one runtime when unambiguous and never mixes runtimes in one
-call. Codex examples: `report --runtime codex [rollout.jsonl]`, `history --runtime codex --since 7d`.
+`--runtime` accepts `claude` (the default, or whatever `TOKEN_USAGE_RUNTIME` names), `cursor`, `codex`, `gemini`, `copilot`, or `auto`.
 
-With no argument, `report` and `json` pick the most recent session for the current directory's project; failing that, the Cowork sandbox mount; failing that too, the newest transcript under **any** project on the machine. That last step means running these outside a directory with its own Claude Code history can pick up a different project's most recent session rather than reporting "not found" — pass an explicit transcript path when it matters which session gets analysed.
+With no argument on the Claude runtime, `report` and `json` pick the most recent session for the current directory's project; failing that, the Cowork sandbox mount; failing that, the newest transcript under any project on the machine. Pass an explicit path when the session matters. Other runtimes use their own discovery and do not fall through into Claude transcripts.
 
-### Dashboard (`dashboard`)
+For a non-Claude runtime, `report --diff` / `json --diff` resolve both sides through the same diff implementation the MCP `diff` tool uses. Both sides must be that one runtime.
 
-Builds a single portable HTML file from the same indexed history as `history`. Summary cards, an inline SVG daily-cost chart, and top project/activity/model tables are embedded with inline CSS only — no `<script>`, remote assets, CDN, iframe, or network calls. Labels, warnings, and measurement notes are HTML-escaped. Default output is `token-usage-dashboard.html`; `--output -` writes HTML to stdout (progress stays on stderr). With no matching history, the page still renders an honest empty state. Cursor `partial` or activity-only corpora disclose when cost/token cards are unmeasured rather than showing misleading zeros.
+### Dashboard, live, and export
 
-### Live mode (`live`)
+`dashboard` writes one HTML file (inline CSS and SVG, no `<script>`, CDN or network). Default output is `token-usage-dashboard.html`. An empty match still renders an empty state. Unmeasured Cursor data is labelled, not shown as a free zero.
 
-Polls every `--interval` seconds (default 2), re-rendering the session report each tick. With no `[TRANSCRIPT]`, each iteration re-runs normal latest-session discovery. Interactive terminals clear with ANSI `\x1b[2J\x1b[H`; redirected stdout uses timestamp separators instead. `--iterations N` runs a finite loop for scripts and tests. **Ctrl-C exits 0.** There is no file watcher or background daemon.
+`live` polls every `--interval` seconds (default 2) and reprints the report. **Ctrl-C exits 0.** `--iterations N` is the finite loop.
 
-### Structured export (`export`)
-
-Emits one RFC-8259 JSON object per line with schema `token-usage.aggregate.v1` and OTel-style metric names (for example `gen_ai.usage.output_tokens`, `gen_ai.estimated_cost.usd`). This is a local JSONL interchange format. It is separate from OTLP protobuf and from any HTTP export. Default scope is `history` (grouped by project). Default output is stdout (`--output -`); a file path is replaced atomically. `--scope session` emits one `total` row plus one row per activity label. Session scope rejects `--by`, `--since` and `--project`. History scope rejects a positional recording path. `gen_ai.estimated_cost.usd` is JSON `null` when unpriced or unmeasured. Lines include project slugs, command labels, and model IDs, so redact them before sharing.
-
-History-scope records also carry `measurement_counts`, the scan's per-session tally (for example `{"exact": 99, "activity_only": 1}`). `measurement` alone is the worst level any session reported, so it cannot tell one weak session from a corpus nobody measured, nor either from a scan that matched nothing — an empty tally is how you spot the last case. Session-scope records cover one session and carry no tally.
+`export` writes one RFC-8259 JSON object per line, schema `token-usage.aggregate.v1`, with OTel-style metric names. It is local JSONL, not OTLP and not an HTTP export. History rows include `measurement_counts`. Redact lines before sharing them: they contain project slugs, command labels and model IDs.
 
 ### Budget nudges
 
-Set `TOKEN_USAGE_BUDGET_USD` (a number greater than zero — anything else is ignored
-with a warning on stderr) in the environment Claude Code runs hooks with (e.g. the `env` block of `~/.claude/settings.json`):
-
-```json
-{
-  "hooks": { "Stop": [{ "command": "..." }] },
-  "env": { "TOKEN_USAGE_BUDGET_USD": "50" }
-}
-```
-
-When the session's estimated cost crosses the threshold the Stop hook emits a `systemMessage` warning, and warns again each time a further multiple of the budget is crossed (2×, 3×, …) — one warning per multiple, naming the multiple actually crossed. The budget must be a positive number. The same API-price-estimate disclaimer applies — this is a usage signal, not a billing alert.
+Set `TOKEN_USAGE_BUDGET_USD` to a number greater than zero in the environment that runs the hook (anything else is ignored, with a warning on stderr). When estimated cost crosses the threshold, the Claude Code, Codex and Antigravity `Stop` hooks emit one `systemMessage` per multiple (2×, 3×, …). `SubagentStop` updates the ledger and does not emit the nudge. This is a usage signal, not a billing alert.
 
 ### Statusline (optional)
 
-`examples/statusline.sh` reads the per-session live ledger (from stdin `session_id`) and renders e.g. `⏶ 214k out · $33.87 · top: /code-review`. Wire it up with `/statusline` in **Claude Code** or merge it into your existing statusline script. Requires `jq`.
+`examples/statusline.sh` reads the Claude Code per-session ledger and renders e.g. `⏶ 214k out · $33.87 · top: /code-review`. Wire it with `/statusline` in **Claude Code**. Requires `jq`.
 
-On Windows with **Claude Code**, `examples/statusline.ps1` is a dependency-free counterpart to `statusline.sh` and requires **PowerShell 7+** (`pwsh`; Windows PowerShell 5.1 is not supported). Like the bash script it reads Claude Code's statusline JSON from stdin and resolves the ledger by `session_id`:
-
-1. `$env:TOKEN_USAGE_LEDGER_DIR/<session_id>.json` (or `~/.cache/token-usage/<session_id>.json`) — the current session's own aggregate.
-2. `.../latest.json` — a pointer to the most recent session aggregate, used only as a fall back when stdin carried no usable session id or that session has no ledger yet. The hook creates it as a symlink on a best-effort basis and Windows commonly refuses, so it is often absent.
-
-The script formats output tokens, estimated cost, and the top `by_label` activity, and **exits silently** (code 0, no stdout/stderr) when the input or the ledger is missing or malformed. Session ids are stripped to `[A-Za-z0-9_-]`, matching how the hook names the ledger, so a hostile id cannot address a file outside the ledger directory.
-
-```text
-pwsh -NoProfile -File C:/path/to/token-usage/examples/statusline.ps1
-```
-
-**Cursor** hook ledgers live as JSONL under `~/.cache/token-usage/cursor/` and write no per-session JSON or `latest.json`, so this PowerShell example is not a Cursor statusline. For a refreshing Cursor session view in the terminal, use `python3 scripts/token_usage.py live --runtime cursor` (optional `--interval`, `--iterations`).
-
-`statusline.ps1` is always checked structurally from its source; the behavioural smoke tests additionally execute it when `pwsh` is on PATH and are skipped otherwise. No test creates a symlink.
+On Windows with **Claude Code**, `examples/statusline.ps1` is the PowerShell 7+ counterpart (`pwsh`; Windows PowerShell 5.1 is not supported). It exits silently when the ledger is missing. It is not a Cursor statusline: Cursor ledgers are JSONL and write no `latest.json`. Use `live --runtime cursor` for a refreshing Cursor view.
 
 ### MCP server
 
-The plugin ships a stdio MCP server (registered in `.claude-plugin/plugin.json` → `scripts/mcp_server.py`, stdlib only,
-no install). When the plugin is enabled, Claude Code starts it and the tools appear as
-`mcp__plugin_token-usage_token-usage__<tool>`:
+When a host plugin is enabled it starts `scripts/mcp_server.py`. Tool name prefixes differ by host. Match the basename.
 
 | Tool | What it answers |
 |---|---|
-| `session_cost` | Per-activity breakdown of one session (`transcript` or `session_id`; defaults to the current project's newest session). The result's `transcript` key names the transcript analysed, and `resolved_via` names the rung that found it. |
+| `session_cost` | Per-activity breakdown of one session (`transcript` or `session_id`; otherwise the newest session for the pinned runtime). |
 | `history` | Cross-session rollup `by` project / day / command / model, with `since` and `project` filters. |
-| `insights` | Rule-based findings: session mode (one session vs the project's 30-day norms) or window mode (`since`). Optional `budget_usd`. |
-| `diff` | Per-activity cost and output deltas between two sessions (paths or session ids). |
-| `top_consumers` | Costliest sessions or command labels in a window (`by`, `since`, `project`, `limit`). |
+| `insights` | Rule-based findings for one session or a window (`since`). Optional `budget_usd`. |
+| `diff` | Per-activity cost and output deltas between two sessions. |
+| `top_consumers` | Costliest sessions or command labels in a window. |
 
-Every tool also takes `runtime` (`claude`, `cursor`, `codex`, `gemini`, `copilot` or `auto`; default `claude`, or
-the server's `TOKEN_USAGE_RUNTIME`, which the Codex plugin sets to `codex`).
+Every tool takes `runtime` (`claude`, `cursor`, `codex`, `gemini`, `copilot` or `auto`). The default is the server's `TOKEN_USAGE_RUNTIME`, which each host manifest sets to itself, or `claude` when unset. Every tool takes `format`: `json` (default) or `markdown`. Failures come back as tool results with `isError`. An unknown method, or `arguments` that is present but not an object, is a JSON-RPC error (`-32602`).
 
-Every tool takes `format`: `json` (default — the CLI's JSON shapes plus `transcript`,
-`resolved_via` and `warnings`) or `markdown` (the rendered table, with the same warnings
-as `Warning:` footnotes). Failures come back as tool results with `isError`, never as
-protocol errors, so a missing transcript or a bad `since` is a readable message.
-Malformed *calls* are the exception: an unknown method, or `arguments` that is present
-but not an object, is a JSON-RPC error (`-32602`) rather than an answer about a session
-the server guessed at.
+**"Current session"** resolves in this order: explicit `transcript` path → `session_id` → `TOKEN_USAGE_TRANSCRIPT` → auto-discovery.
 
-**"Current session"** resolves in this order: explicit `transcript` path → `session_id`
-(searched across every project) → `TOKEN_USAGE_TRANSCRIPT` → auto-discovery. What
-auto-discovery does depends on whether there is a project dir to anchor on:
-
-- **With `TOKEN_USAGE_PROJECT_DIR`** — the plugin manifest passes
-  `${CLAUDE_PROJECT_DIR}`, which reaches stdio MCP servers from Claude Code 2.1.139;
-  older builds (and other hosts) leave it unexpanded or empty, which the server treats as
-  unset and falls back to discovery. When it *is* set, the session is the newest
-  transcript for *that project only*. There is no fall-through: a project with no
-  sessions yet is an error, never a guess at some other project's session.
-- **Without one** (Claude desktop, or the script run by hand): newest transcript for the
-  cwd's own project → the Cowork mount → newest transcript on the machine. In those last
-  two cases nobody named the session, so `resolved_via` says `cwd` / `any_project` and
-  the markdown carries a note saying which project it landed on.
+- **With `TOKEN_USAGE_PROJECT_DIR`** — the Claude manifest passes `${CLAUDE_PROJECT_DIR}`, which reaches stdio MCP servers from Claude Code 2.1.139. Older builds and other hosts may leave it unexpanded; the server treats that as unset. When it is set, the session is the newest transcript for that project only. There is no fall-through.
+- **Without one**: newest transcript for the cwd's project, then the Cowork mount, then the newest transcript on the machine for that runtime. `resolved_via` says which rung matched.
 
 **Claude desktop / Cowork.** Add to `claude_desktop_config.json`:
 
@@ -545,15 +400,9 @@ or, for a Claude Code user scope outside the plugin:
 claude mcp add --scope user token-usage -- python3 /absolute/path/to/token-usage/scripts/mcp_server.py
 ```
 
-That route starts the server without `TOKEN_USAGE_PROJECT_DIR`, but Claude Code exports
-`CLAUDE_PROJECT_DIR` to stdio servers (2.1.139+) and the server reads it as a fallback, so
-"current session" still anchors on the project you are in. User-scope tools are named
-`mcp__token-usage__<tool>` rather than the plugin's
-`mcp__plugin_token-usage_token-usage__<tool>`.
+That route starts the server without `TOKEN_USAGE_PROJECT_DIR`, but Claude Code exports `CLAUDE_PROJECT_DIR` to stdio servers (2.1.139+) and the server reads it as a fallback. User-scope tools are named `mcp__token-usage__<tool>` rather than the plugin's `mcp__plugin_token-usage_token-usage__<tool>`.
 
-The server reads `~/.claude/projects` on the host, so a desktop session sees the same
-history the CLI does. No caching in-process: pricing overlay edits apply on the next call
-(and a malformed overlay comes back in the result's `warnings`).
+The server reads local transcripts on the host. Pricing overlay edits apply on the next call.
 
 ## Configuration
 
@@ -594,7 +443,7 @@ To price a model the bundled table omits, or to replace one bundled rate, create
 
 ## Insights
 
-`insights` runs a fixed set of rule-based checks — pure arithmetic against the current session (or, with `--since`, a window of history) — and prints only the rules that fired:
+`insights` runs a fixed set of rule-based checks and prints only the rules that fired:
 
 ```
 $ python3 scripts/token_usage.py insights
@@ -604,72 +453,86 @@ $ python3 scripts/token_usage.py insights
 
 Session mode (`insights [transcript]`) checks: cost outlier vs the 30-day project median (warn ≥3×, info ≥2×; needs at least 5 prior sessions), prompt-cache regression per command (warn on a ≥20 percentage-point drop in cache-read ratio vs that command's norm), ad-hoc-work dominance (info at ≥50% of spend), unpriced models (warn), agent fan-out concentration (info at ≥70% of a command's cost coming from its subagents), and budget pace (info at 75–100% of `TOKEN_USAGE_BUDGET_USD`).
 
-Window mode (`insights --since 7d|30d|DATE [--project SUB]`) checks: spend trend between the first and second half of the window (warn ≥+50%, info ≥±25%), the top mover behind an increase (≥30% of it), and unpriced models anywhere in the window. Pass a transcript or `--since`, not both. `--project` applies only with `--since`; without it the command exits with an error.
+Window mode (`insights --since 7d|30d|DATE [--project SUB]`) checks: spend trend between the first and second half of the window (warn ≥+50%, info ≥±25%), the top mover behind an increase (≥30% of it), and unpriced models anywhere in the window. Pass a transcript or `--since`, not both. `--project` applies only with `--since`.
 
-No findings is a normal, healthy result — the tool prints `No notable findings.` rather than manufacturing something to say. It also says when it *couldn't* fully look: a window that matched no sessions prints `No sessions in window — nothing was scanned.`, and a trailing `(baseline: …)` names rules that were switched off — `(baseline: N prior session(s); the comparison rules need 5)` in session mode when the project has fewer than the five prior sessions rules 1–2 need, and in window mode `(baseline: no sessions in the window's first half; the trend rules need both halves)` when every matched session lands after the window's midpoint, or `(baseline: no spend in the window's first half; …)` when the first half held sessions but no spend. That qualifier is appended whether or not anything fired: several rules need no baseline, so findings are no evidence the rest ran. `--json` returns the same findings as structured data for scripting, with the counts behind the qualifier under `baseline` (`sessions`, and in window mode `first_half_sessions` / `first_half_cost` / `first_half_spend` — the last being the rules' own unrounded predicate).
+No findings is a normal result: the tool prints `No notable findings.` A window that matched nothing prints `No sessions in window — nothing was scanned.` A trailing `(baseline: …)` names rules that were switched off. `--json` returns the same findings, with the counts behind that qualifier under `baseline`.
 
-Every command that scans the corpus (`history`, `top_consumers`, window `insights`, and the `insights` baseline) also says when it had nothing to scan: a `TOKEN_USAGE_PROJECTS_DIR` that is missing, is not a directory, or cannot be listed is reported as `projects_dir_missing` in `--json` and footnoted `No readable Claude Code projects directory at <path> — nothing was scanned.`, instead of a confident empty table.
+A missing or unreadable `TOKEN_USAGE_PROJECTS_DIR` is reported as `projects_dir_missing` in `--json` and footnoted, instead of an empty table that looks like zero spend.
 
 ## How it works
 
-Claude Code writes every session to `~/.claude/projects/<project-slug>/<session-id>.jsonl`. Each assistant entry carries full API usage (`input_tokens`, `output_tokens`, cache read/write, model). token-usage:
+Every runtime goes through one adapter (`ClaudeAdapter`, `CursorAdapter`, `CodexAdapter`, `GeminiAdapter`, `CopilotAdapter`). The adapter turns a local recording into segments. The same aggregate, price and render path then builds the report. `--runtime` and the MCP `runtime` argument pick one adapter. A new host needs a new adapter; it does not need a new report command. See [architecture](docs/architecture.md).
 
-1. Streams the JSONL, deduplicating assistant entries by `requestId`.
-2. Starts a new segment at each real user prompt; prompts carrying a `<command-name>` marker label the segment with that command. A command's label is sticky — it covers every subsequent turn until the next command.
-3. Sums each subagent transcript (`<session-id>/subagents/agent-*.jsonl`) and attributes it to the segment active at the agent's start time.
-4. Prices each model's usage against `data/pricing.json`.
+For Claude Code the pipeline is:
 
-In **Cowork** (the Claude desktop app) the same transcript format is mounted read-only inside the session sandbox under `<mount>/.claude/projects/…` (and `/sessions/*/mnt/.claude/projects/…`); discovery uses these when no Claude Code project matches the cwd. Skills there are invoked via a `Skill` tool_use block instead of a `<command-name>` prompt, so each such block opens its own sticky segment (deduped by tool-use id). The hooks are Claude-Code-only, so in Cowork run `report` on demand rather than relying on the live ledger.
+1. Stream `~/.claude/projects/<project-slug>/<session-id>.jsonl`, deduplicating assistant entries by `requestId`.
+2. Start a segment at each real user prompt. A `<command-name>` marker labels the segment, and that label covers every later turn until the next command.
+3. Sum each subagent transcript (`<session-id>/subagents/agent-*.jsonl`) into the segment active when the agent started.
+4. Price each model's usage against `data/pricing.json`.
 
-The Stop and SubagentStop hooks (`hooks/hooks.json`) re-run this after every turn and every finished subagent, writing the result to `~/.cache/token-usage/<session-id>.json` (override the directory with `TOKEN_USAGE_LEDGER_DIR`). Hook failures never block the session, and the full parse is cheap — ~0.3s even for a 74MB transcript.
+Cowork uses the same transcript shape on a read-only sandbox mount. Skills there open a segment from a `Skill` tool call rather than a `<command-name>` prompt. Hooks do not run in Cowork, so there is no live ledger there.
 
-The `history` subcommand builds an incremental index under `~/.cache/token-usage/index/`, keyed by file path and re-validated by (mtime, size). Transcripts are only re-parsed when their content changes; subsequent scans skip unchanged files and complete in milliseconds.
+Claude Code and Codex hooks re-run this after a turn or a finished subagent and write the ledger described under [Privacy and data handling](#privacy-and-data-handling). The Antigravity `Stop` hook does the same for a `transcript.jsonl`, into `gemini-<id>.json`. Cursor hooks append raw events instead of rewriting a session aggregate. A full Claude parse is about 0.3s even for a 74MB transcript.
+
+The `history` index is keyed by file path and re-validated by mtime, size and a pricing fingerprint.
 
 ## Cost disclaimer
 
-Costs are **API-price estimates** from the bundled `data/pricing.json` (rates as of September 2026). Subscription plans (Pro/Max) are not billed per token — treat the figure as "what this would cost at API prices". Update `data/pricing.json` if rates change; models not in the table show `—`. Rates can be added to the user pricing overlay at `~/.config/token-usage/pricing.json`, and unpriced models are named in a report footnote either way. Each entry is `{"input": $/MTok, "output": $/MTok}` with an optional `"cache_read": $/MTok` for models whose cache-hit rate is not 0.1× input (bundled for Fable 5.1 and Mythos 5.1 at $0.25). Sonnet 5 is priced at $2/$10 — its launch price, which Anthropic made permanent in September 2026 instead of raising it to $3/$15.
+Costs are **API-price estimates** from `data/pricing.json` (rates as of September 2026), plus any overlay. Subscription plans are not billed per token. Models missing from both tables show `—`. Sonnet 5 is priced at $2/$10. Fable 5.1 and Mythos 5.1 set an explicit cache-read rate of $0.25 per million. The table holds one rate per model, so promotional prices are not modelled; edit the overlay when a rate changes.
 
 ## Cursor: what v1 can and cannot measure
 
-**Can (when data exists):**
+**Can (when data exists):** per-activity breakdowns from hook ledgers, read-only Desktop SQLite, or an explicit Cloud Agent export; cross-session history, insights and top consumers with `measurement` and `warnings`; API-price estimates.
 
-- Per-activity breakdowns from hook ledgers (prospective **exact** buckets when Cursor
-  sends completion token fields), read-only Desktop SQLite composers/bubbles, or an
-  explicit Cloud Agent export path.
-- Cross-session `history`, `insights`, and `top_consumers` with `measurement` and
-  `warnings` in JSON — same aggregate shapes as Claude. Markdown names a
-  `partial` or activity-only measurement, so zero buckets are never mistaken for
-  genuinely free usage.
-- API-price estimates from `data/pricing.json` (not subscription billing).
-
-**Cannot:**
-
-- Infer Cursor plan credits, invoice totals, or subscription-tier billing.
-- Guarantee per-bubble `tokenCount` in SQLite (often zero; not billing truth).
-- Reconstruct exact usage for sessions before hooks were enabled.
-- Attribute marginal token cost to individual `@` attachments.
+**Cannot:** Cursor plan credits or invoice totals; guaranteed per-bubble `tokenCount` in SQLite; exact usage from before hooks were enabled; marginal token cost of individual `@` attachments; token totals the Cloud export did not contain.
 
 Details: [docs/cursor-adapter.md](docs/cursor-adapter.md).
 
 ## Limitations
 
-- Older transcripts without `requestId` fields are summed without dedup (may overcount).
-- `--since` filters sessions by their first timestamp; sessions whose transcripts carry no timestamps are skipped.
-- Day buckets in `history --by day` use local time. As of 0.5.0, a session is split across every local day it touched (not just its start day), so daily figures for the same underlying data shift vs 0.4.0 — same class of change as the 0.2.0 sticky-attribution rework.
-- Brand-new models render `—` and are named in a footnote until you add rates to the user overlay.
-- Attribution granularity is the command or skill segment: a command owns every turn until the next one, and there is no finer per-message split within a segment.
-- The pricing table holds one rate per model, so time-limited introductory or promotional prices are not modelled; edit the overlay when a rate changes.
-- In Cowork the hooks don't run, so there is no live ledger, statusline or budget nudge there; reports parse the sandbox-mounted transcript on demand instead.
+- Older Claude transcripts without `requestId` are summed without dedup and may overcount.
+- `--since` skips sessions whose recordings have no timestamp.
+- Day buckets use local time. Since 0.5.0 a session is split across every local day it touched.
+- Brand-new models render `—` until you add an overlay rate.
+- Attribution stops at the activity segment. There is no per-message split inside a segment, and no wall-clock duration.
+- There is no multi-machine or multi-account fleet rollup. "Fleet" here means the subagents inside one run, and the assistants you report one at a time.
+- Cowork does not run hooks, so there is no live ledger, statusline or budget nudge there.
+- Grok's own sessions, VS Code Copilot Chat, Gemini web and Copilot web are not runtimes.
+
+## Development and testing
+
+No build step. Contributor rules are in [CONTRIBUTING.md](CONTRIBUTING.md). From a virtual environment:
+
+```bash
+python3 -m pip install pytest 'ruff==0.16.6'
+python3 -m pytest tests/ -v -W error
+ruff check scripts tests
+```
+
+CI runs that pytest command on Python 3.9 and 3.12, plus `ruff check scripts tests` with Ruff 0.16.6, `claude plugin validate .` (pinned Claude Code), and an opt-in native Copilot job. The native Copilot check locally needs `COPILOT_TEST_CLI`.
+
+## Versioning
+
+Versions follow [semver](https://semver.org/). The released version is the newest `## [x.y.z]` heading in [CHANGELOG.md](CHANGELOG.md), currently **0.9.0** (2026-10-18, tag `v0.9.0`). These files must carry that same `version`:
+
+- `.claude-plugin/plugin.json`
+- `.codex-plugin/plugin.json`
+- `.cursor-plugin/plugin.json`
+- `.plugin/plugin.json`
+- `gemini-extension.json`
+- `plugin.json` (Antigravity)
+
+User-visible changes land under `## [Unreleased]` until a release. `main` currently includes unreleased Antigravity plugin manifests and the camelCase `Stop` hook on top of 0.9.0.
 
 ## Suggest a feature or report an issue
 
-Bugs and feature requests belong on [GitHub Issues](https://github.com/Wicked-Sick-Ltd/token-usage/issues).
+Bugs and feature requests belong on [GitHub Issues](https://github.com/Wicked-Sick-Ltd/token-usage/issues). Support email: **hello@wickedsick.com**.
 
-- **Something broke:** open a [bug report](https://github.com/Wicked-Sick-Ltd/token-usage/issues/new?template=bug_report.md). Include the plugin version (the `version` field in the host manifest), the host (Claude Code, Codex, Cursor, Gemini CLI, Copilot CLI, or another MCP client), your OS, and the Python version. For a wrong total, attach a **redacted** transcript snippet: the `usage` blocks and `requestId`s, not the conversation text, plus the table you got and the table you expected.
-- **Something missing:** open a [feature request](https://github.com/Wicked-Sick-Ltd/token-usage/issues/new?template=feature_request.md). Describe who is affected, the behaviour you want, and how you would tell that it works.
+- **Something broke:** open a [bug report](https://github.com/Wicked-Sick-Ltd/token-usage/issues/new?template=bug_report.md). Include the plugin version (the `version` field in the host manifest), the host, your OS, and the Python version. For a wrong total, attach a **redacted** transcript snippet: the `usage` blocks and ids, not the conversation text.
+- **Something missing:** open a [feature request](https://github.com/Wicked-Sick-Ltd/token-usage/issues/new?template=feature_request.md).
 - **A security problem:** do not open a public issue. Use the private report path in [SECURITY.md](SECURITY.md).
 
-The issue templates are [bug_report.md](.github/ISSUE_TEMPLATE/bug_report.md) and [feature_request.md](.github/ISSUE_TEMPLATE/feature_request.md). Development setup, tests, and pricing-table updates are in [CONTRIBUTING.md](CONTRIBUTING.md).
+The issue templates are [bug_report.md](.github/ISSUE_TEMPLATE/bug_report.md) and [feature_request.md](.github/ISSUE_TEMPLATE/feature_request.md).
 
 <!-- repository-guidance:begin -->
 ## Contributing and agent guidance
@@ -685,7 +548,4 @@ MIT licensed; see [LICENSE](LICENSE). Preserve third-party notices.
 
 ## Licence and credit
 
-token-usage is free, pro bono software. Copyright (c) 2026 Wicked Sick Limited,
-released under the [MIT licence](LICENSE). You are free to use, modify and redistribute
-it; please keep the copyright notice and credit Wicked Sick Limited (see
-[NOTICE](NOTICE)).
+token-usage is free, pro bono software. Copyright (c) 2026 Wicked Sick Limited, released under the [MIT licence](LICENSE). You are free to use, modify and redistribute it; please keep the copyright notice and credit Wicked Sick Limited (see [NOTICE](NOTICE)).

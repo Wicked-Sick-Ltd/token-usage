@@ -1,7 +1,7 @@
 {
   "name": "token-usage",
   "version": "0.9.0",
-  "description": "Local Google Antigravity and Gemini CLI token accounting, activity reports, model breakdowns and usage history.",
+  "description": "Gemini package of the token-usage AI agent plugin: local Google Antigravity and Gemini CLI token accounting, activity reports, model breakdowns and usage history.",
   "contextFileName": "gemini-context.md",
   "mcpServers": {
     "token-usage": {

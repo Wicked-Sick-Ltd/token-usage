@@ -138,11 +138,11 @@ History scope rejects a positional recording. Session scope rejects `--by`, `--s
 
 | Command | Who runs it | What it writes |
 |---|---|---|
-| `hook` | Claude Code `Stop` and `SubagentStop` (`hooks/hooks.json`) | `~/.cache/token-usage/<session-id>.json`, and it may repoint `latest.json`. |
+| `hook` | Claude Code `Stop` and `SubagentStop` (`hooks/hooks.json`). Antigravity `Stop` (root `hooks.json`) when the payload is camelCase (`conversationId` / `transcriptPath`, and no `transcript_path`). | Claude: `~/.cache/token-usage/<session-id>.json`, and it may repoint `latest.json`. Antigravity: `gemini-<session-id>.json`, and it does not repoint `latest.json`. |
 | `codex-hook` | Codex `Stop` and `SubagentStop` (`hooks/hooks-codex.json`) | `codex-<session-id>.json` in the same cache. It does not repoint `latest.json`. |
 | `cursor-hook` | Cursor `beforeSubmitPrompt`, `stop`, `subagentStart`, `subagentStop` (`hooks/hooks-cursor.json`) | Append-only JSONL under `cursor/` in the cache. Prints `{}`. |
 
-Claude and Codex hooks print nothing on stdout except an optional budget `systemMessage` when `TOKEN_USAGE_BUDGET_USD` is a number greater than zero. The nudge fires on `Stop`, once per crossed multiple. `SubagentStop` updates the ledger and does not emit the nudge. Gemini CLI and Copilot CLI do not register these hooks. The timeout in each hook file is 15 seconds.
+Claude Code and Codex hooks print nothing on stdout except an optional budget `systemMessage` when `TOKEN_USAGE_BUDGET_USD` is a number greater than zero. Antigravity prints `{}` in that same case, or the budget `systemMessage` when a multiple is crossed. The nudge fires on `Stop`, once per crossed multiple. `SubagentStop` updates a Claude or Codex ledger and does not emit the nudge. Antigravity does not register `SubagentStop`. Legacy Gemini CLI and Copilot CLI do not register these hooks. The timeout in each hook file is 15 seconds. Cursor's hook does not emit a budget nudge.
 
 ## MCP server
 
