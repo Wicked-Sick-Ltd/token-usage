@@ -37,8 +37,10 @@ Repeated message or step IDs count once, using the largest recorded counters. Ca
 prompt tokens are separated from uncached input (Antigravity `PLANNER_RESPONSE` steps
 record `input_tokens` already excluding `cache_read_tokens`, whereas legacy Gemini CLI
 `tokens.input` includes `tokens.cached`). Tool-use prompt tokens count as input; thought
-tokens count as output. In Antigravity, skills activated via `view_file` on
-`skills/<name>/SKILL.md` open `$<name>` segments, and subagent conversations linked via
+tokens count as output. Each user message opens a new segment. A leading `$` or `/`
+labels that message; any other message is `(no command)`. In Antigravity, a
+`view_file` on `skills/<name>/SKILL.md` opens a `$<name>` segment for the rest of
+that turn, and the next user message opens a new segment. Subagent conversations linked via
 step 0 `SYSTEM_MESSAGE` `sender=<parent-session-id>` roll into the parent session once.
 In legacy Gemini CLI, child and grandchild sessions under `chats/<parent-id>/` roll into
 the parent once by start timestamp.
@@ -91,6 +93,9 @@ uninstalling the plugin does not delete it.
 
 The adapter combines that ledger with native
 `$COPILOT_HOME/session-state/<session-id>/events.jsonl`, deduplicating by event ID.
+Each `user.message` opens a segment. A leading `$` or `/` labels it, and any other
+message is `(no command)`. `skill.invoked` opens `$<name>` until the next user
+message. A recovered shutdown total is one `partial` `(no command)` segment.
 Input totals already include cache reads and writes; output already includes
 reasoning. Subagent usage is included once and displayed as a subset. Cache writes
 without a lifetime use the standard 5-minute estimate, with an explicit warning.

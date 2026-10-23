@@ -7,7 +7,7 @@ often show a session total. They do not say which activity in the run consumed
 the tokens, or what the subagents inside that activity added. token-usage
 attributes recorded usage to the command, skill, turn or generation that consumed
 it, on Claude Code, Cowork, Cursor, OpenAI Codex, Google Antigravity, Gemini CLI
-and GitHub Copilot CLI:
+and GitHub Copilot CLI. A Claude Code session looks like this:
 
 ```
 | Activity                      | Calls | Output | Input | Cache read | Cache write | Est. cost |
@@ -18,8 +18,11 @@ and GitHub Copilot CLI:
 | **Total**                     |       |  214k  | 13.8k |      46.1M |        1.5M |    $33.87 |
 ```
 
-Totals always reconcile: every turn belongs to exactly one row, and `(no command)` holds
-only the turns before the session's first command.
+Totals always reconcile: every turn belongs to exactly one row. On Claude Code and
+Cowork, `(no command)` is the work before the first command or skill. On Codex,
+Antigravity, Gemini CLI and Copilot, each later ordinary turn is its own
+`(no command)` row. Cursor uses one row per generation, and `(no activity)` when
+that generation has no command, skill, prompt or title.
 
 ## Questions it answers
 

@@ -34,7 +34,8 @@ missing usage is never a fabricated zero-dollar bill.
 
 Input totals include cache reads and cache writes, so the uncached bucket
 subtracts both. Reasoning tokens are already included in output. Models follow
-turn_context, and labels follow turns and explicit user skill/command names.
+turn_context. Each turn opens as `(no command)`. A user message that begins with
+`$` or `/` labels that turn, and the next turn opens unlabelled again.
 Reading a SKILL.md through an arbitrary shell tool is not proof of invocation.
 Subagent rollouts with an explicit parent_thread_id (including the thread_spawn
 source shape) roll into the parent report once; corpus reports exclude those

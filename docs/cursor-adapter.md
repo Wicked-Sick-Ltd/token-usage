@@ -99,7 +99,7 @@ for at least one turn is reported as **partial**, and one that states none is
 | Claude concept | Cursor concept | V1 unit |
 | --- | --- | --- |
 | Session transcript | Composer / Cloud run | Session |
-| Slash-command segment | User generation in composer | Sticky activity |
+| Slash-command segment | User generation in composer | One generation |
 | Skill tool use | Skill/command when recorded | Activity label |
 | Subagent transcript | Task/subagent child | Child activity (rollup when linked) |
 | Model on request | Composer/bubble model | Per-model bucket |
@@ -107,7 +107,9 @@ for at least one turn is reported as **partial**, and one that states none is
 | `@` context | Attachments, rules | Metadata only (no marginal token cost) |
 
 Activity label precedence: explicit command/skill → subagent type → composer
-title → bounded first-user-prompt summary → `(no activity)`.
+title → bounded first-user-prompt summary → `(no activity)`. Each user generation
+is its own row, labelled from that generation. The next generation opens a new
+row. `(no activity)` is a generation with no command, skill, prompt or title.
 
 ## Read path confidence (CursorAdapter)
 

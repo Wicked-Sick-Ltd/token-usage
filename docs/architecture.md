@@ -53,14 +53,17 @@ pricing step. The report does not record wall-clock duration.
 
 ## Local state
 
-The hooks keep a per-session ledger, and the corpus commands keep an incremental summary
+The hooks keep a per-session ledger, and the corpus commands keep a summary
 index. Both live under `~/.cache/token-usage/`, which `TOKEN_USAGE_LEDGER_DIR` overrides;
 the transcript roots have their own overrides. The README's
 [Configuration](../README.md#configuration) section lists every environment variable.
-The index is keyed by transcript path and revalidated by modification time, size and a
-pricing fingerprint, so a rate change re-prices cached sessions. Codex/Gemini
-families and Copilot native-plus-capture sources are recomputed because their
-related files can grow independently. Copilot capture files live separately under
+Claude Code (`cached_summary`) and Cursor (`cached_adapter_summary`) reuse an entry
+when the indexed file's modification time, size and pricing fingerprint still match,
+so a rate change re-prices those sessions. Codex, Antigravity, Gemini CLI and Copilot
+go through `cached_adapter_summary` too, but that function skips the hit for adapter
+names `codex`, `gemini` and `copilot` and parses again on every scan. A child rollout,
+nested chat or Copilot capture file can grow while the indexed file stays the same.
+Copilot capture files live separately under
 `$COPILOT_HOME/token-usage/`; see [data handling](gemini-copilot.md).
 
 ## Reusing the pieces

@@ -74,10 +74,15 @@ All five native runtimes (`claude`, `codex`, `cursor`, `gemini`, `copilot`) supp
 
 ## Features
 
-These behaviours are shared. Host limits are in the table above and in the runtime notes.
+The commands below are shared. Label rules and the history index follow the runtime. The host table and the runtime notes carry the same limits.
 
-- **Per-activity attribution.** A label sticks until the next command, skill or generation. `(no command)` or `(no activity)` is only the work before the first label. Subagent rows from `--agents` and per-model rows from `--models` are subsets of the parent, not extra totals.
-- **Cross-session history.** `history` groups by project, day (local time), command or model. `--project` filters. `--csv` is for a spreadsheet. An index under `~/.cache/token-usage/index/` re-parses a transcript only when it changes.
+- **Per-activity attribution.** Each turn belongs to one activity row. Rows from `--agents` and `--models` are subsets of that parent.
+  - **Claude Code and Cowork.** A command or skill label sticks until the next command or skill. `(no command)` is the work before the first label. Cowork opens a skill segment from a `Skill` tool call (`/skill-name`).
+  - **Codex.** Each turn opens as `(no command)`. A user message that begins with `$` or `/` labels that turn. The next turn opens unlabelled again.
+  - **Cursor.** Each composer generation is its own row. The label is that generation's command, skill, prompt, or composer title. `(no activity)` is a generation with none of those.
+  - **Google Antigravity and Gemini CLI.** Each user message opens a row. A message that begins with `$` or `/` names that row. Any other message is `(no command)`. When an Antigravity turn views `skills/<name>/SKILL.md`, the rest of that turn is `$<name>`.
+  - **GitHub Copilot CLI.** Each `user.message` opens a row, named from a leading `$` or `/`, otherwise `(no command)`. `skill.invoked` opens `$<name>` until the next user message. A recovered shutdown total is one `partial` `(no command)` row.
+- **Cross-session history.** `history` groups by project, day (local time), command or model. `--project` filters. `--csv` is for a spreadsheet. The index under `~/.cache/token-usage/index/` serves `history`, `insights`, `top_consumers`, `dashboard` and `export`. Claude Code and Cursor reuse an entry when the recording's mtime, size and pricing fingerprint still match. Codex, Antigravity, Gemini CLI and Copilot parse again on every scan: a child rollout, nested chat or capture file can grow while the indexed file stays the same, so the saved entry is not reused.
 - **Burn rate.** `history --since 7d` adds an average $/day and a projected $/week for that window.
 - **Compare.** `report --diff OLD NEW` shows per-label cost and output deltas. An unpriced side renders `—`.
 - **Cache-aware estimates.** Cache reads at 0.1× input (0.025× on Fable 5.1 and Mythos 5.1), 5-minute cache writes at 1.25×, 1-hour writes at 2×. Mixed-model sessions are priced per model. Bedrock (`us.anthropic.…`) and OpenRouter-style (`anthropic/…`) ids resolve. Rates live in `data/pricing.json` (checked September 2026) plus an optional overlay.
@@ -110,7 +115,7 @@ Transcripts contain your prompts and code. token-usage reads them only to count 
 
 - `<session-id>.json` (Claude Code), `codex-<session-id>.json` (Codex) and `gemini-<session-id>.json` (Antigravity `Stop`): the session aggregate the hook keeps current. It holds token counts, cost estimates, activity labels, the transcript path, segment timestamps, and **the first 120 characters of the prompt that opened each segment**.
 - `latest.json`: a best-effort symlink to the most recently written Claude Code session aggregate (the statusline fallback). Codex and Gemini ledgers never repoint it.
-- `index/`: the per-transcript summary cache used by `history`, `insights`, `top_consumers`, `dashboard` and `export`. It holds transcript paths, project names, activity labels and token/cost totals.
+- `index/`: the summary cache used by `history`, `insights`, `top_consumers`, `dashboard` and `export`. It holds transcript paths, project names, activity labels and token/cost totals. Claude Code and Cursor reuse an entry when the recording's mtime, size and pricing fingerprint still match. Codex, Antigravity, Gemini CLI and Copilot rewrite the entry on every scan and do not reuse it.
 - `cursor/<hash>.jsonl`: the append-only Cursor hook ledger. It holds the conversation id, UTC timestamps, workspace roots, the hook's raw token fields, and **the first 120 characters of each prompt and subagent task**. The directory is created owner-only (`0700`) where the filesystem supports it.
 
 Copilot additionally writes `~/.copilot/token-usage/<session-id>.jsonl` under `COPILOT_HOME`: event IDs, timestamps, counters, command/skill labels, agent IDs and a session/project header. It stores no prompts or tool output. See the [collector and retention details](docs/gemini-copilot.md#github-copilot-cli).
@@ -474,7 +479,7 @@ Cowork uses the same transcript shape on a read-only sandbox mount. Skills there
 
 Claude Code and Codex hooks re-run this after a turn or a finished subagent and write the ledger described under [Privacy and data handling](#privacy-and-data-handling). The Antigravity `Stop` hook does the same for a `transcript.jsonl`, into `gemini-<id>.json`. Cursor hooks append raw events instead of rewriting a session aggregate. A full Claude parse is about 0.3s even for a 74MB transcript.
 
-The `history` index is keyed by file path and re-validated by mtime, size and a pricing fingerprint.
+The `history` index is keyed by file path and re-validated by mtime, size and a pricing fingerprint. Claude Code and Cursor reuse an entry when those three still match. Codex, Antigravity, Gemini CLI and Copilot parse again on every scan, because a related file can change while the indexed file stays the same. See [architecture](docs/architecture.md).
 
 ## Cost disclaimer
 
@@ -494,7 +499,7 @@ Details: [docs/cursor-adapter.md](docs/cursor-adapter.md).
 - `--since` skips sessions whose recordings have no timestamp.
 - Day buckets use local time. Since 0.5.0 a session is split across every local day it touched.
 - Brand-new models render `—` until you add an overlay rate.
-- Attribution stops at the activity segment. There is no per-message split inside a segment, and no wall-clock duration.
+- Attribution stops at the activity segment, and there is no wall-clock duration. Claude Code and Cowork keep one command or skill label across the later turns inside that segment. Codex, Antigravity, Gemini CLI and Copilot open a new segment on each turn. Cursor opens a new segment on each composer generation.
 - There is no multi-machine or multi-account fleet rollup. "Fleet" here means the subagents inside one run, and the assistants you report one at a time.
 - Cowork does not run hooks, so there is no live ledger, statusline or budget nudge there.
 - Grok's own sessions, VS Code Copilot Chat, Gemini web and Copilot web are not runtimes.

@@ -21,6 +21,12 @@ adheres to [Semantic Versioning](https://semver.org/).
   explicit export path; local Cursor hooks and MCP do not follow the VM. The security
   contact is hello@wickedsick.com. Wall-clock duration and multi-machine fleet rollups
   are documented as unsupported.
+- **Attribution and history-cache limits, per runtime.** Sticky labels, and
+  `(no command)` as only the work before the first label, are documented for
+  Claude Code and Cowork. Codex opens each turn unlabelled. Antigravity, Gemini
+  CLI and Copilot open a new label on each user message. Claude Code and Cursor
+  reuse a history-index entry when mtime, size and the pricing fingerprint match.
+  Codex, Antigravity, Gemini CLI and Copilot parse again on every corpus scan.
 
 ## [0.9.0] — 2026-10-18
 
