@@ -28,7 +28,7 @@ Every listing is manually reviewed and must be open source.
 |---|---|
 | Name | `token-usage` |
 | Display name | Token Usage Profiler |
-| Description | Attribute Cursor, Claude Code, Cowork, Codex, Google Antigravity, Gemini CLI, and Copilot CLI token usage to the work that consumed it — per-activity breakdowns, subagent rollups, cross-session history, live session ledger, cache-aware API-price estimates, and a bundled MCP server with optional Cursor hook attribution |
+| Description | AI agent plugin. Attribute Cursor, Claude Code, Cowork, Codex, Google Antigravity, Gemini CLI, and Copilot CLI token usage to the work that consumed it — per-activity breakdowns, subagent rollups, cross-session history, live session ledger, cache-aware API-price estimates, and a bundled MCP server with optional Cursor hook attribution |
 | Category | Developer Tools |
 | Homepage and documentation | https://github.com/Wicked-Sick-Ltd/token-usage#readme |
 | Support | https://github.com/Wicked-Sick-Ltd/token-usage/issues (email: hello@wickedsick.com) |
@@ -84,7 +84,10 @@ Claude Code (`claude plugin validate .`), Codex, Google Antigravity, Gemini CLI,
 Copilot CLI and Grok Build installs; limits are in the runtime guides. The portal
 resubmission is pending; this document does not record an approved or completed
 submission. Other directories are covered in
-[docs/marketplaces.md](docs/marketplaces.md).
+[docs/marketplaces.md](docs/marketplaces.md). `main` also contains the unreleased
+Antigravity root plugin files and `Stop` hook described in
+[CHANGELOG.md](CHANGELOG.md). A submission of tag `v0.9.0` does not include that
+hook packaging; a submission of `main` does.
 
 The earlier Claude Console plugin form and the claude.ai admin-settings form are no
 longer supported. An earlier submission made through them has to be withdrawn or moved
@@ -105,7 +108,8 @@ repository owner.
   webhook).
 - Raise `version` in the manifests and add a CHANGELOG entry for every release; the
   directory treats each version separately. `tests/test_directory_readiness.py` fails if
-  all five host manifests or the changelog disagree.
+  the host manifests (Claude, Codex, Cursor, Gemini CLI, Antigravity root
+  `plugin.json`, and Copilot) or the changelog disagree.
 
 ## Source
 
@@ -128,7 +132,7 @@ The portal reads these from the repository:
 |---|---|---|
 | Name | `plugin.json` `name` | `token-usage` |
 | Display name | `plugin.json` `displayName` | Token Usage Profiler |
-| Description | `plugin.json` `description` | A token profiler, not a cost meter: attributes Claude Code and Cowork usage to the slash command, skill or subagent that consumed it. |
+| Description | `plugin.json` `description` | AI agent token profiler. On Claude Code and Cowork, attributes usage to the slash command, skill or subagent that consumed it. |
 | Homepage and documentation | `homepage`, `documentationUrl` | https://github.com/Wicked-Sick-Ltd/token-usage#readme |
 | Support | `supportUrl` | https://github.com/Wicked-Sick-Ltd/token-usage/issues (email: hello@wickedsick.com) |
 | Privacy | `privacyPolicyUrl` | https://github.com/Wicked-Sick-Ltd/token-usage#privacy-and-data-handling |
@@ -148,12 +152,16 @@ marketplace metadata, and MCP stdio clean shutdown (see [CHANGELOG.md](CHANGELOG
 
 ### Long description (if a field asks for one)
 
-Every existing tool answers *how much*: `/cost` gives session totals, statuslines show
-a running number, aggregators roll up by day or model. token-usage answers *what the
-work was*. It parses the session transcript and produces one row per slash command or
-skill ("the code review cost 180k tokens, the ad-hoc work cost 30k"), with subagent
-transcripts rolled up into the command that spawned them and a `(no command)` bucket so
-totals always reconcile.
+token-usage is an AI agent plugin, not a Claude-only plugin. The same repository
+measures token use per run on Claude Code, Cowork, Cursor, OpenAI Codex, Google
+Antigravity, Gemini CLI and GitHub Copilot CLI, and rolls a fleet of subagents into
+the activity that spawned them. This directory listing is the Claude Code and Cowork
+package of that plugin.
+
+Every host total answers *how much*. token-usage answers *what the work was*. On
+Claude Code it produces one row per slash command or skill ("the code review cost
+180k tokens, the ad-hoc work cost 30k"), with subagent transcripts rolled up into
+the command that spawned them and a `(no command)` bucket so totals always reconcile.
 
 Attribution is sticky (a command owns every turn until the next one) and works in Cowork
 too, where skills run through the Skill tool rather than slash-command prompts. Beyond
@@ -170,11 +178,13 @@ and `top_consumers`. Cost figures are per-model, cache-aware API-price estimates
 labelled as such for subscription users. Python 3.9+ standard library only: no
 dependencies, no network calls, no telemetry.
 
-The same repository also packages the plugin for Codex (`.codex-plugin/`) and Cursor
-(`.cursor-plugin/`), Gemini CLI (`gemini-extension.json`) and GitHub Copilot CLI
-(`.plugin/`), and Grok Build installs the Claude plugin unchanged; this directory
-listing covers the Claude Code plugin. It is free, pro bono software from Wicked Sick
-Limited under the MIT licence.
+The same repository also packages Codex (`.codex-plugin/`), Cursor
+(`.cursor-plugin/`), Google Antigravity (root `plugin.json`, `mcp_config.json`,
+`hooks.json`), Gemini CLI (`gemini-extension.json`) and GitHub Copilot CLI
+(`.plugin/`). Grok Build installs the Claude-format package unchanged and does not
+attribute Grok's own sessions. This directory listing covers the Claude Code and
+Cowork package. It is free, pro bono software from Wicked Sick Limited under the
+MIT licence. Wall-clock duration and multi-machine fleet rollups are not features.
 
 ### Example use cases
 
@@ -182,9 +192,9 @@ Limited under the MIT licence.
 Example 1: "Where did my tokens go this session?" — at the end of a long session, run /token-usage:report (or just ask) and get a per-command table: see at once that the code review consumed six times everything else combined.
 Example 2: Deciding whether a heavy workflow is worth it — multi-agent commands (deep code reviews, research fan-outs) are powerful but expensive. token-usage shows their true deduplicated, cache-aware cost, so "run on every PR" or "reserve for releases" is decided with real numbers.
 Example 3: Profiling slash commands and skills you author — see what each invocation costs (cache-write amplification and subagent fan-out included), break it down by agent type with --agents or by model with --models, and compare before and after with --diff when optimising prompts.
-Example 4: "Which project ate the tokens this week?" — history --by project --since 7d (or by day, command or model) rolls up every session on the machine, with a burn-rate footer and CSV export; an incremental cache keeps warm runs near-instant.
+Example 4: "Which project ate the tokens this week?" — history --by project --since 7d (or by day, command or model) rolls up every session on the machine, with a burn-rate footer and CSV export. Claude Code and Cursor reuse an unchanged history-index entry; Codex, Antigravity, Gemini CLI and Copilot recompute on every scan.
 Example 5: Live cost awareness while you work — the optional statusline renders "214k out · $33.87 · top: /code-review", updated every turn from the live ledger; set TOKEN_USAGE_BUDGET_USD for a nudge when a session crosses your budget (and again at each multiple).
-Example 6: Auditing a past or headless session — the standalone CLI analyses any transcript outside Claude Code, with JSON output for dashboards or CI cost tracking of claude -p automation.
+Example 6: Auditing a past or headless run — the standalone CLI analyses a recording for any supported runtime (`--runtime claude|codex|cursor|gemini|copilot`), including a Cursor Cloud Agent export path, with JSON output for a case study or CI check.
 Example 7: Asking in the session without a shell — with the plugin enabled, Claude Code starts the bundled MCP server; ask "where did my tokens go?" or "which sessions cost the most this month?" and the skill calls session_cost, insights or top_consumers instead of shelling out.
 Example 8: "What were the costliest sessions (or commands) this month?" — top_consumers --by session|command --since 30d ranks the window; rows whose cost is only a priced subtotal (some usage on an unpriced model) are marked * and footnoted.
 ```
@@ -198,13 +208,16 @@ These answers must match the README section
 Yes, locally only. It reads the user's own local AI session transcripts, which can
 contain prompts and code: Claude Code `~/.claude/projects/`, the read-only Cowork sandbox
 mount, and (only when asked for those runtimes) Cursor's local `state.vscdb` opened
-read-only, Codex rollouts under `~/.codex`, Gemini recordings under `~/.gemini`,
+read-only, an explicit Cursor Cloud Agent export path, Codex rollouts under `~/.codex`,
+Antigravity `transcript.jsonl` and Gemini CLI recordings under `~/.gemini`,
 and Copilot session events under `~/.copilot`. It stores derived token counts, cost
 estimates, activity labels, transcript paths and prompt excerpts of up to 120 characters
-in `~/.cache/token-usage/` on the user's machine. Copilot's capture extension also
+in `~/.cache/token-usage/` on the user's machine (Claude, Codex and Antigravity session
+ledgers, and the Cursor hook ledger). Copilot's capture extension also
 stores counters, event IDs, labels and project/session metadata under
 `$COPILOT_HOME/token-usage/`, without prompts or tool output. Reports returned through
-MCP enter the host conversation and follow its data policy.
+MCP enter the host conversation and follow its data policy. It does not call vendor
+cloud APIs.
 
 **Does it send data to services other than its declared connectors?**
 No. It makes no network calls and has no telemetry or third-party services. The bundled

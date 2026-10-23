@@ -1,5 +1,5 @@
 {
   "name": "token-usage",
   "version": "0.9.0",
-  "description": "Local Google Antigravity, Gemini CLI, Claude Code, Codex, Cursor, and Copilot CLI token accounting, activity reports, model breakdowns and usage history."
+  "description": "AI agent plugin for Google Antigravity: local token accounting for Antigravity, Gemini CLI, Claude Code, Codex, Cursor, and Copilot CLI, with activity reports and usage history."
 }

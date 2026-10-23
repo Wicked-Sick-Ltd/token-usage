@@ -37,8 +37,10 @@ Repeated message or step IDs count once, using the largest recorded counters. Ca
 prompt tokens are separated from uncached input (Antigravity `PLANNER_RESPONSE` steps
 record `input_tokens` already excluding `cache_read_tokens`, whereas legacy Gemini CLI
 `tokens.input` includes `tokens.cached`). Tool-use prompt tokens count as input; thought
-tokens count as output. In Antigravity, skills activated via `view_file` on
-`skills/<name>/SKILL.md` open `$<name>` segments, and subagent conversations linked via
+tokens count as output. Each user message opens a new segment. A leading `$` or `/`
+labels that message; any other message is `(no command)`. In Antigravity, a
+`view_file` on `skills/<name>/SKILL.md` opens a `$<name>` segment for the rest of
+that turn, and the next user message opens a new segment. Subagent conversations linked via
 step 0 `SYSTEM_MESSAGE` `sender=<parent-session-id>` roll into the parent session once.
 In legacy Gemini CLI, child and grandchild sessions under `chats/<parent-id>/` roll into
 the parent once by start timestamp.
@@ -48,6 +50,19 @@ Missing counters produce `partial` or `activity_only` reports. Deleted recording
 be reconstructed; legacy `$set.messages` checkpoints are flagged as incomplete. Unknown
 model prices remain unknown: add an [overlay](../README.md#configuration) to price a
 model. `live --runtime gemini` polls the native recording directly.
+
+### Antigravity Stop hook
+
+Root `hooks.json` registers `Stop` for Google Antigravity. It runs
+`python3 scripts/token_usage.py hook` with a 15-second timeout and fails open.
+A payload that carries `conversationId` or `transcriptPath` and does not carry
+`transcript_path` is stored as the `gemini` runtime in
+`~/.cache/token-usage/gemini-<session-id>.json` (override `TOKEN_USAGE_LEDGER_DIR`).
+That ledger includes the first 120 characters of each segment prompt and does not
+repoint `latest.json`. Stdout is `{}`, or one budget `systemMessage` when
+`TOKEN_USAGE_BUDGET_USD` is crossed. Antigravity does not register `SubagentStop`.
+Legacy Gemini CLI does not register this hook. This packaging is on `main` and is
+listed under Unreleased; tag `v0.9.0` does not include the root hook file.
 
 ## GitHub Copilot CLI
 
@@ -78,6 +93,9 @@ uninstalling the plugin does not delete it.
 
 The adapter combines that ledger with native
 `$COPILOT_HOME/session-state/<session-id>/events.jsonl`, deduplicating by event ID.
+Each `user.message` opens a segment. A leading `$` or `/` labels it, and any other
+message is `(no command)`. `skill.invoked` opens `$<name>` until the next user
+message. A recovered shutdown total is one `partial` `(no command)` segment.
 Input totals already include cache reads and writes; output already includes
 reasoning. Subagent usage is included once and displayed as a subset. Cache writes
 without a lifetime use the standard 5-minute estimate, with an explicit warning.
@@ -119,7 +137,7 @@ Copilot CLI 1.0.91 installed the plugin and discovered its skill and MCP server.
 provider in offline mode, with OpenAI and Anthropic wire formats. It verifies all
 five tool schemas, captured counters, resumed totals and prompt redaction without
 credentials or model spend. Set `COPILOT_TEST_CLI` to the executable to rerun it.
-It does not claim validation against a paid Copilot account or cloud agent.
+It does not claim validation against a paid Copilot account or a Copilot cloud agent.
 
 Contracts checked on 2026-10-05:
 

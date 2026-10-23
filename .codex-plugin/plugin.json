@@ -1,7 +1,7 @@
 {
   "name": "token-usage",
   "version": "0.9.0",
-  "description": "Local Codex token accounting by turn, explicit skill and model, with history, insights, live reports, exports and a bundled MCP server.",
+  "description": "Codex package of the token-usage AI agent plugin: local token accounting by turn, explicit skill and model, with history, insights, live reports, exports and a bundled MCP server.",
   "author": {
     "name": "Wicked Sick Limited",
     "email": "craig@wickedsick.com",
@@ -25,7 +25,7 @@
   "interface": {
     "displayName": "Token Usage",
     "shortDescription": "Local token reports and API cost estimates for Codex sessions.",
-    "longDescription": "Inspect token usage by turn, skill and model, compare sessions, and track local usage history. Costs are API-equivalent estimates, not subscription charges. Requires Python 3.9+ on PATH.",
+    "longDescription": "Codex package of the multi-agent token-usage plugin. Inspect token usage by turn, skill and model, compare sessions, and track local usage history. Costs are API-equivalent estimates, not subscription charges. Requires Python 3.9+ on PATH.",
     "developerName": "Wicked Sick Limited",
     "category": "Developer Tools",
     "websiteURL": "https://github.com/Wicked-Sick-Ltd/token-usage",

@@ -61,6 +61,30 @@ truth ([forum discussion](https://forum.cursor.com/t/cursordiskkv-table-records-
 
 Override the root in tests with `TOKEN_USAGE_CURSOR_DIR`.
 
+## Cloud Agents
+
+A Cloud Agent does not load the developer's local Cursor plugin, `~/.cursor`
+hooks, or `~/.cursor/mcp.json`. Those stay on the machine that installed them.
+Cloud Agents run repository hooks from `.cursor/hooks.json` on the VM. This
+repository does not ship that file, so cloning token-usage does not by itself
+instrument the VM.
+
+Report a finished cloud run by passing the export file:
+
+```bash
+python3 scripts/token_usage.py report --runtime cursor /path/to/cloud-export.json
+```
+
+The same path is the MCP `transcript` argument with `runtime: "cursor"`. Ask the
+agent to include `measurement` and `warnings`. Activity-only output counts turns.
+It is not a token bill.
+
+To capture hooks on the VM, that environment needs the Cursor plugin installed
+or a repository `.cursor/hooks.json` whose command runs
+`python3 <plugin>/scripts/token_usage.py cursor-hook`. The ledger is then on
+the VM, under that VM's `~/.cache/token-usage/cursor/`. It is not written back
+to the developer's laptop.
+
 ## Observed Cloud Agent export
 
 A sample Cloud Agent JSON export (see `tests/fixtures/cursor/cloud-export.json`)
@@ -70,16 +94,12 @@ token fields only when they are actually present: an export that states usage
 for at least one turn is reported as **partial**, and one that states none is
 **activity-only** — no undocumented cloud API and no account credentials.
 
-Cloud Agents run repository hooks from `.cursor/hooks.json` on the VM; a user's
-local `~/.cursor` hooks and local MCP registrations do not automatically follow
-the agent.
-
 ## Attribution mapping (Claude → Cursor)
 
 | Claude concept | Cursor concept | V1 unit |
 | --- | --- | --- |
 | Session transcript | Composer / Cloud run | Session |
-| Slash-command segment | User generation in composer | Sticky activity |
+| Slash-command segment | User generation in composer | One generation |
 | Skill tool use | Skill/command when recorded | Activity label |
 | Subagent transcript | Task/subagent child | Child activity (rollup when linked) |
 | Model on request | Composer/bubble model | Per-model bucket |
@@ -87,7 +107,9 @@ the agent.
 | `@` context | Attachments, rules | Metadata only (no marginal token cost) |
 
 Activity label precedence: explicit command/skill → subagent type → composer
-title → bounded first-user-prompt summary → `(no activity)`.
+title → bounded first-user-prompt summary → `(no activity)`. Each user generation
+is its own row, labelled from that generation. The next generation opens a new
+row. `(no activity)` is a generation with no command, skill, prompt or title.
 
 ## Read path confidence (CursorAdapter)
 
@@ -106,8 +128,9 @@ title → bounded first-user-prompt summary → `(no activity)`.
    `tokenUsage` fields; `partial` when at least one turn states usage and
    `activity_only` when none does. Nothing is inferred from message length.
 
-CLI and MCP accept `--runtime` / `runtime`: `claude` (default), `cursor`, or
-`auto`. One call never mixes corpora.
+CLI and MCP accept `--runtime` / `runtime`: `claude` (default), `cursor`,
+`codex`, `gemini`, `copilot`, or `auto`. One call never mixes corpora. The
+Cursor package sets `TOKEN_USAGE_RUNTIME=cursor` for its own MCP server.
 
 ## V1 can measure
 
@@ -185,7 +208,7 @@ exporter can map this stable schema without breaking JSONL consumers.
 | Authenticated HTTP/SSE MCP transport | **0.7.1+** — needs binding, auth, origin policy, concurrency, shutdown, and stream resumption design |
 | True OTLP wire export | **0.7.1+** — maps from `token-usage.aggregate.v1`, not a separate invented schema |
 | User-configurable insight thresholds | **Deferred (YAGNI)** — fixed rules stay predictable |
-| Fleet / multi-machine aggregation | **Out of scope** |
+| Fleet / multi-machine aggregation | **Out of scope.** Subagent rollups inside one run are supported. A rollup across machines or accounts is not |
 | LLM-generated insights | **Out of scope** — `insights` stays rule-based arithmetic |
 | Codex | **Shipped in 0.7.0** — `CodexAdapter`; see [codex-adapter.md](codex-adapter.md) |
 | Google Antigravity / Gemini CLI / Copilot CLI | **Shipped in 0.8.0 / 0.9.0** — see [runtime setup and limits](gemini-copilot.md) |

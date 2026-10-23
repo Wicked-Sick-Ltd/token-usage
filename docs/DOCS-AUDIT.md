@@ -1,5 +1,29 @@
 # Documentation audit — 2026-10-03
 
+2026-10-23 addendum: the shared feature list had two claims the parsers do not
+share. `parse_session()` (Claude Code and Cowork) keeps a command or skill label
+until the next one, and `(no command)` is only the work before the first label.
+`parse_codex_session()` opens each turn as `(no command)` and applies a leading
+`$` or `/` to that turn. `parse_gemini_session()`, `_parse_antigravity_session()`
+and `parse_copilot_records()` open a new label on each user message.
+`cached_summary()` (Claude Code history) and Cursor inside `cached_adapter_summary()`
+reuse an entry when mtime, size and the pricing fingerprint match. The same
+function skips that hit for adapter names `codex`, `gemini` and `copilot`.
+
+2026-10-22 addendum: docs-vs-code pass against `main` (release 0.9.0 plus the
+unreleased Antigravity plugin files). Corrected claims that treated token-usage
+as a Claude-only plugin, that Gemini had no Stop hook, and that the security
+contact was craig@wickedsick.com. README, SECURITY, SUBMISSION, CHANGELOG,
+host manifests, and the runtime notes now describe one multi-agent plugin.
+Cloud Agent reporting is an explicit export path; this repo does not ship
+`.cursor/hooks.json`. Wall-clock duration and multi-machine fleet aggregation
+are documented as unsupported. The historical tables below were not re-checked
+line by line. Still unverified from this pass: live marketplace listing state,
+vendor price pages after September 2026, whether the Antigravity UI displays a
+budget `systemMessage`, and Claude Code 2.1.139's `CLAUDE_PROJECT_DIR` export.
+
+
+
 2026-10-09 addendum: user-doc gap pass against `scripts/token_usage.py` and
 `scripts/mcp_server.py` at `868ef04` (before this change). Already present: host
 install sections, a feature list, CLI examples, an MCP tool summary, a
