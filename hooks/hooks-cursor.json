@@ -5,24 +5,40 @@
       {
         "command": "python3 \"${CURSOR_PLUGIN_ROOT}/scripts/token_usage.py\" cursor-hook",
         "timeout": 15
+      },
+      {
+        "command": "python3 \"${CURSOR_PLUGIN_ROOT}/scripts/activity_bridge.py\" hook --runtime cursor --stdout cursor",
+        "timeout": 8
       }
     ],
     "stop": [
       {
         "command": "python3 \"${CURSOR_PLUGIN_ROOT}/scripts/token_usage.py\" cursor-hook",
         "timeout": 15
+      },
+      {
+        "command": "python3 \"${CURSOR_PLUGIN_ROOT}/scripts/activity_bridge.py\" hook --runtime cursor --stdout cursor",
+        "timeout": 8
       }
     ],
     "subagentStart": [
       {
         "command": "python3 \"${CURSOR_PLUGIN_ROOT}/scripts/token_usage.py\" cursor-hook",
         "timeout": 15
+      },
+      {
+        "command": "python3 \"${CURSOR_PLUGIN_ROOT}/scripts/activity_bridge.py\" hook --runtime cursor --stdout cursor",
+        "timeout": 8
       }
     ],
     "subagentStop": [
       {
         "command": "python3 \"${CURSOR_PLUGIN_ROOT}/scripts/token_usage.py\" cursor-hook",
         "timeout": 15
+      },
+      {
+        "command": "python3 \"${CURSOR_PLUGIN_ROOT}/scripts/activity_bridge.py\" hook --runtime cursor --stdout cursor",
+        "timeout": 8
       }
     ]
   }

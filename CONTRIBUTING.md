@@ -12,14 +12,19 @@ welcome.
 - **Never block the session.** The Stop hook must always exit 0. Anything
   that can fail (missing transcript, malformed JSONL, unwritable cache dir)
   must fail silently or degrade gracefully.
-- **Local-only.** No network calls, no telemetry. The plugin reads local
+- **Local by default.** The analyser makes no network calls. The one exception
+  is the opt-in activity bridge (`scripts/activity_bridge.py`), which posts
+  turns to operator-configured `WIZZO_COORD_URL` / `WIZZO_TWIN_API_URL`
+  endpoints and stays inert until those are set. The plugin reads local
   session data only (Claude Code `~/.claude/projects/`, the Cowork mount, Cursor's
   local data read-only, Codex rollouts under `~/.codex`, Gemini recordings under
   `~/.gemini`, and Copilot events under `~/.copilot`) plus the pricing files, and
   writes caches under `~/.cache/token-usage/`, Copilot capture events under
   `$COPILOT_HOME/token-usage/` (and the one file `dashboard` or `export`
-  is told to write). Keep the README's privacy and data-handling disclosures true
-  to the code: update them in the same PR as any change to what is read or written.
+  is told to write). The bridge also writes its spool under the cache unless
+  `WIZZO_ACTIVITY_STATE_DIR` points elsewhere. Keep the README's privacy and
+  data-handling disclosures true to the code: update them in the same PR as any
+  change to what is read or written.
 - **Totals must reconcile.** Any attribution change must keep the invariant
   that segment rows sum to the session total. Dedup by `requestId` is
   load-bearing — see "Correct dedup" in the README before touching it.

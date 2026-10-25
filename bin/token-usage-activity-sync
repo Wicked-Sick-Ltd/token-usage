@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Watch or backfill JSONL transcripts into the opt-in llm1 activity bridge.
+# Configuration is WIZZO_COORD_URL / WIZZO_TWIN_API_URL or
+# ~/.config/wizzo/activity-bridge.env. See README.md.
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+exec python3 "$ROOT/scripts/activity_bridge.py" sync "$@"

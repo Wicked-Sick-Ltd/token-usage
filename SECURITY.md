@@ -4,10 +4,21 @@
 
 token-usage is a local AI agent plugin. It reads usage the assistant has already
 recorded on the developer machine and writes derived ledgers under a cache
-directory. It makes **no network calls**, bundles **no credentials**, and does
-not call Claude, Cursor, Codex, Gemini, Copilot or any other vendor API.
+directory. The analyser makes **no network calls**, bundles **no credentials**,
+and does not call Claude, Cursor, Codex, Gemini, Copilot or any other vendor API.
 Reports returned by MCP become part of the host conversation and follow that
-host's data policy. The plugin has no remote reporting service.
+host's data policy.
+
+The optional activity bridge (`scripts/activity_bridge.py`) is off unless
+`WIZZO_COORD_URL`, `WIZZO_TWIN_API_URL`, or `~/.config/wizzo/activity-bridge.env`
+sets a destination. When it is on, hook commands and `sync` POST prompt text,
+tool-call summaries and assistant responses to those operator endpoints
+(mcp-coordination and twin-api). Bearer tokens come from `WIZZO_COORD_TOKEN`
+and `WIZZO_TWIN_TOKEN` and are not written to the spool. Set
+`WIZZO_ACTIVITY_BRIDGE=0` to force it off. An SSH local forward
+(`ssh -L 8140` and `-L 8100`) is a supported way to reach a box that is not
+directly routable; a refused connection is spooled locally and retried. See
+the README section "Activity stream bridge (opt-in)".
 
 Supported runtimes are Claude Code and Cowork, OpenAI Codex, Cursor (including
 an explicit Cloud Agent export file), Google Antigravity and legacy Gemini CLI,
@@ -87,6 +98,11 @@ can start the stdio server.
   host or a manual MCP entry. It has no network listener. It exits quietly on
   stdin EOF or a broken pipe. Tool handlers read the locations above and may
   refresh the summary index. They do not modify transcripts.
+- The activity bridge, when configured, appends to `bridge.sqlite` in its
+  state directory (owner-only when the filesystem allows). The file holds the
+  delivery watermark, any spooled turns, cached prompt text, and per-generation
+  token counters. Deleting that directory drops all of them. Hook invocations
+  still exit 0 if the directory cannot be created.
 
 Deleting `~/.cache/token-usage/` removes summary caches and hook ledgers.
 Deleting `$COPILOT_HOME/token-usage/` removes Copilot capture files. The

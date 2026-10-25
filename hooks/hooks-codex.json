@@ -5,12 +5,22 @@
       "command": "python3 \"${PLUGIN_ROOT}/scripts/token_usage.py\" codex-hook",
       "commandWindows": "python \"${PLUGIN_ROOT}/scripts/token_usage.py\" codex-hook",
       "timeout": 15
+    }, {
+      "type": "command",
+      "command": "python3 \"${PLUGIN_ROOT}/scripts/activity_bridge.py\" hook --runtime codex --stdout claude",
+      "commandWindows": "python \"${PLUGIN_ROOT}/scripts/activity_bridge.py\" hook --runtime codex --stdout claude",
+      "timeout": 8
     }]}],
     "SubagentStop": [{"hooks": [{
       "type": "command",
       "command": "python3 \"${PLUGIN_ROOT}/scripts/token_usage.py\" codex-hook",
       "commandWindows": "python \"${PLUGIN_ROOT}/scripts/token_usage.py\" codex-hook",
       "timeout": 15
+    }, {
+      "type": "command",
+      "command": "python3 \"${PLUGIN_ROOT}/scripts/activity_bridge.py\" hook --runtime codex --stdout claude",
+      "commandWindows": "python \"${PLUGIN_ROOT}/scripts/activity_bridge.py\" hook --runtime codex --stdout claude",
+      "timeout": 8
     }]}]
   }
 }

@@ -57,10 +57,11 @@ they do not model subscription allowances, priority/fast/flex/batch multipliers,
 long-context uplifts, tools, taxes or enterprise terms. Supply the existing user
 pricing overlay for different rates. Unrecognised models stay unpriced.
 
-No credentials, auth files, SQLite databases, remote APIs or telemetry are used.
-Codex ledgers use `codex-<session-id>.json` under TOKEN_USAGE_LEDGER_DIR or the
-existing local token-usage cache. Transcript content never leaves the machine.
-Tests use synthetic data and isolated homes.
+No credentials, auth files or vendor APIs are used. Codex ledgers use
+`codex-<session-id>.json` under TOKEN_USAGE_LEDGER_DIR or the existing local
+token-usage cache. Transcript content stays on the machine unless the operator
+turns on the activity bridge, which then forwards the finished turn to the
+configured llm1 endpoints. Tests use synthetic data and isolated homes.
 
 ## Verification
 

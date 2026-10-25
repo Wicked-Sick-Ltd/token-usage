@@ -8,6 +8,16 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Opt-in llm1 activity stream bridge** — `scripts/activity_bridge.py` and
+  `bin/token-usage-activity-sync`. Cursor (`beforeSubmitPrompt`, `stop`,
+  `subagentStop`), Claude Code and Codex hooks forward a turn when
+  `WIZZO_COORD_URL` or `WIZZO_TWIN_API_URL` (or `~/.config/wizzo/activity-bridge.env`)
+  is set. Posts go to mcp-coordination (`/session/register`, `/session/heartbeat`,
+  `/session/turn`, `/api/ai-sessions`, `/session/end`) and twin-api
+  (`/v1/ingest`). A local SQLite spool and watermark keep turns across an
+  unreachable llm1 and skip turns that were already delivered. `sync` backfills
+  Cloud Agent and Grok Bot JSONL directories. The bridge is off by default.
+  `WIZZO_ACTIVITY_BRIDGE=0` forces it off. The analyser still makes no network calls.
 - **Google Antigravity native plugin manifests (`plugin.json`, `mcp_config.json`, `hooks.json`)** —
   ships root-level Antigravity plugin configuration alongside `gemini-extension.json`, plus
   camelCase `Stop` hook support (`conversationId`, `transcriptPath`, `{}` stdout response, or a
