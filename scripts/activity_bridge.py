@@ -430,6 +430,39 @@ def utc_now():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _earliest_timestamp(left, right):
+    left = left or ""
+    right = right or ""
+    if left and right:
+        return min(left, right)
+    return left or right
+
+
+def _normalize_cursor_usage(usage):
+    """Cursor payload input includes cache reads and writes.
+
+    Matches `_cursor_usage_from_tokens`: subtract cache only when it fits.
+    A cache total above input keeps the reported input. Claude's input is
+    already exclusive of cache and must not go through this function.
+    """
+    def count(key):
+        value = int(usage.get(key) or 0)
+        return max(0, value)
+
+    incoming = count("input_tokens")
+    read = count("cache_read_tokens")
+    written = count("cache_write_tokens")
+    cached = read + written
+    if incoming and cached and incoming >= cached:
+        incoming -= cached
+    return {
+        "input_tokens": incoming,
+        "output_tokens": count("output_tokens"),
+        "cache_read_tokens": read,
+        "cache_write_tokens": written,
+    }
+
+
 def _hash(body):
     raw = json.dumps(body, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -498,6 +531,21 @@ class Store:
                 cache_write_tokens INTEGER NOT NULL DEFAULT 0,
                 in_transcript INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (session_id, generation_id, agent_key)
+            );
+            CREATE TABLE IF NOT EXISTS turn_map (
+                session_id TEXT NOT NULL,
+                agent_key TEXT NOT NULL DEFAULT '',
+                generation_id TEXT NOT NULL,
+                turn_index INTEGER NOT NULL,
+                seen_at TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (session_id, agent_key, generation_id)
+            );
+            CREATE TABLE IF NOT EXISTS turn_high_water (
+                session_id TEXT NOT NULL,
+                agent_key TEXT NOT NULL DEFAULT '',
+                high_water INTEGER NOT NULL DEFAULT 0,
+                started_at TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (session_id, agent_key)
             );
             """
         )
@@ -658,24 +706,30 @@ class Store:
         ).fetchone()
         return int(row[0] if row else 1)
 
-    def save_generation_usage(self, session_id, generation_id, agent_key, usage):
-        """Keep the fullest snapshot of one generation. A repeat does not add again."""
+    def save_generation_usage(self, session_id, generation_id, agent_key, usage, included=False):
+        """Keep the fullest raw snapshot of one generation. A repeat does not add again.
+
+        `included` marks a generation already covered by a transcript total.
+        A later save keeps that flag, so the counters are not added on top.
+        """
         agent_key = agent_key or ""
         self.db.execute(
             """
             INSERT INTO generation_usage (
                 session_id, generation_id, agent_key,
                 input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, in_transcript
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(session_id, generation_id, agent_key) DO UPDATE SET
                 input_tokens = MAX(generation_usage.input_tokens, excluded.input_tokens),
                 output_tokens = MAX(generation_usage.output_tokens, excluded.output_tokens),
                 cache_read_tokens = MAX(generation_usage.cache_read_tokens, excluded.cache_read_tokens),
-                cache_write_tokens = MAX(generation_usage.cache_write_tokens, excluded.cache_write_tokens)
+                cache_write_tokens = MAX(generation_usage.cache_write_tokens, excluded.cache_write_tokens),
+                in_transcript = MAX(generation_usage.in_transcript, excluded.in_transcript)
             """,
             (session_id, generation_id, agent_key,
              int(usage.get("input_tokens") or 0), int(usage.get("output_tokens") or 0),
-             int(usage.get("cache_read_tokens") or 0), int(usage.get("cache_write_tokens") or 0)),
+             int(usage.get("cache_read_tokens") or 0), int(usage.get("cache_write_tokens") or 0),
+             1 if included else 0),
         )
         self.db.commit()
 
@@ -710,21 +764,136 @@ class Store:
         )
         self.db.commit()
 
-    def combined_usage(self, session_id, agent_key=""):
-        """Transcript total plus generations not already covered by that total."""
-        row = self.db.execute(
-            "SELECT COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0), "
-            "COALESCE(SUM(cache_read_tokens), 0), COALESCE(SUM(cache_write_tokens), 0) "
+    def combined_usage(self, session_id, agent_key="", cursor=False):
+        """Transcript total plus generations not already covered by that total.
+
+        Cursor payload rows are stored raw and normalized after the per-generation
+        max, so a partial snapshot cannot win on an already-netted input.
+        """
+        agent_key = agent_key or ""
+        rows = self.db.execute(
+            "SELECT generation_id, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens "
             "FROM generation_usage WHERE session_id=? AND agent_key=? "
             "AND (generation_id=? OR in_transcript=0)",
-            (session_id, agent_key or "", _TRANSCRIPT_GENERATION),
+            (session_id, agent_key, _TRANSCRIPT_GENERATION),
+        ).fetchall()
+        total = _empty_usage()
+        for generation_id, incoming, outgoing, read, written in rows:
+            usage = {
+                "input_tokens": int(incoming or 0),
+                "output_tokens": int(outgoing or 0),
+                "cache_read_tokens": int(read or 0),
+                "cache_write_tokens": int(written or 0),
+            }
+            if cursor and generation_id != _TRANSCRIPT_GENERATION:
+                usage = _normalize_cursor_usage(usage)
+            for key in total:
+                total[key] += int(usage.get(key) or 0)
+        return total
+
+    def high_water(self, session_id, agent_key=""):
+        """Highest turn index already claimed by a transcript, sync, or generation."""
+        agent_key = agent_key or ""
+        stored = self.db.execute(
+            "SELECT high_water FROM turn_high_water WHERE session_id=? AND agent_key=?",
+            (session_id, agent_key),
         ).fetchone()
-        return {
-            "input_tokens": int(row[0] or 0),
-            "output_tokens": int(row[1] or 0),
-            "cache_read_tokens": int(row[2] or 0),
-            "cache_write_tokens": int(row[3] or 0),
-        }
+        prompt = self.db.execute(
+            "SELECT COALESCE(MAX(turn_index), 0) FROM prompts WHERE session_id=? AND agent_key=?",
+            (session_id, agent_key),
+        ).fetchone()
+        mapped = self.db.execute(
+            "SELECT COALESCE(MAX(turn_index), 0) FROM turn_map WHERE session_id=? AND agent_key=?",
+            (session_id, agent_key),
+        ).fetchone()
+        return max(int(stored[0]) if stored else 0, int(prompt[0] or 0), int(mapped[0] or 0))
+
+    def note_high_water(self, session_id, agent_key, count):
+        """Record how many turns a transcript or sync has already published."""
+        agent_key = agent_key or ""
+        self.db.execute(
+            """
+            INSERT INTO turn_high_water (session_id, agent_key, high_water, started_at)
+            VALUES (?, ?, ?, '')
+            ON CONFLICT(session_id, agent_key) DO UPDATE SET
+                high_water = MAX(turn_high_water.high_water, excluded.high_water)
+            """,
+            (session_id, agent_key, int(count or 0)),
+        )
+        self.db.commit()
+
+    def bind_turn(self, session_id, agent_key, generation_id, turn_index):
+        """Map a generation onto a transcript turn index without lowering either."""
+        agent_key = agent_key or ""
+        turn_index = int(turn_index)
+        self.db.execute(
+            """
+            INSERT INTO turn_map (session_id, agent_key, generation_id, turn_index, seen_at)
+            VALUES (?, ?, ?, ?, '')
+            ON CONFLICT(session_id, agent_key, generation_id) DO UPDATE SET
+                turn_index = MAX(turn_map.turn_index, excluded.turn_index)
+            """,
+            (session_id, agent_key, generation_id, turn_index),
+        )
+        self.note_high_water(session_id, agent_key, turn_index)
+        row = self.db.execute(
+            "SELECT turn_index FROM turn_map WHERE session_id=? AND agent_key=? AND generation_id=?",
+            (session_id, agent_key, generation_id),
+        ).fetchone()
+        return int(row[0])
+
+    def ensure_turn(self, session_id, agent_key, generation_id, seen_at=""):
+        """Return the stable index and first-seen timestamp for one generation.
+
+        The index is allocated only after the shared high water, so a payload-only
+        generation cannot reuse a turn a transcript or sync already published.
+        """
+        agent_key = agent_key or ""
+        row = self.db.execute(
+            "SELECT turn_index, seen_at FROM turn_map WHERE session_id=? AND agent_key=? AND generation_id=?",
+            (session_id, agent_key, generation_id),
+        ).fetchone()
+        if row:
+            index, stored = int(row[0]), row[1] or ""
+            if seen_at and not stored:
+                self.db.execute(
+                    "UPDATE turn_map SET seen_at=? WHERE session_id=? AND agent_key=? AND generation_id=?",
+                    (seen_at, session_id, agent_key, generation_id),
+                )
+                self.db.commit()
+                stored = seen_at
+            return index, stored
+        index = self.high_water(session_id, agent_key) + 1
+        self.db.execute(
+            "INSERT INTO turn_map (session_id, agent_key, generation_id, turn_index, seen_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (session_id, agent_key, generation_id, index, seen_at or ""),
+        )
+        self.note_high_water(session_id, agent_key, index)
+        return index, seen_at or ""
+
+    def remember_started(self, session_id, agent_key, candidate):
+        """Keep the earliest session start. Later completions must not move it."""
+        agent_key = agent_key or ""
+        row = self.db.execute(
+            "SELECT started_at FROM turn_high_water WHERE session_id=? AND agent_key=?",
+            (session_id, agent_key),
+        ).fetchone()
+        existing = row[0] if row and row[0] else ""
+        chosen = _earliest_timestamp(existing, candidate)
+        if row is None:
+            self.db.execute(
+                "INSERT INTO turn_high_water (session_id, agent_key, high_water, started_at) "
+                "VALUES (?, ?, 0, ?)",
+                (session_id, agent_key, chosen),
+            )
+        elif chosen != existing:
+            self.db.execute(
+                "UPDATE turn_high_water SET started_at=? WHERE session_id=? AND agent_key=?",
+                (chosen, session_id, agent_key),
+            )
+        self.db.commit()
+        return chosen
 
 
 def post_json(url, body, token, timeout):
@@ -1186,12 +1355,48 @@ def _tool_message_result(rec):
     }
 
 
+def _shape_codex_tool(merged):
+    """Turn a Codex function_call into an assistant tool call, and its output into a result.
+
+    These records have no role. `call_id` is what attaches the output to the call.
+    """
+    kind = merged.get("type")
+    call_id = str(merged.get("call_id") or merged.get("id") or "")
+    if kind == "function_call":
+        fn = merged.get("function") if isinstance(merged.get("function"), dict) else {}
+        name = merged.get("name") or fn.get("name") or "tool"
+        if "arguments" in merged:
+            raw_input = merged.get("arguments")
+        elif "arguments" in fn:
+            raw_input = fn.get("arguments")
+        else:
+            raw_input = merged.get("input") if "input" in merged else {}
+        merged["role"] = "assistant"
+        merged["tool_calls"] = [{
+            "id": call_id,
+            "name": str(name),
+            "arguments": {} if raw_input is None else raw_input,
+        }]
+        return merged
+    output = merged.get("output")
+    if output is None:
+        output = merged.get("content") or ""
+    merged["role"] = "tool"
+    merged["tool_call_id"] = call_id
+    merged["content"] = output
+    return merged
+
+
 def _normalize_record(rec):
     """Lift Codex payload records so role, content, usage, and model are top-level."""
     if not isinstance(rec, dict) or rec.get("_codex_norm"):
         return rec
     typ = rec.get("type")
     payload = rec.get("payload")
+    if typ in {"function_call", "function_call_output"} and not isinstance(payload, dict):
+        shaped = dict(rec)
+        shaped["_codex_norm"] = True
+        return _shape_codex_tool(shaped)
     if typ not in _CODEX_PAYLOAD_TYPES or not isinstance(payload, dict):
         return rec
     merged = dict(payload)
@@ -1201,6 +1406,8 @@ def _normalize_record(rec):
     merged["_codex_norm"] = True
     if typ == "response_item":
         merged.setdefault("type", payload.get("type") or "message")
+        if merged.get("type") in {"function_call", "function_call_output"}:
+            return _shape_codex_tool(merged)
     else:
         merged["type"] = typ
     if typ == "token_usage_record":
@@ -1882,11 +2089,12 @@ def _process_hook(bridge, payload, config, runtime, event):
         "unknown",
     )
     agent_key = _agent_key(payload)
+    transcript = payload.get("transcript_path") or payload.get("transcriptPath") or ""
+    session_id, agent_key = _resolve_identity(transcript, session_id, agent_key)
     ledger_id = _ledger_id(session_id, agent_key)
     generation_id = clean_id(payload.get("generation_id") or event or "turn", "turn")
     cwd = _cwd_from_payload(payload)
     repo, branch = resolve_place(cwd, config)
-    transcript = payload.get("transcript_path") or payload.get("transcriptPath") or ""
     surface = config.surface or default_surface(runtime, transcript)
     vendor = vendor_name(config.vendor or runtime)
     model = _text(payload.get("model") or payload.get("subagent_model"))
@@ -1895,17 +2103,18 @@ def _process_hook(bridge, payload, config, runtime, event):
 
     if event in PROMPT_EVENTS:
         prompt = _payload_prompt(payload)
+        turn_index, seen = bridge.store.ensure_turn(
+            session_id, agent_key, generation_id, utc_now())
+        bridge.store.remember_started(session_id, agent_key, seen)
         stored = bridge.store.load_prompt(session_id, generation_id, agent_key)
-        if stored:
-            turn_index = stored["turn_index"]
-        else:
-            turn_index = bridge.store.next_turn_index(session_id, agent_key)
+        if stored and stored.get("prompt") and not prompt:
+            prompt = stored["prompt"]
         bridge.store.save_prompt(
             session_id, generation_id, prompt, model, cwd, turn_index, agent_key)
         turn = Turn()
         turn.prompt = prompt
         turn.model = model
-        turn.timestamp = utc_now()
+        turn.timestamp = seen or utc_now()
         # Prompt hooks must not publish a zero-usage session summary. The
         # matching completion (or the file sync) owns /api/ai-sessions.
         publish_turn(
@@ -1923,14 +2132,21 @@ def _process_hook(bridge, payload, config, runtime, event):
     turn_index = 0
     if isinstance(transcript, str) and transcript and Path(transcript).is_file():
         state, file_usage, turn_count, target, turn_index, _updated = _stream_transcript(transcript)
-        if session_id == "unknown":
+        if session_id == "unknown" and not _sidechain_parts(transcript)[1]:
             session_id = clean_id(state["session_id"], "unknown")
+            session_id, agent_key = _resolve_identity(transcript, session_id, agent_key)
             ledger_id = _ledger_id(session_id, agent_key)
         if not model:
             model = state["model"]
         started = state["started"]
         # turn.timestamp is the prompt time. The summary clock is the last record.
         updated_at = state["updated"] or ""
+        if turn_count:
+            bridge.store.note_high_water(session_id, agent_key, turn_count)
+        if turn_index:
+            turn_index = bridge.store.bind_turn(session_id, agent_key, generation_id, turn_index)
+        if started:
+            started = bridge.store.remember_started(session_id, agent_key, started)
         if state["cwd"] and not payload.get("cwd") and not payload.get("workspace_roots"):
             cwd = state["cwd"]
             repo, branch = resolve_place(cwd, config)
@@ -1940,19 +2156,21 @@ def _process_hook(bridge, payload, config, runtime, event):
         prompt = _payload_prompt(payload) or (stored["prompt"] if stored else "")
         output = _payload_output(payload)
         tools = _payload_tools(payload)
-        if stored:
-            turn_index = stored["turn_index"]
-            if not model:
-                model = stored["model"]
-        else:
-            turn_index = bridge.store.next_turn_index(session_id, agent_key)
+        turn_index, seen = bridge.store.ensure_turn(session_id, agent_key, generation_id, "")
+        if not seen:
+            seen = utc_now()
+            turn_index, seen = bridge.store.ensure_turn(
+                session_id, agent_key, generation_id, seen)
+        if stored and not model:
+            model = stored["model"]
+        if prompt:
             bridge.store.save_prompt(
                 session_id, generation_id, prompt, model, cwd, turn_index, agent_key)
         if prompt or output or tools:
             target = Turn()
             target.prompt = prompt
             target.model = model
-            target.timestamp = utc_now()
+            target.timestamp = seen
             if output:
                 target.assistant_parts.append(clip(output))
             target.tools.extend(tools)
@@ -1966,25 +2184,60 @@ def _process_hook(bridge, payload, config, runtime, event):
         target.model = model
     payload_usage = _payload_tokens(payload)
     transcript_measured = bool(turn_count) and _any_usage(file_usage)
+    cursor_payload = vendor == "cursor"
     if transcript_measured:
-        # A full transcript already includes every generation. Do not also add
-        # the payload counters, which are one generation and would replace or
-        # double the file total.
+        # A full transcript already includes every generation. Remember this
+        # generation as included so a later payload-only retry cannot add it
+        # again. The stored counters stay raw; Cursor normalization happens
+        # when a generation is actually summed.
         bridge.store.replace_transcript_usage(session_id, agent_key, file_usage)
+        bridge.store.save_generation_usage(
+            session_id, generation_id, agent_key, payload_usage or _empty_usage(), included=True)
         usage = file_usage
     elif any(payload_usage.values()):
         bridge.store.save_generation_usage(session_id, generation_id, agent_key, payload_usage)
-        usage = bridge.store.combined_usage(session_id, agent_key)
+        usage = bridge.store.combined_usage(session_id, agent_key, cursor=cursor_payload)
     else:
-        usage = bridge.store.combined_usage(session_id, agent_key)
+        usage = bridge.store.combined_usage(session_id, agent_key, cursor=cursor_payload)
         if not _any_usage(usage):
             usage = file_usage if turn_count else sum_usage([target])
+    started = bridge.store.remember_started(
+        session_id, agent_key, started or target.timestamp or "")
+    if not updated_at:
+        updated_at = utc_now()
     count = turn_count or turn_index
     publish_turn(
         bridge, ledger_id, turn_index, target, vendor, surface, model,
         cwd, repo, branch, machine, cost, basis, usage, count, started or target.timestamp,
         include_ingest=target.has_assistant, include_summary=True, updated_at=updated_at,
     )
+
+
+def _sidechain_parts(path):
+    """`(parent, agent stem)` for `<parent>/subagents/agent-*.jsonl`, else empty."""
+    if not path:
+        return "", ""
+    path = Path(path)
+    parts = path.parts
+    lowered = [part.lower() for part in parts]
+    if "subagents" not in lowered:
+        return "", ""
+    index = lowered.index("subagents")
+    parent = parts[index - 1] if index else ""
+    return parent, path.stem
+
+
+def _resolve_identity(path, session_id, agent_key):
+    """Shared ledger identity for a live hook and a `sync_file` backfill.
+
+    A sidechain path is always `{parent}:{agent stem}`. An explicit subagent id
+    is used only when the transcript is not a sidechain file.
+    """
+    parent, agent = _sidechain_parts(path)
+    if not agent:
+        return session_id, agent_key
+    parent_id = clean_id(parent, "") or session_id or "unknown"
+    return clean_id(parent_id, "unknown"), clean_id(agent, "")
 
 
 def _agent_key(payload):
@@ -2088,7 +2341,10 @@ def sync_file(bridge, path, config, vendor="", surface=""):
     for _index, turn in turns:
         for key in usage:
             usage[key] += int(turn.usage.get(key) or 0)
-    session = clean_id(state["session_id"], path.stem)
+    session_id, agent_key = _resolve_identity(path, state["session_id"], "")
+    session = _ledger_id(clean_id(session_id, path.stem), agent_key)
+    bridge.store.note_high_water(session_id, agent_key, len(turns))
+    started_at = bridge.store.remember_started(session_id, agent_key, state["started"] or "")
     live = [(index, turn) for index, turn in turns if turn.prompt or turn.has_assistant]
     if not live:
         return
@@ -2108,7 +2364,7 @@ def sync_file(bridge, path, config, vendor="", surface=""):
         "ai-sessions:" + session,
         ai_sessions_body(
             session, runtime, surface, usage, len(turns), repo, branch,
-            state["started"] or "", state["updated"] or state["started"] or "",
+            started_at or state["started"] or "", state["updated"] or started_at or state["started"] or "",
             last_turn.model or state["model"] or "unknown", config.machine, 0.0, "unpriced",
         ),
         session_id=session,
