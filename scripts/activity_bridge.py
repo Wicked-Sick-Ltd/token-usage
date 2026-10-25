@@ -637,6 +637,76 @@ class Store:
         ).fetchone()
         return row is not None
 
+    def acknowledge_delivery(self, source_id, endpoint, content_hash, session_id="",
+                             turn_index=0, mutable=0, stage=0, usage_revision=0):
+        """Record a successful post without lowering a version won during the send.
+
+        A rescan can raise the queued revision for this same body while the POST
+        is in flight. The delivered row keeps the later turn, stage, and
+        revision among the posted values, the queued row, and any row already
+        delivered. The spool row is removed in that same transaction.
+        """
+        posted = (
+            int(turn_index or 0), int(stage or 0), int(usage_revision or 0),
+            session_id or "", 1 if mutable else 0,
+        )
+        if self.db.in_transaction:
+            self.db.rollback()
+        self.db.execute("BEGIN IMMEDIATE")
+        best = posted
+        queued = self.db.execute(
+            "SELECT turn_index, stage, usage_revision, session_id, mutable FROM spool "
+            "WHERE source_id=? AND endpoint=? AND content_hash=?",
+            (source_id, endpoint, content_hash),
+        ).fetchone()
+        stored = self.db.execute(
+            "SELECT turn_index, stage, usage_revision, session_id, mutable FROM delivered "
+            "WHERE source_id=? AND endpoint=? AND content_hash=?",
+            (source_id, endpoint, content_hash),
+        ).fetchone()
+        for row in (queued, stored):
+            if row is None:
+                continue
+            candidate = (
+                int(row[0] or 0), int(row[1] or 0), int(row[2] or 0),
+                row[3] or "", int(row[4] or 0),
+            )
+            if candidate[:3] > best[:3]:
+                best = candidate
+        kept_turn, kept_stage, kept_revision, kept_session, kept_mutable = best
+        if stored is None:
+            self.db.execute(
+                "INSERT INTO delivered (source_id, endpoint, content_hash, delivered_at, "
+                "session_id, turn_index, mutable, stage, usage_revision) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (source_id, endpoint, content_hash, utc_now(), kept_session,
+                 kept_turn, kept_mutable, kept_stage, kept_revision),
+            )
+        else:
+            self.db.execute(
+                "UPDATE delivered SET session_id=?, turn_index=?, mutable=?, stage=?, "
+                "usage_revision=?, delivered_at=? "
+                "WHERE source_id=? AND endpoint=? AND content_hash=? "
+                "AND (turn_index<? OR (turn_index=? AND stage<?) "
+                "OR (turn_index=? AND stage=? AND usage_revision<?))",
+                (kept_session, kept_turn, kept_mutable, kept_stage, kept_revision, utc_now(),
+                 source_id, endpoint, content_hash,
+                 kept_turn, kept_turn, kept_stage, kept_turn, kept_stage, kept_revision),
+            )
+        self.db.execute(
+            "DELETE FROM spool WHERE source_id=? AND endpoint=? AND content_hash=?",
+            (source_id, endpoint, content_hash),
+        )
+        if kept_mutable and kept_session:
+            self.db.execute(
+                "DELETE FROM spool WHERE session_id=? AND endpoint=? AND mutable=1 "
+                "AND (turn_index<? OR (turn_index=? AND stage<?) "
+                "OR (turn_index=? AND stage=? AND usage_revision<?))",
+                (kept_session, endpoint, kept_turn, kept_turn, kept_stage,
+                 kept_turn, kept_stage, kept_revision),
+            )
+        self.db.commit()
+
     def mark_delivered(self, source_id, endpoint, content_hash, session_id="", turn_index=0,
                        mutable=0, stage=0, usage_revision=0):
         self.db.execute(
@@ -1342,13 +1412,9 @@ class Bridge:
             ):
                 self.spooled += 1
             return False
-        self.store.mark_delivered(
+        self.store.acknowledge_delivery(
             source_id, endpoint, content_hash, session_id, turn_index, mutable, stage,
             usage_revision)
-        self.store.drop_spool(source_id, endpoint, content_hash)
-        if mutable:
-            self.store.drop_stale_pending(
-                session_id, endpoint, turn_index, stage, usage_revision)
         self.delivered += 1
         return True
 
@@ -1391,13 +1457,9 @@ class Bridge:
                 self.offline = True
                 self.store.note_failure(source_id, endpoint, content_hash, str(exc))
             else:
-                self.store.mark_delivered(
+                self.store.acknowledge_delivery(
                     source_id, endpoint, content_hash, session_id, turn_index, mutable, stage,
                     usage_revision)
-                self.store.drop_spool(source_id, endpoint, content_hash)
-                if mutable:
-                    self.store.drop_stale_pending(
-                        session_id, endpoint, turn_index, stage, usage_revision)
                 sent += 1
                 self.delivered += 1
         return sent

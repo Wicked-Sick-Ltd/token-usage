@@ -2783,6 +2783,75 @@ def test_flush_advances_a_duplicate_summary_before_an_older_revision(tmp_path):
         opened.close()
 
 
+def _promote_same_body(config, body, revision):
+    other = bridge.Store(config.state_dir)
+    try:
+        other.enqueue(
+            "ai-sessions:s", "ai_sessions", bridge._hash(body), "coord", "/api/ai-sessions",
+            body, "rescan", "s", 2, 1, 1, revision,
+        )
+    finally:
+        other.close()
+
+
+def test_send_keeps_a_revision_promoted_during_the_post(tmp_path):
+    config = cfg(tmp_path)
+    fifteen = _summary_body(15)
+    ten = _summary_body(10)
+    poster = FakePoster()
+    promoted = {"done": False}
+
+    def sending(url, body, token, timeout):
+        if not promoted["done"] and url.endswith("/api/ai-sessions"):
+            promoted["done"] = True
+            _promote_same_body(config, fifteen, 3)
+        return poster(url, body, token, timeout)
+
+    opened = bridge.Bridge(config, poster=sending)
+    try:
+        assert opened.send("ai_sessions", "ai-sessions:s", fifteen, "s", 2, 1, 1)
+        row = opened.store.db.execute(
+            "SELECT usage_revision FROM delivered WHERE endpoint='ai_sessions'"
+        ).fetchone()
+        assert row == (3,)
+        assert opened.store.pending_count() == 0
+        assert opened.send("ai_sessions", "ai-sessions:s", ten, "s", 2, 1, 2)
+        assert [body["input_tokens"] for body in _summaries(poster, "s")] == [15]
+    finally:
+        opened.close()
+
+
+def test_flush_keeps_a_revision_promoted_during_the_post(tmp_path):
+    config = cfg(tmp_path)
+    fifteen = _summary_body(15)
+    ten = _summary_body(10)
+    poster = FakePoster()
+    promoted = {"done": False}
+
+    def sending(url, body, token, timeout):
+        if not promoted["done"] and url.endswith("/api/ai-sessions"):
+            promoted["done"] = True
+            _promote_same_body(config, fifteen, 3)
+        return poster(url, body, token, timeout)
+
+    opened = bridge.Bridge(config, poster=sending)
+    try:
+        assert opened.store.enqueue(
+            "ai-sessions:s", "ai_sessions", bridge._hash(fifteen), "coord", "/api/ai-sessions",
+            fifteen, "offline", "s", 2, 1, 1, 1,
+        )
+        assert opened.flush() == 1
+        row = opened.store.db.execute(
+            "SELECT usage_revision FROM delivered WHERE endpoint='ai_sessions'"
+        ).fetchone()
+        assert row == (3,)
+        assert opened.store.pending_count() == 0
+        assert opened.send("ai_sessions", "ai-sessions:s", ten, "s", 2, 1, 2)
+        assert [body["input_tokens"] for body in _summaries(poster, "s")] == [15]
+    finally:
+        opened.close()
+
+
 def test_retry_publishes_summary_at_the_captured_high_water(tmp_path, monkeypatch):
     path = write_jsonl(tmp_path / "sess-early.jsonl", [
         {"role": "user", "content": "one", "ts": "2026-10-25T11:00:00Z"},

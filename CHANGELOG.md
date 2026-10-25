@@ -73,6 +73,8 @@ adheres to [Semantic Versioning](https://semver.org/).
   repeated summary body advances the delivered revision without posting
   again. The hook publishes that summary at the high water captured with
   the counters; the body and the heartbeat stay on the generation's turn.
+  Acknowledging a post keeps the later queued or delivered version of that
+  same body when a rescan raises it during the request.
 
 ## [0.9.0] — 2026-10-18
 
