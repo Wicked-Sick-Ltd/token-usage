@@ -2534,6 +2534,48 @@ def test_older_snapshot_cannot_overwrite_a_newer_committed_scan(tmp_path, monkey
         store.close()
 
 
+def test_sync_summary_does_not_reuse_a_later_hooks_index(tmp_path, monkeypatch):
+    path = write_jsonl(tmp_path / "sess-gap.jsonl", [
+        {"role": "user", "content": "one", "ts": "2026-10-25T11:00:00Z"},
+        {
+            "role": "assistant", "content": "uno", "model": "m",
+            "ts": "2026-10-25T11:00:01Z",
+            "usage": {"input_tokens": 10, "output_tokens": 4},
+        },
+    ])
+    poster = FakePoster()
+    config = cfg(tmp_path)
+    bridge.sync_tree(path, config, poster=poster, vendor="claude")
+    armed = {"on": False}
+    original = bridge.publish_turn
+
+    def wrapped(*args, **kwargs):
+        if armed["on"]:
+            armed["on"] = False
+            bridge.process_hook({
+                "hook_event_name": "stop",
+                "conversation_id": "sess-gap",
+                "generation_id": "g-extra",
+                "model": "m",
+                "output": "later",
+                "input_tokens": 5,
+                "output_tokens": 1,
+            }, config, poster, runtime="claude")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(bridge, "publish_turn", wrapped)
+    armed["on"] = True
+    bridge.sync_tree(path, config, poster=poster, vendor="claude")
+    summaries = _summaries(poster, "sess-gap")
+    assert summaries[-1]["input_tokens"] == 15
+    assert not any(body["input_tokens"] == 10 and body["turns"] == 2 for body in summaries)
+    store = bridge.Store(config.state_dir)
+    try:
+        assert store.combined_usage("sess-gap")["input_tokens"] == 15
+    finally:
+        store.close()
+
+
 def test_existing_turn_map_gains_transcript_turn(tmp_path):
     state = tmp_path / "state"
     state.mkdir()
