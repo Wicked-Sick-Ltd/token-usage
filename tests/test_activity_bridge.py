@@ -1510,3 +1510,199 @@ def test_sync_sidechain_uses_the_hook_identity(tmp_path):
     ingest_ids = [call["body"]["source_id"] for call in poster.calls if call["url"].endswith("/v1/ingest")]
     assert "parent:agent-abc:turn-1" in ingest_ids
     assert ingest_ids.count("parent:turn-1") == 1
+
+
+def _heartbeats(poster):
+    return [call for call in poster.calls if call["url"].endswith("/session/heartbeat")]
+
+
+def test_completion_drops_a_spooled_prompt_snapshot_of_the_same_turn(tmp_path):
+    poster = FakePoster(fail_substrings=["coord.test", "twin.test"])
+    config = cfg(tmp_path)
+    bridge.process_hook({
+        "hook_event_name": "beforeSubmitPrompt",
+        "conversation_id": "conv-stage",
+        "generation_id": "g1",
+        "model": "m",
+        "prompt": "question",
+    }, config, poster, runtime="cursor")
+    poster.calls.clear()
+    poster.fail_substrings = []
+    bridge.process_hook({
+        "hook_event_name": "stop",
+        "conversation_id": "conv-stage",
+        "generation_id": "g1",
+        "model": "m",
+        "output": "answer",
+        "input_tokens": 4,
+        "output_tokens": 2,
+    }, config, poster, runtime="cursor")
+    live = bridge.Bridge(config, poster=poster, store=bridge.Store(config.state_dir))
+    try:
+        live.flush(50)
+    finally:
+        live.close()
+    heartbeats = _heartbeats(poster)
+    assert heartbeats
+    assert all(call["body"]["last_output"] == "answer" for call in heartbeats)
+    assert all(call["body"]["last_prompt"] == "question" for call in heartbeats)
+    bridge.process_hook({
+        "hook_event_name": "stop",
+        "conversation_id": "conv-stage",
+        "generation_id": "g2",
+        "model": "m",
+        "prompt": "next",
+        "output": "done",
+        "input_tokens": 3,
+        "output_tokens": 1,
+    }, config, poster, runtime="cursor")
+    heartbeats = _heartbeats(poster)
+    assert heartbeats[-1]["body"]["last_output"] == "done"
+    ingest_ids = {call["body"]["source_id"] for call in poster.calls if call["url"].endswith("/v1/ingest")}
+    assert ingest_ids == {"conv-stage:turn-1", "conv-stage:turn-2"}
+
+
+def test_flush_replays_the_completion_not_the_prompt_when_both_were_offline(tmp_path):
+    poster = FakePoster(fail_substrings=["coord.test", "twin.test"])
+    config = cfg(tmp_path)
+    prompt = {
+        "hook_event_name": "beforeSubmitPrompt",
+        "conversation_id": "conv-both",
+        "generation_id": "g1",
+        "model": "m",
+        "prompt": "question",
+    }
+    stop = {
+        "hook_event_name": "stop",
+        "conversation_id": "conv-both",
+        "generation_id": "g1",
+        "model": "m",
+        "output": "answer",
+        "input_tokens": 4,
+        "output_tokens": 2,
+    }
+    bridge.process_hook(prompt, config, poster, runtime="cursor")
+    bridge.process_hook(stop, config, poster, runtime="cursor")
+    poster.calls.clear()
+    poster.fail_substrings = []
+    live = bridge.Bridge(config, poster=poster, store=bridge.Store(config.state_dir))
+    try:
+        assert live.flush(50) >= 1
+    finally:
+        live.close()
+    heartbeats = _heartbeats(poster)
+    assert len(heartbeats) == 1
+    assert heartbeats[0]["body"]["last_output"] == "answer"
+    ingest_ids = [call["body"]["source_id"] for call in poster.calls if call["url"].endswith("/v1/ingest")]
+    assert ingest_ids == ["conv-both:turn-1"]
+
+
+def test_retrying_an_earlier_transcript_does_not_absorb_a_later_generation(tmp_path):
+    full = write_jsonl(tmp_path / "full.jsonl", [
+        {"role": "user", "content": "one", "ts": "2026-10-25T11:00:00Z"},
+        {
+            "role": "assistant", "content": "uno", "model": "m",
+            "ts": "2026-10-25T11:00:01Z",
+            "usage": {"input_tokens": 10, "output_tokens": 4},
+        },
+        {"role": "user", "content": "two", "ts": "2026-10-25T11:01:00Z"},
+        {
+            "role": "assistant", "content": "dos", "model": "m",
+            "ts": "2026-10-25T11:01:01Z",
+            "usage": {"input_tokens": 6, "output_tokens": 2},
+        },
+    ])
+    short = write_jsonl(tmp_path / "short.jsonl", [
+        {"role": "user", "content": "one", "ts": "2026-10-25T11:00:00Z"},
+        {
+            "role": "assistant", "content": "uno", "model": "m",
+            "ts": "2026-10-25T11:00:01Z",
+            "usage": {"input_tokens": 10, "output_tokens": 4},
+        },
+    ])
+    poster = FakePoster()
+    config = cfg(tmp_path)
+
+    def stop(generation, **extra):
+        payload = {
+            "hook_event_name": "stop",
+            "conversation_id": "sess-cover",
+            "generation_id": generation,
+            "model": "m",
+        }
+        payload.update(extra)
+        return payload
+
+    bridge.process_hook(stop("g1", transcript_path=str(full), input_tokens=999, output_tokens=999),
+                        config, poster, runtime="cursor")
+    summary = [call["body"] for call in poster.calls if call["url"].endswith("/api/ai-sessions")][-1]
+    assert summary["input_tokens"] == 16
+    bridge.process_hook(stop("g2", output="later", input_tokens=5, output_tokens=1),
+                        config, poster, runtime="cursor")
+    summary = [call["body"] for call in poster.calls if call["url"].endswith("/api/ai-sessions")][-1]
+    assert summary["input_tokens"] == 21
+    bridge.process_hook(stop("g1", transcript_path=str(full), input_tokens=999, output_tokens=999),
+                        config, poster, runtime="cursor")
+    bridge.process_hook(stop("g1", transcript_path=str(short), input_tokens=999, output_tokens=999),
+                        config, poster, runtime="cursor")
+    bridge.process_hook(stop("g3", output="after", input_tokens=1, output_tokens=1),
+                        config, poster, runtime="cursor")
+    summary = [call["body"] for call in poster.calls if call["url"].endswith("/api/ai-sessions")][-1]
+    assert summary["input_tokens"] == 22
+    assert summary["output_tokens"] == 8
+
+
+def test_payload_after_sync_adds_to_the_transcript_baseline(tmp_path):
+    path = write_jsonl(tmp_path / "sess-sync.jsonl", [
+        {"role": "user", "content": "one", "ts": "2026-10-25T11:00:00Z"},
+        {
+            "role": "assistant", "content": "uno", "model": "m",
+            "ts": "2026-10-25T11:00:01Z",
+            "usage": {"input_tokens": 10, "output_tokens": 4},
+        },
+    ])
+    poster = FakePoster()
+    config = cfg(tmp_path)
+    bridge.sync_tree(path, config, poster=poster, vendor="cursor")
+    summary = [call["body"] for call in poster.calls if call["url"].endswith("/api/ai-sessions")][-1]
+    assert summary["input_tokens"] == 10
+    assert summary["session_id"] == "sess-sync"
+    bridge.process_hook({
+        "hook_event_name": "stop",
+        "conversation_id": "sess-sync",
+        "generation_id": "g2",
+        "model": "m",
+        "output": "later",
+        "input_tokens": 5,
+        "output_tokens": 1,
+    }, config, poster, runtime="cursor")
+    summary = [call["body"] for call in poster.calls if call["url"].endswith("/api/ai-sessions")][-1]
+    assert summary["input_tokens"] == 15
+    assert summary["output_tokens"] == 5
+    assert summary["turns"] == 2
+
+
+def test_flush_limit_does_not_let_a_disabled_target_starve_coord(tmp_path):
+    config = cfg(tmp_path, twin_url="")
+    store = bridge.Store(config.state_dir)
+    try:
+        for index in range(3):
+            assert store.enqueue(
+                f"a-twin-{index}", "ingest", f"hash-twin-{index}", "twin", "/v1/ingest",
+                {"n": index}, "offline", session_id="s", turn_index=index,
+            )
+        assert store.enqueue(
+            "z-coord", "register", "hash-coord", "coord", "/session/register",
+            {"session_id": "s", "ok": True}, "offline", session_id="s",
+        )
+    finally:
+        store.close()
+    poster = FakePoster()
+    live = bridge.Bridge(config, poster=poster, store=bridge.Store(config.state_dir))
+    try:
+        sent = live.flush(2)
+    finally:
+        live.close()
+    assert sent == 1
+    assert [call["url"] for call in poster.calls] == ["http://coord.test:8140/session/register"]
+    assert poster.calls[0]["body"]["ok"] is True
