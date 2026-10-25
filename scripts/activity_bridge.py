@@ -494,6 +494,7 @@ class Store:
                 turn_index INTEGER DEFAULT 0,
                 mutable INTEGER DEFAULT 0,
                 stage INTEGER NOT NULL DEFAULT 0,
+                usage_revision INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (source_id, endpoint, content_hash)
             );
             CREATE TABLE IF NOT EXISTS spool (
@@ -510,6 +511,7 @@ class Store:
                 turn_index INTEGER DEFAULT 0,
                 mutable INTEGER DEFAULT 0,
                 stage INTEGER NOT NULL DEFAULT 0,
+                usage_revision INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (source_id, endpoint, content_hash)
             );
             CREATE TABLE IF NOT EXISTS prompts (
@@ -550,6 +552,7 @@ class Store:
                 high_water INTEGER NOT NULL DEFAULT 0,
                 started_at TEXT NOT NULL DEFAULT '',
                 open_prompt INTEGER NOT NULL DEFAULT 0,
+                usage_revision INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (session_id, agent_key)
             );
             """
@@ -600,6 +603,10 @@ class Store:
                 self.db.execute(
                     f"ALTER TABLE {table} ADD COLUMN stage INTEGER NOT NULL DEFAULT 0"
                 )
+            if "usage_revision" not in cols:
+                self.db.execute(
+                    f"ALTER TABLE {table} ADD COLUMN usage_revision INTEGER NOT NULL DEFAULT 0"
+                )
         usage_cols = self._columns("generation_usage")
         if usage_cols and "covered_turns" not in usage_cols:
             self.db.execute(
@@ -615,6 +622,10 @@ class Store:
             self.db.execute(
                 "ALTER TABLE turn_high_water ADD COLUMN open_prompt INTEGER NOT NULL DEFAULT 0"
             )
+        if water_cols and "usage_revision" not in water_cols:
+            self.db.execute(
+                "ALTER TABLE turn_high_water ADD COLUMN usage_revision INTEGER NOT NULL DEFAULT 0"
+            )
 
     def close(self):
         self.db.close()
@@ -627,66 +638,83 @@ class Store:
         return row is not None
 
     def mark_delivered(self, source_id, endpoint, content_hash, session_id="", turn_index=0,
-                       mutable=0, stage=0):
+                       mutable=0, stage=0, usage_revision=0):
         self.db.execute(
             "INSERT OR REPLACE INTO delivered (source_id, endpoint, content_hash, delivered_at, "
-            "session_id, turn_index, mutable, stage) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "session_id, turn_index, mutable, stage, usage_revision) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (source_id, endpoint, content_hash, utc_now(), session_id or "", int(turn_index),
-             int(mutable), int(stage)),
+             int(mutable), int(stage), int(usage_revision or 0)),
         )
         self.db.commit()
 
-    def newer_delivered(self, session_id, endpoint, turn_index, stage=0):
+    def newer_delivered(self, session_id, endpoint, turn_index, stage=0, usage_revision=0):
         """True when a later mutable snapshot for this session already landed.
 
         Stage separates a prompt-only snapshot (0) from the completion (1) of
         the same turn. An equal stage is not newer, so one completion does not
-        suppress another. Immutable posts are not compared.
+        suppress another. A higher usage revision at that same turn and stage
+        is newer: it was committed with the counters the earlier total lacked.
+        Immutable posts are not compared.
         """
         if not session_id:
             return False
+        turn_index = int(turn_index)
+        stage = int(stage)
+        usage_revision = int(usage_revision or 0)
         row = self.db.execute(
             "SELECT 1 FROM delivered WHERE session_id=? AND endpoint=? AND mutable=1 "
-            "AND (turn_index>? OR (turn_index=? AND stage>?)) LIMIT 1",
-            (session_id, endpoint, int(turn_index), int(turn_index), int(stage)),
+            "AND (turn_index>? OR (turn_index=? AND stage>?) "
+            "OR (turn_index=? AND stage=? AND usage_revision>?)) LIMIT 1",
+            (session_id, endpoint, turn_index, turn_index, stage,
+             turn_index, stage, usage_revision),
         ).fetchone()
         return row is not None
 
     def enqueue(self, source_id, endpoint, content_hash, target, path, body, error,
-                session_id="", turn_index=0, mutable=0, stage=0):
+                session_id="", turn_index=0, mutable=0, stage=0, usage_revision=0):
         mutable = 1 if mutable else 0
         turn_index = int(turn_index)
         stage = int(stage)
-        if mutable and self.newer_delivered(session_id, endpoint, turn_index, stage):
+        usage_revision = int(usage_revision or 0)
+        if mutable and self.newer_delivered(
+            session_id, endpoint, turn_index, stage, usage_revision,
+        ):
             return False
         self.db.execute(
             "INSERT OR IGNORE INTO spool (source_id, endpoint, content_hash, target, path, "
-            "body, attempts, last_error, created_at, session_id, turn_index, mutable, stage) "
-            "VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)",
+            "body, attempts, last_error, created_at, session_id, turn_index, mutable, stage, "
+            "usage_revision) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)",
             (source_id, endpoint, content_hash, target, path,
              json.dumps(body, ensure_ascii=False), _text(error)[:300], utc_now(),
-             session_id or "", turn_index, mutable, stage),
+             session_id or "", turn_index, mutable, stage, usage_revision),
         )
         if mutable and session_id:
             # A completion drops the prompt-only snapshot of the same turn.
             # An older turn drops too. The same stage stays, and ingest is immutable.
+            # A later usage revision drops a stale total at that same turn.
             self.db.execute(
                 "DELETE FROM spool WHERE session_id=? AND endpoint=? AND mutable=1 "
-                "AND (turn_index<? OR (turn_index=? AND stage<?))",
-                (session_id, endpoint, turn_index, turn_index, stage),
+                "AND (turn_index<? OR (turn_index=? AND stage<?) "
+                "OR (turn_index=? AND stage=? AND usage_revision<?))",
+                (session_id, endpoint, turn_index, turn_index, stage,
+                 turn_index, stage, usage_revision),
             )
         self.db.commit()
         return True
 
-    def drop_stale_pending(self, session_id, endpoint, turn_index, stage=0):
+    def drop_stale_pending(self, session_id, endpoint, turn_index, stage=0, usage_revision=0):
         if not session_id:
             return
         turn_index = int(turn_index)
         stage = int(stage)
+        usage_revision = int(usage_revision or 0)
         self.db.execute(
             "DELETE FROM spool WHERE session_id=? AND endpoint=? AND mutable=1 "
-            "AND (turn_index<? OR (turn_index=? AND stage<?))",
-            (session_id, endpoint, turn_index, turn_index, stage),
+            "AND (turn_index<? OR (turn_index=? AND stage<?) "
+            "OR (turn_index=? AND stage=? AND usage_revision<?))",
+            (session_id, endpoint, turn_index, turn_index, stage,
+             turn_index, stage, usage_revision),
         )
         self.db.commit()
 
@@ -705,7 +733,7 @@ class Store:
         """
         columns = (
             "source_id, endpoint, content_hash, target, path, body, attempts, "
-            "session_id, turn_index, mutable, stage"
+            "session_id, turn_index, mutable, stage, usage_revision"
         )
         limit = int(limit)
         if targets is None:
@@ -761,6 +789,26 @@ class Store:
         ).fetchone()
         return int(row[0] if row else 1)
 
+    def _bump_usage_revision(self, session_id, agent_key):
+        """Advance the summary version. Caller holds the counter transaction."""
+        self.db.execute(
+            """
+            INSERT INTO turn_high_water (
+                session_id, agent_key, high_water, started_at, usage_revision
+            ) VALUES (?, ?, 0, '', 1)
+            ON CONFLICT(session_id, agent_key) DO UPDATE SET
+                usage_revision = turn_high_water.usage_revision + 1
+            """,
+            (session_id, agent_key or ""),
+        )
+
+    def usage_revision(self, session_id, agent_key=""):
+        row = self.db.execute(
+            "SELECT usage_revision FROM turn_high_water WHERE session_id=? AND agent_key=?",
+            (session_id, agent_key or ""),
+        ).fetchone()
+        return int(row[0] or 0) if row else 0
+
     def save_generation_usage(self, session_id, generation_id, agent_key, usage, included=False):
         """Keep the fullest raw snapshot of one generation. A repeat does not add again.
 
@@ -786,6 +834,7 @@ class Store:
              int(usage.get("cache_read_tokens") or 0), int(usage.get("cache_write_tokens") or 0),
              1 if included else 0),
         )
+        self._bump_usage_revision(session_id, agent_key)
         self.db.commit()
 
     def replace_transcript_usage(self, session_id, agent_key, usage, covered_turns,
@@ -827,6 +876,8 @@ class Store:
         self._write_high_water(session_id, agent_key, covered_turns)
         if open_prompt is not None:
             self._write_open_prompt(session_id, agent_key, open_prompt)
+        if apply_usage:
+            self._bump_usage_revision(session_id, agent_key)
         self.db.commit()
         return True
 
@@ -951,8 +1002,9 @@ class Store:
     def publication_snapshot(self, session_id, agent_key="", cursor=False):
         """Combined usage and high water from one immediate read.
 
-        A hook write blocks until both values are captured, so a sync cannot
-        attach the total it already read to an index the hook allocated later.
+        A hook write blocks until the values are captured. The revision is the
+        one committed with those counters, so an index allocated before the
+        matching save cannot lend its version to this total.
         """
         if self.db.in_transaction:
             self.db.rollback()
@@ -960,10 +1012,11 @@ class Store:
         try:
             usage = self.combined_usage(session_id, agent_key, cursor=cursor)
             water = self.high_water(session_id, agent_key)
+            revision = self.usage_revision(session_id, agent_key)
         finally:
             if self.db.in_transaction:
                 self.db.rollback()
-        return usage, water
+        return usage, water, revision
 
     def high_water(self, session_id, agent_key=""):
         """Highest turn index already claimed by a transcript, sync, or generation."""
@@ -1185,7 +1238,8 @@ class Bridge:
     def close(self):
         self.store.close()
 
-    def send(self, endpoint, source_id, body, session_id="", turn_index=0, stage=0):
+    def send(self, endpoint, source_id, body, session_id="", turn_index=0, stage=0,
+             usage_revision=0):
         target, path = ENDPOINTS[endpoint]
         base = self.config.coord_url if target == "coord" else self.config.twin_url
         if not base:
@@ -1194,14 +1248,17 @@ class Bridge:
         mutable = 1 if endpoint in MUTABLE_ENDPOINTS else 0
         turn_index = int(turn_index or 0)
         stage = int(stage or 0)
-        if mutable and self.store.newer_delivered(session_id, endpoint, turn_index, stage):
+        usage_revision = int(usage_revision or 0)
+        if mutable and self.store.newer_delivered(
+            session_id, endpoint, turn_index, stage, usage_revision,
+        ):
             return True
         if self.store.is_delivered(source_id, endpoint, content_hash):
             return True
         if self.offline:
             if self.store.enqueue(
                 source_id, endpoint, content_hash, target, path, body, "offline",
-                session_id, turn_index, mutable, stage,
+                session_id, turn_index, mutable, stage, usage_revision,
             ):
                 self.spooled += 1
             return False
@@ -1212,15 +1269,17 @@ class Bridge:
             self.offline = True
             if self.store.enqueue(
                 source_id, endpoint, content_hash, target, path, body, str(exc),
-                session_id, turn_index, mutable, stage,
+                session_id, turn_index, mutable, stage, usage_revision,
             ):
                 self.spooled += 1
             return False
         self.store.mark_delivered(
-            source_id, endpoint, content_hash, session_id, turn_index, mutable, stage)
+            source_id, endpoint, content_hash, session_id, turn_index, mutable, stage,
+            usage_revision)
         self.store.drop_spool(source_id, endpoint, content_hash)
         if mutable:
-            self.store.drop_stale_pending(session_id, endpoint, turn_index, stage)
+            self.store.drop_stale_pending(
+                session_id, endpoint, turn_index, stage, usage_revision)
         self.delivered += 1
         return True
 
@@ -1233,17 +1292,20 @@ class Bridge:
             targets.append("twin")
         for row in self.store.pending(limit, targets):
             (source_id, endpoint, content_hash, target, path, body, _attempts,
-             session_id, turn_index, mutable, stage) = row
+             session_id, turn_index, mutable, stage, usage_revision) = row
             session_id = session_id or ""
             turn_index = int(turn_index or 0)
             mutable = int(mutable or 0)
             stage = int(stage or 0)
+            usage_revision = int(usage_revision or 0)
             if self.offline:
                 break
             base = self.config.coord_url if target == "coord" else self.config.twin_url
             if not base:
                 continue
-            if mutable and self.store.newer_delivered(session_id, endpoint, turn_index, stage):
+            if mutable and self.store.newer_delivered(
+                session_id, endpoint, turn_index, stage, usage_revision,
+            ):
                 self.store.drop_spool(source_id, endpoint, content_hash)
                 continue
             if self.store.is_delivered(source_id, endpoint, content_hash):
@@ -1257,10 +1319,12 @@ class Bridge:
                 self.store.note_failure(source_id, endpoint, content_hash, str(exc))
             else:
                 self.store.mark_delivered(
-                    source_id, endpoint, content_hash, session_id, turn_index, mutable, stage)
+                    source_id, endpoint, content_hash, session_id, turn_index, mutable, stage,
+                    usage_revision)
                 self.store.drop_spool(source_id, endpoint, content_hash)
                 if mutable:
-                    self.store.drop_stale_pending(session_id, endpoint, turn_index, stage)
+                    self.store.drop_stale_pending(
+                        session_id, endpoint, turn_index, stage, usage_revision)
                 sent += 1
                 self.delivered += 1
         return sent
@@ -2319,7 +2383,7 @@ def _runtime_from_payload(payload):
 def publish_turn(bridge, session_id, turn_index, turn, vendor, surface, model,
                  cwd, repo, branch, machine, cost, cost_basis, usage, turns,
                  started_at, include_ingest, include_summary=True, subagent_id="",
-                 updated_at="", stage=1):
+                 updated_at="", stage=1, usage_revision=0):
     """Register, heartbeat, optional ingest, and optionally the session summary.
 
     The turn's own model wins over the session's first model. Prompt hooks pass
@@ -2350,6 +2414,7 @@ def publish_turn(bridge, session_id, turn_index, turn, vendor, surface, model,
                 session_id, vendor, surface, usage, turns, repo, branch,
                 started_at or turn.timestamp or "", updated, model, machine, cost, cost_basis),
             session_id=session_id, turn_index=int(turns or turn_index or 0), stage=stage,
+            usage_revision=int(usage_revision or 0),
         )
     if include_ingest and turn.has_assistant:
         bridge.send(
@@ -2602,10 +2667,12 @@ def _process_hook(bridge, payload, config, runtime, event):
     if not updated_at:
         updated_at = utc_now()
     count = turn_count or turn_index
+    revision = bridge.store.usage_revision(session_id, agent_key)
     publish_turn(
         bridge, ledger_id, turn_index, target, vendor, surface, model,
         cwd, repo, branch, machine, cost, basis, usage, count, started or target.timestamp,
         include_ingest=target.has_assistant, include_summary=True, updated_at=updated_at,
+        usage_revision=revision,
     )
 
 
@@ -2761,7 +2828,7 @@ def sync_file(bridge, path, config, vendor="", surface=""):
     # this scan must not reuse that index for the total it already captured.
     # A rejected shorter snapshot stays on the file length.
     started_at = bridge.store.remember_started(session_id, agent_key, state["started"] or "")
-    outgoing, published_index = bridge.store.publication_snapshot(
+    outgoing, published_index, summary_revision = bridge.store.publication_snapshot(
         session_id, agent_key, cursor=vendor_name(runtime) == "cursor")
     summary_index = published_index if accepted else len(turns)
     live = [(index, turn) for index, turn in turns if turn.prompt or turn.has_assistant]
@@ -2790,6 +2857,7 @@ def sync_file(bridge, path, config, vendor="", surface=""):
         session_id=session,
         turn_index=summary_index,
         stage=1,
+        usage_revision=summary_revision,
     )
     for index, turn in live:
         if not turn.has_assistant:

@@ -64,6 +64,8 @@ adheres to [Semantic Versioning](https://semver.org/).
   transaction so an older scan cannot overwrite a newer one. A sync captures
   the combined total and its publication index together, so a hook that lands
   during the post cannot attach the stale total to the hook's newer index.
+  Counter writes advance `usage_revision` in the same transaction, so a total
+  read before those counters cannot be delivered as the later completion.
 
 ## [0.9.0] — 2026-10-18
 

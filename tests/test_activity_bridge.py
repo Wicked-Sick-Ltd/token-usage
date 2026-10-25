@@ -2545,7 +2545,6 @@ def test_sync_summary_does_not_reuse_a_later_hooks_index(tmp_path, monkeypatch):
     ])
     poster = FakePoster()
     config = cfg(tmp_path)
-    bridge.sync_tree(path, config, poster=poster, vendor="claude")
     armed = {"on": False}
     original = bridge.publish_turn
 
@@ -2572,6 +2571,79 @@ def test_sync_summary_does_not_reuse_a_later_hooks_index(tmp_path, monkeypatch):
     store = bridge.Store(config.state_dir)
     try:
         assert store.combined_usage("sess-gap")["input_tokens"] == 15
+    finally:
+        store.close()
+
+
+def test_incomplete_hook_index_cannot_publish_a_stale_total(tmp_path, monkeypatch):
+    path = write_jsonl(tmp_path / "sess-late.jsonl", [
+        {"role": "user", "content": "one", "ts": "2026-10-25T11:00:00Z"},
+        {
+            "role": "assistant", "content": "uno", "model": "m",
+            "ts": "2026-10-25T11:00:01Z",
+            "usage": {"input_tokens": 10, "output_tokens": 4},
+        },
+    ])
+    poster = FakePoster()
+    config = cfg(tmp_path)
+    store = bridge.Store(config.state_dir)
+    try:
+        store.replace_transcript_usage(
+            "sess-late", "", {"input_tokens": 10, "output_tokens": 4}, 1, [1],
+            open_prompt=0,
+        )
+    finally:
+        store.close()
+    entered = threading.Event()
+    release = threading.Event()
+    original_save = bridge.Store.save_generation_usage
+
+    def wrapped_save(self, session_id, generation_id, agent_key, usage, included=False):
+        if generation_id == "g-extra":
+            entered.set()
+            if not release.wait(3):
+                raise TimeoutError("hook save was not released")
+        return original_save(self, session_id, generation_id, agent_key, usage, included)
+
+    monkeypatch.setattr(bridge.Store, "save_generation_usage", wrapped_save)
+
+    def hook():
+        bridge.process_hook({
+            "hook_event_name": "stop",
+            "conversation_id": "sess-late",
+            "generation_id": "g-extra",
+            "model": "m",
+            "output": "later",
+            "input_tokens": 5,
+            "output_tokens": 1,
+        }, config, poster, runtime="claude")
+
+    worker = threading.Thread(target=hook)
+    worker.start()
+    assert entered.wait(3)
+    original_publish = bridge.publish_turn
+    released = {"done": False}
+
+    def wrapped_publish(*args, **kwargs):
+        if not released["done"]:
+            released["done"] = True
+            release.set()
+            worker.join(5)
+        return original_publish(*args, **kwargs)
+
+    monkeypatch.setattr(bridge, "publish_turn", wrapped_publish)
+    bridge.sync_tree(path, config, poster=poster, vendor="claude")
+    worker.join(5)
+    summaries = _summaries(poster, "sess-late")
+    assert summaries[-1]["input_tokens"] == 15
+    assert not any(
+        index > 0 and body["input_tokens"] == 10
+        and summaries[index - 1]["input_tokens"] == 15
+        for index, body in enumerate(summaries)
+    )
+    store = bridge.Store(config.state_dir)
+    try:
+        assert store.combined_usage("sess-late")["input_tokens"] == 15
     finally:
         store.close()
 
@@ -2613,10 +2685,12 @@ def test_existing_turn_map_gains_transcript_turn(tmp_path):
         assert row == (3, 0)
         water_cols = [row[1] for row in store.db.execute("PRAGMA table_info(turn_high_water)")]
         assert "open_prompt" in water_cols
+        assert "usage_revision" in water_cols
         opened = store.db.execute(
-            "SELECT high_water, open_prompt FROM turn_high_water WHERE session_id='s'"
+            "SELECT high_water, open_prompt, usage_revision FROM turn_high_water "
+            "WHERE session_id='s'"
         ).fetchone()
-        assert opened == (3, 0)
+        assert opened == (3, 0, 0)
     finally:
         store.close()
 
