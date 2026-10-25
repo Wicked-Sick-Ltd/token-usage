@@ -948,6 +948,23 @@ class Store:
                 total[key] += int(usage.get(key) or 0)
         return total
 
+    def publication_snapshot(self, session_id, agent_key="", cursor=False):
+        """Combined usage and high water from one immediate read.
+
+        A hook write blocks until both values are captured, so a sync cannot
+        attach the total it already read to an index the hook allocated later.
+        """
+        if self.db.in_transaction:
+            self.db.rollback()
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            usage = self.combined_usage(session_id, agent_key, cursor=cursor)
+            water = self.high_water(session_id, agent_key)
+        finally:
+            if self.db.in_transaction:
+                self.db.rollback()
+        return usage, water
+
     def high_water(self, session_id, agent_key=""):
         """Highest turn index already claimed by a transcript, sync, or generation."""
         agent_key = agent_key or ""
@@ -2739,9 +2756,14 @@ def sync_file(bridge, path, config, vendor="", surface=""):
     )
     # A file with no counters must not replace totals live hooks already stored.
     # Equal turn index and stage would otherwise let an all-zero summary win.
-    outgoing = bridge.store.combined_usage(
-        session_id, agent_key, cursor=vendor_name(runtime) == "cursor")
+    # The total and its publication index are one read. A hook that lands
+    # during the per-turn posts can publish a newer total at a higher index;
+    # this scan must not reuse that index for the total it already captured.
+    # A rejected shorter snapshot stays on the file length.
     started_at = bridge.store.remember_started(session_id, agent_key, state["started"] or "")
+    outgoing, published_index = bridge.store.publication_snapshot(
+        session_id, agent_key, cursor=vendor_name(runtime) == "cursor")
+    summary_index = published_index if accepted else len(turns)
     live = [(index, turn) for index, turn in turns if turn.prompt or turn.has_assistant]
     if not live:
         return
@@ -2757,11 +2779,6 @@ def sync_file(bridge, path, config, vendor="", surface=""):
             stage=1 if turn.has_assistant else 0,
         )
     _index, last_turn = live[-1]
-    # A payload can allocate past the file before delayed counters arrive. The
-    # accepted scan still owns the session total, so deliver it at the shared
-    # high water. A rejected shorter snapshot stays on the file length and
-    # cannot replace that later post.
-    summary_index = bridge.store.high_water(session_id, agent_key) if accepted else len(turns)
     bridge.send(
         "ai_sessions",
         "ai-sessions:" + session,

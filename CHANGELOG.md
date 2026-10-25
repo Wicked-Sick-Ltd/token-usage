@@ -61,7 +61,9 @@ adheres to [Semantic Versioning](https://semver.org/).
   still publishes the combined total when a payload has already allocated past
   the file. A counter-free snapshot records its length without replacing
   retained counters, and the freshness read shares the snapshot's immediate
-  transaction so an older scan cannot overwrite a newer one.
+  transaction so an older scan cannot overwrite a newer one. A sync captures
+  the combined total and its publication index together, so a hook that lands
+  during the post cannot attach the stale total to the hook's newer index.
 
 ## [0.9.0] — 2026-10-18
 
