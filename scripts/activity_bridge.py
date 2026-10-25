@@ -35,8 +35,11 @@ CURSOR_EVENTS = {
     "sessionEnd",
 }
 COMPLETION_EVENTS = {"stop", "subagentStop", "Stop", "SubagentStop", "afterAgentResponse"}
-PROMPT_EVENTS = {"beforeSubmitPrompt", "subagentStart"}
+PROMPT_EVENTS = {"beforeSubmitPrompt", "subagentStart", "SubagentStart"}
 END_EVENTS = {"sessionEnd", "SessionEnd"}
+# Live snapshots. A newer delivered turn must win over an older spooled one.
+MUTABLE_ENDPOINTS = {"heartbeat", "turn", "ai_sessions"}
+_CODEX_PAYLOAD_TYPES = {"response_item", "session_meta", "turn_context", "token_usage_record"}
 ENDPOINTS = {
     "register": ("coord", "/session/register"),
     "heartbeat": ("coord", "/session/heartbeat"),
@@ -112,12 +115,9 @@ class Turn:
         self.tools = []
         self.model = ""
         self.timestamp = ""
-        self.usage = {
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "cache_read_tokens": 0,
-            "cache_write_tokens": 0,
-        }
+        self.usage = _empty_usage()
+        # requestId -> per-field maxima, folded into usage when the turn closes.
+        self.request_usage = {}
 
     @property
     def assistant(self):
@@ -139,6 +139,7 @@ def _warn(message):
         sys.stderr.write(str(message) + "\n")
         sys.stderr.flush()
     except OSError:
+        # A closed or broken stderr must not crash the hook.
         pass
 
 
@@ -152,6 +153,7 @@ def _flush_stdout():
             os.close(fd)
             sys.stdout.flush()
         except (OSError, ValueError, AttributeError):
+            # stdout is already unusable; the hook still has to exit 0.
             pass
 
 
@@ -440,6 +442,7 @@ class Store:
         try:
             os.chmod(self.directory, 0o700)
         except OSError:
+            # Restrictive filesystems can reject chmod; the spool still works.
             pass
         self.path = self.directory / "bridge.sqlite"
         self.db = sqlite3.connect(str(self.path), timeout=1.0)
@@ -452,6 +455,9 @@ class Store:
                 endpoint TEXT NOT NULL,
                 content_hash TEXT NOT NULL,
                 delivered_at TEXT NOT NULL,
+                session_id TEXT DEFAULT '',
+                turn_index INTEGER DEFAULT 0,
+                mutable INTEGER DEFAULT 0,
                 PRIMARY KEY (source_id, endpoint, content_hash)
             );
             CREATE TABLE IF NOT EXISTS spool (
@@ -464,21 +470,66 @@ class Store:
                 attempts INTEGER NOT NULL DEFAULT 1,
                 last_error TEXT,
                 created_at TEXT NOT NULL,
+                session_id TEXT DEFAULT '',
+                turn_index INTEGER DEFAULT 0,
+                mutable INTEGER DEFAULT 0,
                 PRIMARY KEY (source_id, endpoint, content_hash)
             );
             CREATE TABLE IF NOT EXISTS prompts (
                 session_id TEXT NOT NULL,
                 generation_id TEXT NOT NULL,
+                agent_key TEXT NOT NULL DEFAULT '',
                 prompt TEXT NOT NULL,
                 model TEXT,
                 cwd TEXT,
                 turn_index INTEGER NOT NULL,
                 updated_at TEXT NOT NULL,
-                PRIMARY KEY (session_id, generation_id)
+                PRIMARY KEY (session_id, generation_id, agent_key)
             );
             """
         )
+        self._migrate()
         self.db.commit()
+
+    def _columns(self, table):
+        return [row[1] for row in self.db.execute(f"PRAGMA table_info({table})")]
+
+    def _migrate(self):
+        """Upgrade spools created before agent keys and snapshot versions existed."""
+        prompt_cols = self._columns("prompts")
+        if prompt_cols and "agent_key" not in prompt_cols:
+            self.db.executescript(
+                """
+                ALTER TABLE prompts RENAME TO prompts_v1;
+                CREATE TABLE prompts (
+                    session_id TEXT NOT NULL,
+                    generation_id TEXT NOT NULL,
+                    agent_key TEXT NOT NULL DEFAULT '',
+                    prompt TEXT NOT NULL,
+                    model TEXT,
+                    cwd TEXT,
+                    turn_index INTEGER NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (session_id, generation_id, agent_key)
+                );
+                INSERT INTO prompts (
+                    session_id, generation_id, agent_key, prompt, model, cwd, turn_index, updated_at
+                )
+                SELECT session_id, generation_id, '', prompt, model, cwd, turn_index, updated_at
+                FROM prompts_v1;
+                DROP TABLE prompts_v1;
+                """
+            )
+        for table in ("spool", "delivered"):
+            cols = self._columns(table)
+            if not cols:
+                continue
+            if "session_id" not in cols:
+                self.db.execute(f"ALTER TABLE {table} ADD COLUMN session_id TEXT DEFAULT ''")
+            if "turn_index" not in cols:
+                self.db.execute(f"ALTER TABLE {table} ADD COLUMN turn_index INTEGER DEFAULT 0")
+            if "mutable" not in cols:
+                self.db.execute(f"ALTER TABLE {table} ADD COLUMN mutable INTEGER DEFAULT 0")
 
     def close(self):
         self.db.close()
@@ -490,20 +541,54 @@ class Store:
         ).fetchone()
         return row is not None
 
-    def mark_delivered(self, source_id, endpoint, content_hash):
+    def mark_delivered(self, source_id, endpoint, content_hash, session_id="", turn_index=0, mutable=0):
         self.db.execute(
-            "INSERT OR REPLACE INTO delivered (source_id, endpoint, content_hash, delivered_at) "
-            "VALUES (?, ?, ?, ?)",
-            (source_id, endpoint, content_hash, utc_now()),
+            "INSERT OR REPLACE INTO delivered (source_id, endpoint, content_hash, delivered_at, "
+            "session_id, turn_index, mutable) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (source_id, endpoint, content_hash, utc_now(), session_id or "", int(turn_index), int(mutable)),
         )
         self.db.commit()
 
-    def enqueue(self, source_id, endpoint, content_hash, target, path, body, error):
+    def newer_delivered(self, session_id, endpoint, turn_index):
+        """True when a later mutable snapshot for this session already landed."""
+        if not session_id:
+            return False
+        row = self.db.execute(
+            "SELECT 1 FROM delivered WHERE session_id=? AND endpoint=? AND mutable=1 "
+            "AND turn_index>? LIMIT 1",
+            (session_id, endpoint, int(turn_index)),
+        ).fetchone()
+        return row is not None
+
+    def enqueue(self, source_id, endpoint, content_hash, target, path, body, error,
+                session_id="", turn_index=0, mutable=0):
+        mutable = 1 if mutable else 0
+        turn_index = int(turn_index)
+        if mutable and self.newer_delivered(session_id, endpoint, turn_index):
+            return False
         self.db.execute(
             "INSERT OR IGNORE INTO spool (source_id, endpoint, content_hash, target, path, "
-            "body, attempts, last_error, created_at) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)",
+            "body, attempts, last_error, created_at, session_id, turn_index, mutable) "
+            "VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)",
             (source_id, endpoint, content_hash, target, path,
-             json.dumps(body, ensure_ascii=False), _text(error)[:300], utc_now()),
+             json.dumps(body, ensure_ascii=False), _text(error)[:300], utc_now(),
+             session_id or "", turn_index, mutable),
+        )
+        if mutable and session_id:
+            # Keep the newest pending snapshot. Older heartbeats must not replay later.
+            self.db.execute(
+                "DELETE FROM spool WHERE session_id=? AND endpoint=? AND mutable=1 AND turn_index<?",
+                (session_id, endpoint, turn_index),
+            )
+        self.db.commit()
+        return True
+
+    def drop_stale_pending(self, session_id, endpoint, turn_index):
+        if not session_id:
+            return
+        self.db.execute(
+            "DELETE FROM spool WHERE session_id=? AND endpoint=? AND mutable=1 AND turn_index<?",
+            (session_id, endpoint, int(turn_index)),
         )
         self.db.commit()
 
@@ -516,7 +601,8 @@ class Store:
 
     def pending(self, limit):
         return self.db.execute(
-            "SELECT source_id, endpoint, content_hash, target, path, body, attempts "
+            "SELECT source_id, endpoint, content_hash, target, path, body, attempts, "
+            "session_id, turn_index, mutable "
             "FROM spool ORDER BY created_at, source_id LIMIT ?",
             (int(limit),),
         ).fetchall()
@@ -532,28 +618,30 @@ class Store:
     def pending_count(self):
         return self.db.execute("SELECT COUNT(*) FROM spool").fetchone()[0]
 
-    def save_prompt(self, session_id, generation_id, prompt, model, cwd, turn_index):
+    def save_prompt(self, session_id, generation_id, prompt, model, cwd, turn_index, agent_key=""):
         self.db.execute(
-            "INSERT OR REPLACE INTO prompts (session_id, generation_id, prompt, model, cwd, "
-            "turn_index, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (session_id, generation_id, prompt, model or "", cwd or "", int(turn_index), utc_now()),
+            "INSERT OR REPLACE INTO prompts (session_id, generation_id, agent_key, prompt, model, "
+            "cwd, turn_index, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (session_id, generation_id, agent_key or "", prompt, model or "", cwd or "",
+             int(turn_index), utc_now()),
         )
         self.db.commit()
 
-    def load_prompt(self, session_id, generation_id):
+    def load_prompt(self, session_id, generation_id, agent_key=""):
         row = self.db.execute(
             "SELECT prompt, model, cwd, turn_index FROM prompts "
-            "WHERE session_id=? AND generation_id=?",
-            (session_id, generation_id),
+            "WHERE session_id=? AND generation_id=? AND agent_key=?",
+            (session_id, generation_id, agent_key or ""),
         ).fetchone()
         if row is None:
             return None
         return {"prompt": row[0], "model": row[1], "cwd": row[2], "turn_index": row[3]}
 
-    def next_turn_index(self, session_id):
+    def next_turn_index(self, session_id, agent_key=""):
         row = self.db.execute(
-            "SELECT COALESCE(MAX(turn_index), 0) + 1 FROM prompts WHERE session_id=?",
-            (session_id,),
+            "SELECT COALESCE(MAX(turn_index), 0) + 1 FROM prompts "
+            "WHERE session_id=? AND agent_key=?",
+            (session_id, agent_key or ""),
         ).fetchone()
         return int(row[0] if row else 1)
 
@@ -578,7 +666,9 @@ def post_json(url, body, token, timeout):
         if 200 <= exc.code < 300 or exc.code == 409:
             return exc.code
         raise DeliveryError("HTTP " + str(exc.code)) from exc
-    except urllib.error.URLError as exc:
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        # socket timeouts are TimeoutError (an OSError), not URLError, on every
+        # supported Python. Spool them instead of escaping the hook.
         raise DeliveryError(str(getattr(exc, "reason", exc))) from exc
 
 
@@ -596,39 +686,59 @@ class Bridge:
     def close(self):
         self.store.close()
 
-    def send(self, endpoint, source_id, body):
+    def send(self, endpoint, source_id, body, session_id="", turn_index=0):
         target, path = ENDPOINTS[endpoint]
         base = self.config.coord_url if target == "coord" else self.config.twin_url
         if not base:
             return False
         content_hash = _hash(body)
+        mutable = 1 if endpoint in MUTABLE_ENDPOINTS else 0
+        turn_index = int(turn_index or 0)
+        if mutable and self.store.newer_delivered(session_id, endpoint, turn_index):
+            return True
         if self.store.is_delivered(source_id, endpoint, content_hash):
             return True
         if self.offline:
-            self.store.enqueue(source_id, endpoint, content_hash, target, path, body, "offline")
-            self.spooled += 1
+            if self.store.enqueue(
+                source_id, endpoint, content_hash, target, path, body, "offline",
+                session_id, turn_index, mutable,
+            ):
+                self.spooled += 1
             return False
         token = self.config.coord_token if target == "coord" else self.config.twin_token
         try:
             self.poster(base + path, body, token, self.config.timeout)
-        except DeliveryError as exc:
+        except (DeliveryError, TimeoutError, OSError) as exc:
             self.offline = True
-            self.store.enqueue(source_id, endpoint, content_hash, target, path, body, str(exc))
-            self.spooled += 1
+            if self.store.enqueue(
+                source_id, endpoint, content_hash, target, path, body, str(exc),
+                session_id, turn_index, mutable,
+            ):
+                self.spooled += 1
             return False
-        self.store.mark_delivered(source_id, endpoint, content_hash)
+        self.store.mark_delivered(
+            source_id, endpoint, content_hash, session_id, turn_index, mutable)
         self.store.drop_spool(source_id, endpoint, content_hash)
+        if mutable:
+            self.store.drop_stale_pending(session_id, endpoint, turn_index)
         self.delivered += 1
         return True
 
     def flush(self, limit=50):
         sent = 0
         for row in self.store.pending(limit):
-            source_id, endpoint, content_hash, target, path, body, _attempts = row
+            (source_id, endpoint, content_hash, target, path, body, _attempts,
+             session_id, turn_index, mutable) = row
+            session_id = session_id or ""
+            turn_index = int(turn_index or 0)
+            mutable = int(mutable or 0)
             if self.offline:
                 break
             base = self.config.coord_url if target == "coord" else self.config.twin_url
             if not base:
+                continue
+            if mutable and self.store.newer_delivered(session_id, endpoint, turn_index):
+                self.store.drop_spool(source_id, endpoint, content_hash)
                 continue
             if self.store.is_delivered(source_id, endpoint, content_hash):
                 self.store.drop_spool(source_id, endpoint, content_hash)
@@ -636,12 +746,15 @@ class Bridge:
             token = self.config.coord_token if target == "coord" else self.config.twin_token
             try:
                 self.poster(base + path, json.loads(body), token, self.config.timeout)
-            except (DeliveryError, ValueError) as exc:
+            except (DeliveryError, TimeoutError, OSError, ValueError) as exc:
                 self.offline = True
                 self.store.note_failure(source_id, endpoint, content_hash, str(exc))
             else:
-                self.store.mark_delivered(source_id, endpoint, content_hash)
+                self.store.mark_delivered(
+                    source_id, endpoint, content_hash, session_id, turn_index, mutable)
                 self.store.drop_spool(source_id, endpoint, content_hash)
+                if mutable:
+                    self.store.drop_stale_pending(session_id, endpoint, turn_index)
                 sent += 1
                 self.delivered += 1
         return sent
@@ -746,22 +859,69 @@ def _num(usage, *keys):
     return 0
 
 
+def _empty_usage():
+    return {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+    }
+
+
 def _usage(rec):
     msg = rec.get("message") if isinstance(rec.get("message"), dict) else {}
     usage = rec.get("usage") or msg.get("usage") or rec.get("token_usage") or rec.get("tokens") or {}
     if not isinstance(usage, dict):
         return {}
-    cache_write = _num(usage, "cache_write_tokens", "cache_creation_input_tokens", "cache_write")
-    creation = usage.get("cache_creation")
-    if isinstance(creation, dict):
-        cache_write += _num(creation, "ephemeral_5m_input_tokens")
-        cache_write += _num(creation, "ephemeral_1h_input_tokens")
+    creation = usage.get("cache_creation") if isinstance(usage.get("cache_creation"), dict) else {}
+    five_m = creation.get("ephemeral_5m_input_tokens")
+    one_h = creation.get("ephemeral_1h_input_tokens")
+    if five_m is None and one_h is None:
+        # Flat total is the whole cache-creation count. Nested TTL buckets, when
+        # present, already include that total and must not be added again.
+        cache_write = _num(usage, "cache_write_tokens", "cache_creation_input_tokens", "cache_write")
+    else:
+        cache_write = int(five_m or 0) + int(one_h or 0)
     return {
         "input_tokens": _num(usage, "input_tokens", "input"),
         "output_tokens": _num(usage, "output_tokens", "output"),
-        "cache_read_tokens": _num(usage, "cache_read_tokens", "cache_read_input_tokens", "cache_read"),
+        "cache_read_tokens": _num(
+            usage, "cache_read_tokens", "cache_read_input_tokens", "cache_read", "cached_input_tokens",
+        ),
         "cache_write_tokens": cache_write,
     }
+
+
+def _request_id(rec):
+    sources = [rec]
+    msg = rec.get("message")
+    if isinstance(msg, dict):
+        sources.append(msg)
+    for source in sources:
+        for key in ("requestId", "request_id", "response_id"):
+            val = source.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+    return ""
+
+
+def _max_usage(dest, usage):
+    for key in dest:
+        dest[key] = max(int(dest[key]), int(usage.get(key) or 0))
+
+
+def _bounded_input(value):
+    """Keep tool arguments, but don't retain a multi-megabyte blob on the turn."""
+    coerced = _coerce_input(value)
+    if isinstance(coerced, str):
+        return clip(coerced)
+    try:
+        raw = json.dumps(coerced, ensure_ascii=False, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        return clip(str(coerced))
+    if len(raw) <= FIELD_LIMIT:
+        return coerced
+    return clip(raw)
 
 
 def _coerce_input(value):
@@ -804,7 +964,7 @@ def _tool_calls(rec, content):
         calls.append({
             "id": str(block.get("id") or block.get("tool_use_id") or ""),
             "name": str(name),
-            "input": _coerce_input(raw_input),
+            "input": _bounded_input(raw_input),
             "result": "",
         })
     return calls
@@ -822,7 +982,7 @@ def _tool_results(content):
         results.append({
             "id": str(block.get("tool_use_id") or block.get("id") or ""),
             "name": str(block.get("name") or ""),
-            "text": _text_from_content(block.get("content")),
+            "text": clip(_text_from_content(block.get("content"))),
         })
     return results
 
@@ -860,11 +1020,11 @@ def _attach_results(turn, results):
         if matched is None:
             matched = {"id": rid, "name": name or "tool", "input": {}, "result": ""}
             turn.tools.append(matched)
-        text = result.get("text") or ""
+        text = clip(result.get("text") or "")
         if not text:
             continue
         if matched["result"]:
-            matched["result"] += "\n" + text
+            matched["result"] = clip(matched["result"] + "\n" + text)
         else:
             matched["result"] = text
 
@@ -873,23 +1033,98 @@ def _tool_message_result(rec):
     return {
         "id": str(rec.get("tool_call_id") or rec.get("tool_use_id") or rec.get("id") or ""),
         "name": str(rec.get("name") or rec.get("tool") or ""),
-        "text": _text_from_content(_content(rec)),
+        "text": clip(_text_from_content(_content(rec))),
     }
 
 
-def extract_turns(records):
-    """Group JSONL records into turns. Tool results stay on the open turn."""
-    turns = []
+def _normalize_record(rec):
+    """Lift Codex payload records so role, content, usage, and model are top-level."""
+    if not isinstance(rec, dict) or rec.get("_codex_norm"):
+        return rec
+    typ = rec.get("type")
+    payload = rec.get("payload")
+    if typ not in _CODEX_PAYLOAD_TYPES or not isinstance(payload, dict):
+        return rec
+    merged = dict(payload)
+    for key in ("timestamp", "ts"):
+        if key not in merged and isinstance(rec.get(key), str):
+            merged[key] = rec[key]
+    merged["_codex_norm"] = True
+    if typ == "response_item":
+        merged.setdefault("type", payload.get("type") or "message")
+    else:
+        merged["type"] = typ
+    if typ == "token_usage_record":
+        response_id = payload.get("response_id")
+        if isinstance(response_id, str) and response_id.strip() and "requestId" not in merged:
+            merged["requestId"] = response_id.strip()
+    return merged
+
+
+def _apply_usage(turn, rec):
+    usage = _usage(rec)
+    if not any(usage.values()):
+        return
+    request_id = _request_id(rec)
+    if not request_id:
+        turn.add_usage(usage)
+        return
+    bucket = turn.request_usage.get(request_id)
+    if bucket is None:
+        bucket = _empty_usage()
+        turn.request_usage[request_id] = bucket
+    _max_usage(bucket, usage)
+
+
+def iter_turns(records, on_record=None):
+    """Yield turns one at a time so a large JSONL file is not kept twice.
+
+    Tool text is clipped as it is attached. Assistant usage snapshots that share
+    a requestId keep per-field maxima; snapshots with no id still sum.
+    """
     current = None
+    pending_model = ""
 
     def close():
         nonlocal current
-        if current is not None and (current.prompt or current.has_assistant):
-            turns.append(current)
+        if current is None:
+            return
+        for bucket in current.request_usage.values():
+            current.add_usage(bucket)
+        current.request_usage = {}
+        if current.prompt or current.has_assistant:
+            yield_turn = current
+        else:
+            yield_turn = None
         current = None
+        return yield_turn
 
     for rec in records:
         if not isinstance(rec, dict):
+            continue
+        rec = _normalize_record(rec)
+        if on_record is not None:
+            on_record(rec)
+        typ = rec.get("type")
+        if typ == "turn_context":
+            found = _model(rec)
+            if found:
+                pending_model = found
+                if current is not None:
+                    current.model = found
+            ts = _timestamp(rec)
+            if current is not None and ts and not current.timestamp:
+                current.timestamp = ts
+            continue
+        if typ == "token_usage_record":
+            if current is None:
+                current = Turn()
+            _apply_usage(current, rec)
+            if pending_model and not current.model:
+                current.model = pending_model
+            ts = _timestamp(rec)
+            if ts and not current.timestamp:
+                current.timestamp = ts
             continue
         role = _role(rec)
         if not role or role == "system":
@@ -906,25 +1141,40 @@ def extract_turns(records):
                 _attach_results(current, results)
                 if ts and not current.timestamp:
                     current.timestamp = ts
+                if model:
+                    current.model = model
                 continue
-            close()
+            finished = close()
+            if finished is not None:
+                yield finished
             current = Turn()
-            current.prompt = text
+            current.prompt = clip(text)
             current.timestamp = ts
+            if pending_model:
+                current.model = pending_model
+                pending_model = ""
+            if model:
+                current.model = model
             if results:
                 _attach_results(current, results)
             continue
         if current is None:
             current = Turn()
             current.timestamp = ts
-        if model and not current.model:
+            if pending_model:
+                current.model = pending_model
+                pending_model = ""
+        if model:
             current.model = model
+        elif pending_model and not current.model:
+            current.model = pending_model
+            pending_model = ""
         if ts and not current.timestamp:
             current.timestamp = ts
         if role == "assistant":
             text = _text_from_content(content)
             if text:
-                current.assistant_parts.append(text)
+                current.assistant_parts.append(clip(text))
             seen = {
                 (call.get("id"), call.get("name"), _input_text(call.get("input")))
                 for call in current.tools
@@ -935,16 +1185,21 @@ def extract_turns(records):
                     continue
                 seen.add(key)
                 current.tools.append(call)
-            current.add_usage(_usage(rec))
+            _apply_usage(current, rec)
             continue
         if role == "tool":
             _attach_results(current, [_tool_message_result(rec)])
-    close()
-    return turns
+    finished = close()
+    if finished is not None:
+        yield finished
 
 
-def read_jsonl(path):
-    records = []
+def extract_turns(records):
+    """Group JSONL records into turns. Tool results stay on the open turn."""
+    return list(iter_turns(records))
+
+
+def _iter_records(path):
     try:
         with Path(path).open(encoding="utf-8", errors="replace") as handle:
             for line in handle:
@@ -956,53 +1211,70 @@ def read_jsonl(path):
                 except ValueError:
                     continue
                 if isinstance(rec, dict):
-                    records.append(rec)
+                    yield rec
     except OSError:
-        return records
-    return records
+        return
 
 
-def session_identity(path, records):
-    """(session_id, model, started_at, cwd) from a transcript path and records."""
+def read_jsonl(path):
+    return list(_iter_records(path))
+
+
+def _identity_state(path):
     path = Path(path)
     session_id = path.stem
     if path.name.lower() in {"transcript.jsonl", "session.jsonl", "messages.jsonl"} and path.parent.name:
         session_id = path.parent.name
-    model = ""
-    started = ""
-    cwd = ""
+    return {"session_id": session_id, "model": "", "started": "", "updated": "", "cwd": ""}
+
+
+def _observe_identity(path, state, rec):
+    path = Path(path)
+    rec = _normalize_record(rec)
+    if rec.get("type") in {"session_meta", "session"}:
+        for key in ("session_id", "id", "conversation_id"):
+            if (
+                isinstance(rec.get(key), str)
+                and rec[key].strip()
+                and state["session_id"] == path.stem
+            ):
+                state["session_id"] = rec[key].strip()
+                break
+        if isinstance(rec.get("model"), str) and rec["model"].strip() and not state["model"]:
+            state["model"] = rec["model"].strip()
+        if isinstance(rec.get("cwd"), str) and rec["cwd"].strip() and not state["cwd"]:
+            state["cwd"] = rec["cwd"].strip()
+    if (
+        isinstance(rec.get("session_id"), str)
+        and rec["session_id"].strip()
+        and state["session_id"] in {path.stem, path.parent.name}
+    ):
+        state["session_id"] = rec["session_id"].strip()
+    if not state["model"]:
+        found = _model(rec)
+        if found:
+            state["model"] = found
+    seen_at = _timestamp(rec)
+    if seen_at:
+        if not state["started"]:
+            state["started"] = seen_at
+        state["updated"] = seen_at
+    if not state["cwd"]:
+        for key in ("cwd", "workspace"):
+            if isinstance(rec.get(key), str) and rec[key].strip():
+                state["cwd"] = rec[key].strip()
+                break
+
+
+def session_identity(path, records):
+    """(session_id, model, started_at, cwd) from a transcript path and records."""
+    state = _identity_state(path)
     for rec in records:
-        if not isinstance(rec, dict):
-            continue
-        if rec.get("type") == "session_meta" or rec.get("type") == "session":
-            for key in ("session_id", "id", "conversation_id"):
-                if isinstance(rec.get(key), str) and rec[key].strip() and session_id == path.stem:
-                    session_id = rec[key].strip()
-                    break
-            if isinstance(rec.get("model"), str) and rec["model"].strip() and not model:
-                model = rec["model"].strip()
-            if isinstance(rec.get("cwd"), str) and rec["cwd"].strip() and not cwd:
-                cwd = rec["cwd"].strip()
-        if (
-            isinstance(rec.get("session_id"), str)
-            and rec["session_id"].strip()
-            and session_id in {path.stem, path.parent.name}
-        ):
-            session_id = rec["session_id"].strip()
-        if not model:
-            found = _model(rec)
-            if found:
-                model = found
-        if not started:
-            started = _timestamp(rec)
-        if not cwd:
-            for key in ("cwd", "workspace"):
-                if isinstance(rec.get(key), str) and rec[key].strip():
-                    cwd = rec[key].strip()
-                    break
-    if not cwd:
-        cwd = str(path.parent)
-    return session_id, model, started, cwd
+        if isinstance(rec, dict):
+            _observe_identity(path, state, rec)
+    if not state["cwd"]:
+        state["cwd"] = str(Path(path).parent)
+    return state["session_id"], state["model"], state["started"], state["cwd"]
 
 
 def _input_text(value):
@@ -1149,7 +1421,9 @@ def ingest_body(session_id, turn_index, vendor, model, turn, repo, branch, machi
             "branch": branch or "",
             "machine": machine,
             "surface": surface,
-            "timestamp": turn.timestamp or utc_now(),
+            # Empty when the transcript has no timestamp. A clock read would
+            # change the body hash on every scan and repost the same turn.
+            "timestamp": turn.timestamp or "",
         },
     }
 
@@ -1212,8 +1486,8 @@ def _payload_tools(payload):
         calls.append({
             "id": str(block.get("id") or ""),
             "name": str(name),
-            "input": _coerce_input(block.get("input") if "input" in block else block.get("arguments")),
-            "result": _text_from_content(block.get("result") or block.get("output") or ""),
+            "input": _bounded_input(block.get("input") if "input" in block else block.get("arguments")),
+            "result": clip(_text_from_content(block.get("result") or block.get("output") or "")),
         })
     return calls
 
@@ -1229,27 +1503,40 @@ def _runtime_from_payload(payload):
 
 def publish_turn(bridge, session_id, turn_index, turn, vendor, surface, model,
                  cwd, repo, branch, machine, cost, cost_basis, usage, turns,
-                 started_at, include_ingest, subagent_id=""):
-    """Register, heartbeat, optional ingest, and the session summary."""
-    now = utc_now()
-    model = model or turn.model or "unknown"
+                 started_at, include_ingest, include_summary=True, subagent_id=""):
+    """Register, heartbeat, optional ingest, and optionally the session summary.
+
+    The turn's own model wins over the session's first model. Prompt hooks pass
+    include_summary=False so a later prompt cannot replace a real summary with
+    empty usage. Sync publishes the summary once per file, not once per turn.
+    """
+    model = turn.model or model or "unknown"
     reg_id = "register:" + session_id
-    bridge.send("register", reg_id, register_body(
-        session_id, machine, cwd, repo, branch, vendor, model, cost_basis))
+    bridge.send(
+        "register", reg_id, register_body(
+            session_id, machine, cwd, repo, branch, vendor, model, cost_basis),
+        session_id=session_id, turn_index=0,
+    )
     live_id = source_id_for(session_id, turn_index, subagent_id)
     beat = heartbeat_body(
         session_id, turn.prompt, turn.assistant, turn_index, cost, model, vendor, surface)
-    bridge.send("heartbeat", live_id, beat)
-    bridge.send("turn", live_id, beat)
-    # Transcript timestamps keep the summary hash stable across syncs. A hook
-    # with no timestamp falls back to the clock so a live stop still updates.
-    updated = turn.timestamp or started_at or now
-    bridge.send("ai_sessions", "ai-sessions:" + session_id, ai_sessions_body(
-        session_id, vendor, surface, usage, turns, repo, branch,
-        started_at or turn.timestamp or now, updated, model, machine, cost, cost_basis))
+    bridge.send("heartbeat", live_id, beat, session_id=session_id, turn_index=turn_index)
+    bridge.send("turn", live_id, beat, session_id=session_id, turn_index=turn_index)
+    if include_summary:
+        updated = turn.timestamp or started_at or ""
+        bridge.send(
+            "ai_sessions", "ai-sessions:" + session_id, ai_sessions_body(
+                session_id, vendor, surface, usage, turns, repo, branch,
+                started_at or turn.timestamp or "", updated, model, machine, cost, cost_basis),
+            session_id=session_id, turn_index=int(turns or turn_index or 0),
+        )
     if include_ingest and turn.has_assistant:
-        bridge.send("ingest", live_id, ingest_body(
-            session_id, turn_index, vendor, model, turn, repo, branch, machine, surface, subagent_id))
+        bridge.send(
+            "ingest", live_id, ingest_body(
+                session_id, turn_index, vendor, model, turn, repo, branch, machine, surface,
+                subagent_id),
+            session_id=session_id, turn_index=turn_index,
+        )
     return live_id
 
 
@@ -1277,6 +1564,36 @@ def process_hook(payload, config, poster=None, runtime=""):
         return 0
 
 
+def _stream_transcript(path):
+    """One pass over a JSONL file.
+
+    Only the latest assistant turn is kept. Usage is summed as turns are
+    discarded so a long sidechain cannot sit in memory twice.
+    """
+    state = _identity_state(path)
+    usage = _empty_usage()
+    count = 0
+    last = None
+    last_index = 0
+    updated = ""
+
+    def observe(rec):
+        _observe_identity(path, state, rec)
+
+    for index, turn in enumerate(iter_turns(_iter_records(path), on_record=observe), start=1):
+        count = index
+        for key in usage:
+            usage[key] += int(turn.usage.get(key) or 0)
+        if turn.timestamp:
+            updated = turn.timestamp
+        if turn.has_assistant:
+            last = turn
+            last_index = index
+    if not state["cwd"]:
+        state["cwd"] = str(Path(path).parent)
+    return state, usage, count, last, last_index, updated
+
+
 def _process_hook(bridge, payload, config, runtime, event):
     if event in END_EVENTS:
         _publish_end(bridge, payload, config, runtime)
@@ -1285,13 +1602,13 @@ def _process_hook(bridge, payload, config, runtime, event):
         payload.get("conversation_id") or payload.get("session_id") or payload.get("conversationId"),
         "unknown",
     )
-    subagent_id = clean_id(payload.get("subagent_id") or "", "")
-    if subagent_id == "unknown":
-        subagent_id = ""
+    agent_key = _agent_key(payload)
+    ledger_id = _ledger_id(session_id, agent_key)
     generation_id = clean_id(payload.get("generation_id") or event or "turn", "turn")
     cwd = _cwd_from_payload(payload)
     repo, branch = resolve_place(cwd, config)
-    surface = config.surface or default_surface(runtime, payload.get("transcript_path") or "")
+    transcript = payload.get("transcript_path") or payload.get("transcriptPath") or ""
+    surface = config.surface or default_surface(runtime, transcript)
     vendor = vendor_name(config.vendor or runtime)
     model = _text(payload.get("model") or payload.get("subagent_model"))
     cost, basis = _cost(payload)
@@ -1299,45 +1616,45 @@ def _process_hook(bridge, payload, config, runtime, event):
 
     if event in PROMPT_EVENTS:
         prompt = _payload_prompt(payload)
-        stored = bridge.store.load_prompt(session_id, generation_id)
+        stored = bridge.store.load_prompt(session_id, generation_id, agent_key)
         if stored:
             turn_index = stored["turn_index"]
         else:
-            turn_index = bridge.store.next_turn_index(session_id)
-        bridge.store.save_prompt(session_id, generation_id, prompt, model, cwd, turn_index)
+            turn_index = bridge.store.next_turn_index(session_id, agent_key)
+        bridge.store.save_prompt(
+            session_id, generation_id, prompt, model, cwd, turn_index, agent_key)
         turn = Turn()
         turn.prompt = prompt
         turn.model = model
         turn.timestamp = utc_now()
+        # Prompt hooks must not publish a zero-usage session summary. The
+        # matching completion (or the file sync) owns /api/ai-sessions.
         publish_turn(
-            bridge, session_id, turn_index, turn, vendor, surface, model, cwd, repo, branch,
+            bridge, ledger_id, turn_index, turn, vendor, surface, model, cwd, repo, branch,
             machine, cost, basis, _payload_tokens(payload), turn_index, turn.timestamp,
-            include_ingest=False, subagent_id=subagent_id if event == "subagentStart" else "",
+            include_ingest=False, include_summary=False,
         )
         return
 
-    transcript = payload.get("transcript_path") or payload.get("transcriptPath")
-    turns = []
+    file_usage = _empty_usage()
+    turn_count = 0
     started = ""
-    if isinstance(transcript, str) and transcript and Path(transcript).is_file():
-        records = read_jsonl(transcript)
-        ident_session, ident_model, started, ident_cwd = session_identity(transcript, records)
-        if session_id == "unknown":
-            session_id = clean_id(ident_session, "unknown")
-        if not model:
-            model = ident_model
-        if ident_cwd and not payload.get("cwd") and not payload.get("workspace_roots"):
-            cwd = ident_cwd
-            repo, branch = resolve_place(cwd, config)
-        turns = extract_turns(records)
-
     target = None
     turn_index = 0
-    complete = [(idx, turn) for idx, turn in enumerate(turns, start=1) if turn.has_assistant]
-    if complete:
-        turn_index, target = complete[-1]
+    if isinstance(transcript, str) and transcript and Path(transcript).is_file():
+        state, file_usage, turn_count, target, turn_index, _updated = _stream_transcript(transcript)
+        if session_id == "unknown":
+            session_id = clean_id(state["session_id"], "unknown")
+            ledger_id = _ledger_id(session_id, agent_key)
+        if not model:
+            model = state["model"]
+        started = state["started"]
+        if state["cwd"] and not payload.get("cwd") and not payload.get("workspace_roots"):
+            cwd = state["cwd"]
+            repo, branch = resolve_place(cwd, config)
+
     if target is None:
-        stored = bridge.store.load_prompt(session_id, generation_id)
+        stored = bridge.store.load_prompt(session_id, generation_id, agent_key)
         prompt = _payload_prompt(payload) or (stored["prompt"] if stored else "")
         output = _payload_output(payload)
         tools = _payload_tools(payload)
@@ -1346,18 +1663,19 @@ def _process_hook(bridge, payload, config, runtime, event):
             if not model:
                 model = stored["model"]
         else:
-            turn_index = bridge.store.next_turn_index(session_id)
-            bridge.store.save_prompt(session_id, generation_id, prompt, model, cwd, turn_index)
+            turn_index = bridge.store.next_turn_index(session_id, agent_key)
+            bridge.store.save_prompt(
+                session_id, generation_id, prompt, model, cwd, turn_index, agent_key)
         if prompt or output or tools:
             target = Turn()
             target.prompt = prompt
             target.model = model
             target.timestamp = utc_now()
             if output:
-                target.assistant_parts.append(output)
+                target.assistant_parts.append(clip(output))
             target.tools.extend(tools)
     elif not target.prompt:
-        stored = bridge.store.load_prompt(session_id, generation_id)
+        stored = bridge.store.load_prompt(session_id, generation_id, agent_key)
         if stored and stored.get("prompt"):
             target.prompt = stored["prompt"]
     if target is None:
@@ -1365,14 +1683,45 @@ def _process_hook(bridge, payload, config, runtime, event):
     if not target.model:
         target.model = model
     payload_usage = _payload_tokens(payload)
-    usage = payload_usage if any(payload_usage.values()) else sum_usage(turns or [target])
-    turn_count = len(turns) if turns else turn_index
+    if any(payload_usage.values()):
+        usage = payload_usage
+    elif turn_count:
+        usage = file_usage
+    else:
+        usage = sum_usage([target])
+    count = turn_count or turn_index
     publish_turn(
-        bridge, session_id, turn_index, target, vendor, surface, model or target.model,
-        cwd, repo, branch, machine, cost, basis, usage, turn_count, started or target.timestamp,
-        include_ingest=target.has_assistant,
-        subagent_id=subagent_id if event == "subagentStop" else "",
+        bridge, ledger_id, turn_index, target, vendor, surface, model,
+        cwd, repo, branch, machine, cost, basis, usage, count, started or target.timestamp,
+        include_ingest=target.has_assistant, include_summary=True,
     )
+
+
+def _agent_key(payload):
+    """Subagent id, or the sidechain transcript stem when the id is absent.
+
+    Claude Code and Codex send SubagentStop in PascalCase and point
+    transcript_path at `<session>/subagents/agent-*.jsonl` without a separate id.
+    """
+    if not isinstance(payload, dict):
+        return ""
+    for key in ("subagent_id", "agent_id", "agentId"):
+        val = clean_id(payload.get(key) or "", "")
+        if val and val != "unknown":
+            return val
+    transcript = payload.get("transcript_path") or payload.get("transcriptPath") or ""
+    if not isinstance(transcript, str) or not transcript.strip():
+        return ""
+    path = Path(transcript)
+    if "subagents" not in {part.lower() for part in path.parts}:
+        return ""
+    return clean_id(path.stem, "")
+
+
+def _ledger_id(session_id, agent_key):
+    if agent_key:
+        return f"{session_id}:{agent_key}"
+    return session_id
 
 
 def _publish_end(bridge, payload, config, runtime):
@@ -1421,36 +1770,67 @@ def sync_tree(root, config, poster=None, vendor="", surface="", flush_limit=50):
 
 
 def sync_file(bridge, path, config, vendor="", surface=""):
-    records = read_jsonl(path)
-    if not records:
-        return
-    session_id, model, started, cwd = session_identity(path, records)
+    """Publish each turn's coord snapshot, one session summary, then ingests.
+
+    The summary is one post per file scan. started_at is the first transcript
+    timestamp and updated_at is the last, so a second scan of an unchanged file
+    does not post /api/ai-sessions again. The summary goes out before ingest so
+    a twin-api failure cannot skip it. Turns are clipped while they are read,
+    so a large tool result is not retained.
+    """
+    path = Path(path)
+    state = _identity_state(path)
     runtime = infer_runtime(path, vendor or config.vendor)
     surface = surface or config.surface or default_surface(runtime, path)
-    repo, branch = resolve_place(cwd, config)
-    turns = extract_turns(records)
+
+    def observe(rec):
+        _observe_identity(path, state, rec)
+
+    turns = list(enumerate(iter_turns(_iter_records(path), on_record=observe), start=1))
     if not turns:
         return
-    usage = sum_usage(turns)
-    complete = [(idx, turn) for idx, turn in enumerate(turns, start=1)]
-    last_live = None
-    for idx, turn in complete:
-        if not turn.prompt and not turn.has_assistant:
+    cwd = state["cwd"] or str(path.parent)
+    repo, branch = resolve_place(cwd, config)
+    usage = _empty_usage()
+    for _index, turn in turns:
+        for key in usage:
+            usage[key] += int(turn.usage.get(key) or 0)
+    session = clean_id(state["session_id"], path.stem)
+    live = [(index, turn) for index, turn in turns if turn.prompt or turn.has_assistant]
+    if not live:
+        return
+    for index, turn in live:
+        trailing_prompt = (index, turn) == live[-1] and not turn.has_assistant
+        if not turn.has_assistant and not trailing_prompt:
             continue
-        last_live = (idx, turn)
+        publish_turn(
+            bridge, session, index, turn, runtime, surface,
+            turn.model or state["model"], cwd, repo, branch, config.machine, 0.0, "unpriced",
+            usage, len(turns), state["started"] or turn.timestamp,
+            include_ingest=False, include_summary=False,
+        )
+    _index, last_turn = live[-1]
+    bridge.send(
+        "ai_sessions",
+        "ai-sessions:" + session,
+        ai_sessions_body(
+            session, runtime, surface, usage, len(turns), repo, branch,
+            state["started"] or "", state["updated"] or state["started"] or "",
+            last_turn.model or state["model"] or "unknown", config.machine, 0.0, "unpriced",
+        ),
+        session_id=session,
+        turn_index=len(turns),
+    )
+    for index, turn in live:
         if not turn.has_assistant:
             continue
-        publish_turn(
-            bridge, clean_id(session_id, path.stem), idx, turn, runtime, surface,
-            model or turn.model, cwd, repo, branch, config.machine, 0.0, "unpriced",
-            usage, len(turns), started or turn.timestamp, include_ingest=True,
-        )
-    if last_live and not last_live[1].has_assistant:
-        idx, turn = last_live
-        publish_turn(
-            bridge, clean_id(session_id, path.stem), idx, turn, runtime, surface,
-            model or turn.model, cwd, repo, branch, config.machine, 0.0, "unpriced",
-            usage, len(turns), started or turn.timestamp, include_ingest=False,
+        live_id = source_id_for(session, index)
+        bridge.send(
+            "ingest", live_id, ingest_body(
+                session, index, runtime, turn.model or state["model"], turn, repo, branch,
+                config.machine, surface,
+            ),
+            session_id=session, turn_index=index,
         )
 
 

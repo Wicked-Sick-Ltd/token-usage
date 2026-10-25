@@ -676,6 +676,364 @@ def test_sync_missing_dir_is_a_usage_error():
     assert "sync-dir" in result.stderr
 
 
+def test_second_prompt_does_not_zero_the_session_summary(tmp_path):
+    poster = FakePoster()
+    config = cfg(tmp_path)
+    bridge.process_hook({
+        "hook_event_name": "beforeSubmitPrompt",
+        "conversation_id": "conv-sum",
+        "generation_id": "g1",
+        "model": "cursor-grok",
+        "prompt": "first question",
+    }, config, poster, runtime="cursor")
+    bridge.process_hook({
+        "hook_event_name": "stop",
+        "conversation_id": "conv-sum",
+        "generation_id": "g1",
+        "model": "cursor-grok",
+        "output": "first answer",
+        "input_tokens": 80,
+        "output_tokens": 8,
+    }, config, poster, runtime="cursor")
+    summaries = [call for call in poster.calls if call["url"].endswith("/api/ai-sessions")]
+    assert len(summaries) == 1
+    assert summaries[0]["body"]["input_tokens"] == 80
+    bridge.process_hook({
+        "hook_event_name": "beforeSubmitPrompt",
+        "conversation_id": "conv-sum",
+        "generation_id": "g2",
+        "model": "cursor-grok",
+        "prompt": "second question",
+    }, config, poster, runtime="cursor")
+    summaries = [call for call in poster.calls if call["url"].endswith("/api/ai-sessions")]
+    assert len(summaries) == 1
+    assert summaries[0]["body"]["input_tokens"] == 80
+    assert summaries[0]["body"]["output_tokens"] == 8
+
+
+def test_subagent_start_does_not_replace_the_parent_prompt(tmp_path):
+    poster = FakePoster()
+    config = cfg(tmp_path)
+    bridge.process_hook({
+        "hook_event_name": "beforeSubmitPrompt",
+        "conversation_id": "conv",
+        "generation_id": "gen-parent",
+        "model": "parent-model",
+        "prompt": "parent prompt",
+    }, config, poster, runtime="cursor")
+    bridge.process_hook({
+        "hook_event_name": "subagentStart",
+        "conversation_id": "conv",
+        "generation_id": "gen-parent",
+        "subagent_id": "sub-1",
+        "model": "child-model",
+        "task": "child task",
+    }, config, poster, runtime="cursor")
+    bridge.process_hook({
+        "hook_event_name": "stop",
+        "conversation_id": "conv",
+        "generation_id": "gen-parent",
+        "output": "parent answer",
+    }, config, poster, runtime="cursor")
+    ingest = [call for call in poster.calls if call["url"].endswith("/v1/ingest")]
+    assert len(ingest) == 1
+    assert ingest[0]["body"]["source_id"] == "conv:turn-1"
+    assert "parent prompt" in ingest[0]["body"]["content"]
+    assert "child task" not in ingest[0]["body"]["content"]
+    assert "parent-model" in ingest[0]["body"]["content"]
+
+
+def test_pascal_subagent_stop_uses_the_sidechain_identity(tmp_path):
+    poster = FakePoster()
+    config = cfg(tmp_path)
+    sidechain = write_jsonl(tmp_path / "parent" / "subagents" / "agent-abc.jsonl", [
+        {"role": "user", "content": "child question", "ts": "2026-10-25T11:00:00Z"},
+        {
+            "role": "assistant", "content": "child answer", "model": "child-model",
+            "ts": "2026-10-25T11:00:01Z",
+            "usage": {"input_tokens": 3, "output_tokens": 4},
+        },
+    ])
+    bridge.process_hook({
+        "hook_event_name": "stop",
+        "conversation_id": "parent",
+        "generation_id": "g-parent",
+        "model": "parent-model",
+        "prompt": "parent prompt",
+        "output": "parent answer",
+        "input_tokens": 100,
+        "output_tokens": 10,
+    }, config, poster, runtime="claude")
+    bridge.process_hook({
+        "hook_event_name": "SubagentStop",
+        "session_id": "parent",
+        "transcript_path": str(sidechain),
+    }, config, poster, runtime="codex")
+    ingest_ids = [call["body"]["source_id"] for call in poster.calls if call["url"].endswith("/v1/ingest")]
+    assert "parent:turn-1" in ingest_ids
+    assert "parent:agent-abc:turn-1" in ingest_ids
+    summaries = [call["body"] for call in poster.calls if call["url"].endswith("/api/ai-sessions")]
+    parent_rows = [body for body in summaries if body["session_id"] == "parent"]
+    child_rows = [body for body in summaries if body["session_id"] == "parent:agent-abc"]
+    assert len(parent_rows) == 1
+    assert parent_rows[0]["input_tokens"] == 100
+    assert child_rows
+    assert child_rows[-1]["input_tokens"] == 3
+    assert all(body["session_id"] != "parent" or body["input_tokens"] == 100 for body in summaries)
+
+
+def test_sync_publishes_one_stable_session_summary(tmp_path):
+    poster = FakePoster()
+    config = cfg(tmp_path, surface="grok_bot", vendor="grok")
+    root = tmp_path / "grok"
+    write_jsonl(root / "thread.jsonl", [
+        {"role": "user", "content": "one", "ts": "2026-10-25T11:00:00Z"},
+        {"role": "assistant", "content": "uno", "model": "model-a", "ts": "2026-10-25T11:00:01Z"},
+        {"role": "user", "content": "two", "ts": "2026-10-25T11:02:00Z"},
+        {"role": "assistant", "content": "dos", "model": "model-b", "ts": "2026-10-25T11:02:01Z"},
+    ])
+    bridge.sync_tree(root, config, poster=poster)
+    summaries = [call for call in poster.calls if call["url"].endswith("/api/ai-sessions")]
+    assert len(summaries) == 1
+    assert summaries[0]["body"]["turns"] == 2
+    assert summaries[0]["body"]["started_at"] == "2026-10-25T11:00:00Z"
+    assert summaries[0]["body"]["updated_at"] == "2026-10-25T11:02:01Z"
+    assert summaries[0]["body"]["model"] == "model-b"
+    ingests = [call["body"] for call in poster.calls if call["url"].endswith("/v1/ingest")]
+    assert ingests[0]["content"].startswith("# Chat turn — grok/model-a\n")
+    assert ingests[1]["content"].startswith("# Chat turn — grok/model-b\n")
+    marked = len(poster.calls)
+    bridge.sync_tree(root, config, poster=poster)
+    assert len(poster.calls) == marked
+
+
+def test_timestamp_free_jsonl_does_not_repost(tmp_path):
+    poster = FakePoster()
+    config = cfg(tmp_path)
+    root = tmp_path / "logs"
+    write_jsonl(root / "flat.jsonl", [
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "hi", "model": "grok-4"},
+    ])
+    bridge.sync_tree(root, config, poster=poster, vendor="grok")
+    ingest = [call for call in poster.calls if call["url"].endswith("/v1/ingest")]
+    assert len(ingest) == 1
+    assert ingest[0]["body"]["metadata"]["timestamp"] == ""
+    marked = len(poster.calls)
+    bridge.sync_tree(root, config, poster=poster, vendor="grok")
+    assert len(poster.calls) == marked
+
+
+def test_timeout_is_spooled_and_the_hook_exits_zero(tmp_path):
+    def boom(url, body, token, timeout):
+        raise TimeoutError("timed out")
+
+    config = cfg(tmp_path)
+    assert bridge.process_hook({
+        "hook_event_name": "stop",
+        "conversation_id": "conv-timeout",
+        "generation_id": "g",
+        "prompt": "keep me",
+        "output": "stored",
+        "model": "m",
+    }, config, boom, runtime="cursor") == 0
+    store = bridge.Store(config.state_dir)
+    try:
+        assert store.pending_count() >= 1
+        blob = " ".join(row[5] for row in store.pending(20))
+        assert "keep me" in blob
+    finally:
+        store.close()
+
+
+def test_stale_spooled_snapshot_does_not_replay_over_a_newer_turn(tmp_path):
+    poster = FakePoster(fail_substrings=["coord.test", "twin.test"])
+    config = cfg(tmp_path)
+
+    def stop(number, prompt, output):
+        return {
+            "hook_event_name": "stop",
+            "conversation_id": "conv",
+            "generation_id": f"g{number}",
+            "prompt": prompt,
+            "output": output,
+            "model": "m",
+            "input_tokens": number,
+            "output_tokens": number,
+        }
+
+    bridge.process_hook(stop(1, "old", "old-out"), config, poster, runtime="cursor")
+    poster.fail_substrings = []
+    bridge.process_hook(stop(2, "new", "new-out"), config, poster, runtime="cursor")
+    live = bridge.Bridge(config, poster=poster, store=bridge.Store(config.state_dir))
+    try:
+        live.flush(50)
+    finally:
+        live.close()
+    heartbeats = [call for call in poster.calls if call["url"].endswith("/session/heartbeat")]
+    assert heartbeats
+    assert all(call["body"]["last_prompt"] != "old" for call in heartbeats)
+    summaries = [call["body"] for call in poster.calls if call["url"].endswith("/api/ai-sessions")]
+    assert summaries
+    assert all(body["input_tokens"] != 1 for body in summaries)
+    ingest_ids = {call["body"]["source_id"] for call in poster.calls if call["url"].endswith("/v1/ingest")}
+    assert ingest_ids == {"conv:turn-1", "conv:turn-2"}
+
+
+def test_codex_response_item_payload_and_usage_dedup():
+    records = [
+        {"type": "session_meta", "timestamp": "2026-10-01T10:00:00Z",
+         "payload": {"id": "thread-1", "cwd": "/tmp/project"}},
+        {"type": "turn_context", "timestamp": "2026-10-01T10:00:00Z",
+         "payload": {"model": "gpt-test", "turn_id": "turn-1"}},
+        {"type": "response_item", "timestamp": "2026-10-01T10:00:00Z", "payload": {
+            "type": "message", "role": "user",
+            "content": [{"type": "input_text", "text": "$review check the change"}],
+        }},
+        {"type": "response_item", "timestamp": "2026-10-01T10:00:01Z", "payload": {
+            "type": "message", "role": "assistant",
+            "content": [{"type": "output_text", "text": "checked"}],
+        }},
+        {"type": "token_usage_record", "timestamp": "2026-10-01T10:00:01Z", "payload": {
+            "response_id": "response-1",
+            "usage": {"input_tokens": 100, "cached_input_tokens": 40, "output_tokens": 20},
+        }},
+        {"type": "token_usage_record", "timestamp": "2026-10-01T10:00:01Z", "payload": {
+            "response_id": "response-1",
+            "usage": {"input_tokens": 100, "cached_input_tokens": 40, "output_tokens": 20},
+        }},
+    ]
+    turns = bridge.extract_turns(records)
+    assert len(turns) == 1
+    assert turns[0].prompt == "$review check the change"
+    assert turns[0].assistant == "checked"
+    assert turns[0].model == "gpt-test"
+    assert turns[0].usage == {
+        "input_tokens": 100,
+        "output_tokens": 20,
+        "cache_read_tokens": 40,
+        "cache_write_tokens": 0,
+    }
+    session_id, model, started, cwd = bridge.session_identity("rollout-thread-1.jsonl", records)
+    assert session_id == "thread-1"
+    assert model == "gpt-test"
+    assert started == "2026-10-01T10:00:00Z"
+    assert cwd == "/tmp/project"
+
+
+def test_cache_creation_breakdown_is_not_added_to_the_flat_total():
+    usage = bridge._usage({
+        "usage": {
+            "input_tokens": 10,
+            "cache_creation_input_tokens": 100,
+            "cache_creation": {
+                "ephemeral_5m_input_tokens": 40,
+                "ephemeral_1h_input_tokens": 10,
+            },
+        },
+    })
+    assert usage["cache_write_tokens"] == 50
+    flat = bridge._usage({"usage": {"cache_creation_input_tokens": 7}})
+    assert flat["cache_write_tokens"] == 7
+
+
+def test_request_id_snapshots_keep_maxima_and_missing_ids_sum():
+    deduped = bridge.extract_turns([
+        {"type": "user", "timestamp": "2026-06-12T10:00:00Z",
+         "message": {"role": "user", "content": "hi"}},
+        {"type": "assistant", "requestId": "req_1", "timestamp": "2026-06-12T10:00:01Z",
+         "message": {"role": "assistant", "model": "claude-fable-5",
+                     "content": [{"type": "text", "text": "partial"}],
+                     "usage": {"input_tokens": 100, "output_tokens": 10}}},
+        {"type": "assistant", "requestId": "req_1", "timestamp": "2026-06-12T10:00:02Z",
+         "message": {"role": "assistant", "model": "claude-fable-5",
+                     "content": [{"type": "text", "text": "done"}],
+                     "usage": {"input_tokens": 100, "output_tokens": 50}}},
+    ])
+    assert deduped[0].usage["output_tokens"] == 50
+    assert deduped[0].usage["input_tokens"] == 100
+    summed = bridge.extract_turns([
+        {"type": "assistant", "timestamp": "2026-06-12T10:00:01Z",
+         "message": {"role": "assistant", "content": "a", "usage": {"output_tokens": 10}}},
+        {"type": "assistant", "timestamp": "2026-06-12T10:00:02Z",
+         "message": {"role": "assistant", "content": "b", "usage": {"output_tokens": 20}}},
+    ])
+    assert summed[0].usage["output_tokens"] == 30
+
+
+def test_oversized_tool_results_are_clipped_at_extraction():
+    huge = "x" * (bridge.FIELD_LIMIT + 5000)
+    turns = bridge.extract_turns([
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "content": "a", "tool_calls": [
+            {"id": "1", "name": "Read", "input": {"path": "p"}},
+        ]},
+        {"role": "tool", "tool_call_id": "1", "content": huge},
+    ])
+    result = turns[0].tools[0]["result"]
+    assert result.endswith("…[truncated]")
+    assert len(result) < bridge.FIELD_LIMIT + 20
+    block = bridge.extract_turns([
+        {"type": "user", "message": {"role": "user", "content": "q"}},
+        {"type": "user", "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": huge},
+        ]}},
+    ])
+    assert block[0].tools[0]["result"].endswith("…[truncated]")
+    assert len(block[0].tools[0]["result"]) < bridge.FIELD_LIMIT + 20
+
+
+def test_store_migrates_prompts_to_include_the_agent_key(tmp_path):
+    directory = tmp_path / "state"
+    directory.mkdir()
+    db = sqlite3.connect(directory / "bridge.sqlite")
+    db.executescript(
+        """
+        CREATE TABLE delivered (
+            source_id TEXT NOT NULL,
+            endpoint TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            delivered_at TEXT NOT NULL,
+            PRIMARY KEY (source_id, endpoint, content_hash)
+        );
+        CREATE TABLE spool (
+            source_id TEXT NOT NULL,
+            endpoint TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            target TEXT NOT NULL,
+            path TEXT NOT NULL,
+            body TEXT NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 1,
+            last_error TEXT,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (source_id, endpoint, content_hash)
+        );
+        CREATE TABLE prompts (
+            session_id TEXT NOT NULL,
+            generation_id TEXT NOT NULL,
+            prompt TEXT NOT NULL,
+            model TEXT,
+            cwd TEXT,
+            turn_index INTEGER NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (session_id, generation_id)
+        );
+        INSERT INTO prompts VALUES ('s', 'g', 'parent prompt', 'm', '/tmp', 1, 't');
+        """
+    )
+    db.commit()
+    db.close()
+    store = bridge.Store(directory)
+    try:
+        store.save_prompt("s", "g", "child task", "m", "/tmp", 1, "child")
+        assert store.load_prompt("s", "g")["prompt"] == "parent prompt"
+        assert store.load_prompt("s", "g", "child")["prompt"] == "child task"
+        assert store.next_turn_index("s") == 2
+        assert store.next_turn_index("s", "child") == 2
+    finally:
+        store.close()
+
+
 @pytest.mark.parametrize("bad", ("0", "-1"))
 def test_interval_must_be_positive(bad):
     env = os.environ.copy()
