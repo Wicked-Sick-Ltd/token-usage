@@ -2648,6 +2648,61 @@ def test_incomplete_hook_index_cannot_publish_a_stale_total(tmp_path, monkeypatc
         store.close()
 
 
+def test_publication_snapshot_pairs_usage_with_its_revision(tmp_path, monkeypatch):
+    config = cfg(tmp_path)
+    store = bridge.Store(config.state_dir)
+    store.save_generation_usage(
+        "sess-pair", "g", "", {"input_tokens": 10, "output_tokens": 4})
+    done = threading.Event()
+    original = bridge.Store.usage_revision
+
+    def wrapped(self, session_id, agent_key=""):
+        if session_id == "sess-pair" and not done.is_set():
+            def bump():
+                other = bridge.Store(config.state_dir)
+                try:
+                    other.db.execute("PRAGMA busy_timeout=2000")
+                    other.save_generation_usage(
+                        "sess-pair", "g", "", {"input_tokens": 15, "output_tokens": 5})
+                finally:
+                    other.close()
+                    done.set()
+
+            threading.Thread(target=bump).start()
+            done.wait(0.4)
+        return original(self, session_id, agent_key)
+
+    monkeypatch.setattr(bridge.Store, "usage_revision", wrapped)
+    try:
+        usage, _water, revision = store.publication_snapshot("sess-pair", "")
+    finally:
+        store.close()
+    assert done.wait(3) is True
+    assert not (usage["input_tokens"] == 10 and revision >= 2)
+
+
+def test_second_offline_sync_keeps_the_queued_summary(tmp_path):
+    path = write_jsonl(tmp_path / "sess-off.jsonl", [
+        {"role": "user", "content": "one", "ts": "2026-10-25T11:00:00Z"},
+        {
+            "role": "assistant", "content": "uno", "model": "m",
+            "ts": "2026-10-25T11:00:01Z",
+            "usage": {"input_tokens": 10, "output_tokens": 4},
+        },
+    ])
+    poster = FakePoster(fail_substrings=["coord.test", "twin.test"])
+    config = cfg(tmp_path)
+    bridge.sync_tree(path, config, poster=poster, vendor="claude")
+    bridge.sync_tree(path, config, poster=poster, vendor="claude")
+    store = bridge.Store(config.state_dir)
+    try:
+        queued = [row for row in store.pending(20) if row[1] == "ai_sessions"]
+        assert len(queued) == 1
+        assert queued[0][-1] >= 2
+    finally:
+        store.close()
+
+
 def test_existing_turn_map_gains_transcript_turn(tmp_path):
     state = tmp_path / "state"
     state.mkdir()

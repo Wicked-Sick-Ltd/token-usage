@@ -66,6 +66,9 @@ adheres to [Semantic Versioning](https://semver.org/).
   during the post cannot attach the stale total to the hook's newer index.
   Counter writes advance `usage_revision` in the same transaction, so a total
   read before those counters cannot be delivered as the later completion.
+  A hook reads that total and revision together. An offline rescan of an
+  unchanged transcript updates the queued summary to the newer revision
+  instead of deleting it.
 
 ## [0.9.0] — 2026-10-18
 

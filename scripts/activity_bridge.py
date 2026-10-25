@@ -682,9 +682,19 @@ class Store:
         ):
             return False
         self.db.execute(
-            "INSERT OR IGNORE INTO spool (source_id, endpoint, content_hash, target, path, "
+            "INSERT INTO spool (source_id, endpoint, content_hash, target, path, "
             "body, attempts, last_error, created_at, session_id, turn_index, mutable, stage, "
-            "usage_revision) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)",
+            "usage_revision) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(source_id, endpoint, content_hash) DO UPDATE SET "
+            "usage_revision = MAX(spool.usage_revision, excluded.usage_revision), "
+            "turn_index = CASE WHEN excluded.usage_revision >= spool.usage_revision "
+            "THEN excluded.turn_index ELSE spool.turn_index END, "
+            "stage = CASE WHEN excluded.usage_revision >= spool.usage_revision "
+            "THEN excluded.stage ELSE spool.stage END, "
+            "session_id = CASE WHEN excluded.usage_revision >= spool.usage_revision "
+            "THEN excluded.session_id ELSE spool.session_id END, "
+            "mutable = CASE WHEN excluded.usage_revision >= spool.usage_revision "
+            "THEN excluded.mutable ELSE spool.mutable END",
             (source_id, endpoint, content_hash, target, path,
              json.dumps(body, ensure_ascii=False), _text(error)[:300], utc_now(),
              session_id or "", turn_index, mutable, stage, usage_revision),
@@ -2654,20 +2664,21 @@ def _process_hook(bridge, payload, config, runtime, event):
             session_id, generation_id, agent_key, payload_usage or _empty_usage(),
             included=bool(accepted and coverage_turn),
         )
-        usage = bridge.store.combined_usage(session_id, agent_key, cursor=cursor_payload)
     elif any(payload_usage.values()):
         bridge.store.save_generation_usage(session_id, generation_id, agent_key, payload_usage)
-        usage = bridge.store.combined_usage(session_id, agent_key, cursor=cursor_payload)
-    else:
-        usage = bridge.store.combined_usage(session_id, agent_key, cursor=cursor_payload)
-        if not _any_usage(usage):
-            usage = file_usage if turn_count else sum_usage([target])
+    # Usage and revision are one read. A retry that commits between two reads
+    # would otherwise publish this hook's stale total at the retry's revision.
+    # The empty-usage fallback stays on the path that stored no counters.
+    measured = transcript_measured or any(payload_usage.values())
+    usage, _published_index, revision = bridge.store.publication_snapshot(
+        session_id, agent_key, cursor=cursor_payload)
+    if not measured and not _any_usage(usage):
+        usage = file_usage if turn_count else sum_usage([target])
     started = bridge.store.remember_started(
         session_id, agent_key, started or target.timestamp or "")
     if not updated_at:
         updated_at = utc_now()
     count = turn_count or turn_index
-    revision = bridge.store.usage_revision(session_id, agent_key)
     publish_turn(
         bridge, ledger_id, turn_index, target, vendor, surface, model,
         cwd, repo, branch, machine, cost, basis, usage, count, started or target.timestamp,
