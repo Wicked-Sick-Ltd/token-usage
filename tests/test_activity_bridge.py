@@ -909,7 +909,7 @@ def test_codex_response_item_payload_and_usage_dedup():
     assert turns[0].assistant == "checked"
     assert turns[0].model == "gpt-test"
     assert turns[0].usage == {
-        "input_tokens": 100,
+        "input_tokens": 60,
         "output_tokens": 20,
         "cache_read_tokens": 40,
         "cache_write_tokens": 0,
@@ -1050,3 +1050,203 @@ def test_interval_must_be_positive(bad):
         check=False,
     )
     assert result.returncode == 2
+
+
+def _codex_event(kind, payload, second=0):
+    return {"type": kind, "timestamp": f"2026-10-01T10:00:{second:02d}Z", "payload": payload}
+
+
+def _codex_total(inp=100, cached=40, out=20):
+    return {"input_tokens": inp, "cached_input_tokens": cached, "output_tokens": out}
+
+
+def test_codex_token_count_deltas_are_not_dropped_or_doubled():
+    usage = _codex_total()
+    rows = [
+        _codex_event("session_meta", {"id": "thread-1", "cwd": "/tmp/project"}),
+        _codex_event("turn_context", {"model": "gpt-test", "turn_id": "turn-1"}),
+        _codex_event("response_item", {"type": "message", "role": "user", "content": [
+            {"type": "input_text", "text": "$review check the change"},
+        ]}),
+        _codex_event("event_msg", {"type": "token_count", "info": {"total_token_usage": usage}}, 1),
+        _codex_event("event_msg", {"type": "token_count", "info": {"total_token_usage": usage}}, 1),
+        _codex_event("event_msg", {"type": "token_count", "info": None}, 1),
+    ]
+    turns = bridge.extract_turns(rows)
+    assert len(turns) == 1
+    assert turns[0].model == "gpt-test"
+    assert turns[0].usage == {
+        "input_tokens": 60,
+        "output_tokens": 20,
+        "cache_read_tokens": 40,
+        "cache_write_tokens": 0,
+    }
+    rows.extend([
+        _codex_event("turn_context", {"model": "gpt-other", "turn_id": "turn-2"}, 2),
+        _codex_event("event_msg", {"type": "token_count", "info": {
+            "total_token_usage": _codex_total(200, 60, 50),
+        }}, 3),
+    ])
+    turns = bridge.extract_turns(rows)
+    assert turns[0].model == "gpt-test"
+    assert turns[1].model == "gpt-other"
+    assert turns[1].usage["cache_read_tokens"] == 20
+    total = bridge.sum_usage(turns)
+    assert total["input_tokens"] == 140
+    assert total["output_tokens"] == 50
+    both = list(rows)
+    both.insert(4, _codex_event("token_usage_record", {
+        "response_id": "response-1", "turn_id": "turn-1", "usage": usage,
+    }, 1))
+    recorded = bridge.extract_turns(both)
+    assert bridge.sum_usage(recorded)["input_tokens"] == 60
+    assert bridge.sum_usage(recorded)["output_tokens"] == 20
+
+
+def test_cache_write_input_tokens_are_counted_and_netted_from_input():
+    usage = bridge._usage({"usage": {
+        "input_tokens": 100,
+        "cached_input_tokens": 40,
+        "cache_write_input_tokens": 10,
+        "output_tokens": 20,
+    }})
+    assert usage["cache_write_tokens"] == 10
+    assert usage["cache_read_tokens"] == 40
+    assert usage["input_tokens"] == 50
+    claude = bridge._usage({"usage": {
+        "input_tokens": 10,
+        "cache_read_input_tokens": 4,
+        "output_tokens": 2,
+    }})
+    assert claude["input_tokens"] == 10
+    assert claude["cache_read_tokens"] == 4
+
+
+def test_turn_context_does_not_relabel_the_open_turn(tmp_path):
+    poster = FakePoster()
+    config = cfg(tmp_path)
+    path = write_jsonl(tmp_path / "rollout.jsonl", [
+        _codex_event("turn_context", {"model": "model-a", "turn_id": "turn-1"}),
+        _codex_event("response_item", {"type": "message", "role": "user", "content": [
+            {"type": "input_text", "text": "first"},
+        ]}),
+        _codex_event("response_item", {"type": "message", "role": "assistant", "content": [
+            {"type": "output_text", "text": "done"},
+        ]}, 1),
+    ])
+    bridge.sync_tree(path.parent, config, poster=poster, vendor="codex")
+    ingest = [call for call in poster.calls if call["url"].endswith("/v1/ingest")]
+    assert len(ingest) == 1
+    assert "model-a" in ingest[0]["body"]["content"]
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(_codex_event(
+            "turn_context", {"model": "model-b", "turn_id": "turn-2"}, 2,
+        )) + "\n")
+    bridge.sync_tree(path.parent, config, poster=poster, vendor="codex")
+    ingest = [call for call in poster.calls if call["url"].endswith("/v1/ingest")]
+    assert len(ingest) == 1
+    assert "model-a" in ingest[0]["body"]["content"]
+    summaries = [call["body"] for call in poster.calls if call["url"].endswith("/api/ai-sessions")]
+    assert summaries[-1]["model"] == "model-a"
+    turns = bridge.extract_turns(bridge.read_jsonl(path))
+    assert turns[0].model == "model-a"
+    turns = bridge.extract_turns(bridge.read_jsonl(path) + [
+        _codex_event("response_item", {"type": "message", "role": "user", "content": [
+            {"type": "input_text", "text": "second"},
+        ]}, 3),
+        _codex_event("response_item", {"type": "message", "role": "assistant", "content": [
+            {"type": "output_text", "text": "next"},
+        ]}, 4),
+    ])
+    assert [turn.model for turn in turns] == ["model-a", "model-b"]
+
+
+def test_stop_summary_uses_the_final_transcript_timestamp(tmp_path):
+    path = write_jsonl(tmp_path / "sess.jsonl", [
+        {"role": "user", "content": "prompt", "ts": "2026-10-25T11:00:00Z"},
+        {
+            "role": "assistant", "content": "answer", "model": "m",
+            "ts": "2026-10-25T11:05:00Z",
+            "usage": {"input_tokens": 4, "output_tokens": 5},
+        },
+    ])
+    poster = FakePoster()
+    bridge.process_hook({
+        "hook_event_name": "Stop",
+        "session_id": "sess-clock",
+        "transcript_path": str(path),
+        "cwd": "/workspace/token-usage",
+    }, cfg(tmp_path), poster, runtime="claude")
+    summary = next(call for call in poster.calls if call["url"].endswith("/api/ai-sessions"))
+    ingest = next(call for call in poster.calls if call["url"].endswith("/v1/ingest"))
+    assert summary["body"]["updated_at"] == "2026-10-25T11:05:00Z"
+    assert ingest["body"]["metadata"]["timestamp"] == "2026-10-25T11:00:00Z"
+
+
+def test_payload_completions_aggregate_per_generation(tmp_path):
+    poster = FakePoster()
+    config = cfg(tmp_path)
+
+    def stop(generation, prompt, output, tokens=None):
+        payload = {
+            "hook_event_name": "stop",
+            "conversation_id": "conv-gen",
+            "generation_id": generation,
+            "model": "cursor-grok",
+            "prompt": prompt,
+            "output": output,
+        }
+        if tokens is not None:
+            payload["input_tokens"] = tokens[0]
+            payload["output_tokens"] = tokens[1]
+        return payload
+
+    bridge.process_hook(stop("g1", "one", "uno", (80, 8)), config, poster, runtime="cursor")
+    bridge.process_hook(stop("g2", "two", "dos", (20, 2)), config, poster, runtime="cursor")
+    summaries = [call["body"] for call in poster.calls if call["url"].endswith("/api/ai-sessions")]
+    assert summaries[-1]["input_tokens"] == 100
+    assert summaries[-1]["output_tokens"] == 10
+    assert summaries[-1]["turns"] == 2
+    bridge.process_hook(stop("g3", "three", "tres"), config, poster, runtime="cursor")
+    summaries = [call["body"] for call in poster.calls if call["url"].endswith("/api/ai-sessions")]
+    assert summaries[-1]["input_tokens"] == 100
+    assert summaries[-1]["output_tokens"] == 10
+    bridge.process_hook(stop("g2", "two", "dos", (20, 2)), config, poster, runtime="cursor")
+    summaries = [call["body"] for call in poster.calls if call["url"].endswith("/api/ai-sessions")]
+    assert summaries[-1]["input_tokens"] == 100
+
+
+def test_transcript_totals_win_over_payload_counters(tmp_path):
+    path = write_jsonl(tmp_path / "sess.jsonl", [
+        {"role": "user", "content": "prompt", "ts": "2026-10-25T11:00:00Z"},
+        {
+            "role": "assistant", "content": "answer", "model": "m",
+            "ts": "2026-10-25T11:00:01Z",
+            "usage": {"input_tokens": 10, "output_tokens": 4},
+        },
+    ])
+    poster = FakePoster()
+    bridge.process_hook({
+        "hook_event_name": "stop",
+        "conversation_id": "sess",
+        "generation_id": "g1",
+        "transcript_path": str(path),
+        "input_tokens": 999,
+        "output_tokens": 999,
+        "output": "ignored",
+    }, cfg(tmp_path), poster, runtime="cursor")
+    summary = [call["body"] for call in poster.calls if call["url"].endswith("/api/ai-sessions")][-1]
+    assert summary["input_tokens"] == 10
+    assert summary["output_tokens"] == 4
+    poster.calls.clear()
+    bridge.process_hook({
+        "hook_event_name": "stop",
+        "conversation_id": "sess",
+        "generation_id": "g2",
+        "output": "later",
+        "input_tokens": 5,
+        "output_tokens": 1,
+    }, cfg(tmp_path), poster, runtime="cursor")
+    summary = [call["body"] for call in poster.calls if call["url"].endswith("/api/ai-sessions")][-1]
+    assert summary["input_tokens"] == 15
+    assert summary["output_tokens"] == 5

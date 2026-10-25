@@ -124,9 +124,9 @@ Copilot additionally writes `~/.copilot/token-usage/<session-id>.jsonl` under `C
 
 `dashboard` and `export` also write the one file you name with `--output` (dashboard defaults to `token-usage-dashboard.html` in the current directory; `--output -` writes to stdout).
 
-When the activity bridge is configured it also writes `activity-bridge/bridge.sqlite` under `WIZZO_ACTIVITY_STATE_DIR`, or under `TOKEN_USAGE_LEDGER_DIR/activity-bridge` when that override is set, or otherwise under `~/.cache/token-usage/activity-bridge` (`XDG_CACHE_HOME` when set). The database is a watermark of delivered turns plus a spool of undelivered JSON bodies, which include prompt and assistant text until a flush succeeds. The directory is created owner-only (`0700`) where the filesystem supports it. Bearer tokens are not written there.
+When the activity bridge is configured it also writes `activity-bridge/bridge.sqlite` under `WIZZO_ACTIVITY_STATE_DIR`, or under `TOKEN_USAGE_LEDGER_DIR/activity-bridge` when that override is set, or otherwise under `~/.cache/token-usage/activity-bridge` (`XDG_CACHE_HOME` when set). The database holds a watermark of delivered turns, a spool of undelivered JSON bodies (prompt and assistant text until a flush succeeds), a `prompts` table, and per-generation token counters. `prompts` caches the prompt or task text from `beforeSubmitPrompt` and `subagentStart` so the matching stop can pair it. That cache is separate from the spool: a successful flush deletes spool rows and does not delete prompt rows, and an empty spool does not mean the cached prompt text is gone. Generation counters are the deduplicated per-generation totals used when a completion has no transcript. The directory is created owner-only (`0700`) where the filesystem supports it. Bearer tokens are not written there.
 
-**Retention.** token-usage never deletes or prunes anything. The data stays until you remove it. Deleting `~/.cache/token-usage/` (or your `TOKEN_USAGE_LEDGER_DIR`) removes those caches, hook ledgers and, when the spool lives there, undelivered bridge posts. The next run rebuilds the cache from your transcripts. Remove `$COPILOT_HOME/token-usage/` separately to remove Copilot capture files. Remove the bridge state directory separately when it is not under that cache.
+**Retention.** token-usage never deletes or prunes anything. The data stays until you remove it. Deleting `~/.cache/token-usage/` (or your `TOKEN_USAGE_LEDGER_DIR`) removes those caches, hook ledgers and, when the bridge database lives there, its watermark, spool, cached prompts, and generation counters. The next run rebuilds the cache from your transcripts. Remove `$COPILOT_HOME/token-usage/` separately to remove Copilot capture files. Remove the bridge state directory separately when it is not under that cache. Flushing the spool does not clear cached prompts.
 
 **What runs.**
 
@@ -464,7 +464,7 @@ Hook commands in `hooks/hooks-cursor.json`, `hooks/hooks.json` and `hooks/hooks-
 | `WIZZO_TWIN_API_URL` | unset | twin-api base URL, for example `http://100.105.90.34:8100`. Receives `POST /v1/ingest`. |
 | `WIZZO_TWIN_TOKEN` | unset | Bearer token for `WIZZO_TWIN_API_URL`. |
 | `WIZZO_ACTIVITY_BRIDGE` | on when a URL is set | `0`, `off`, `false` or `no` disables the bridge. |
-| `WIZZO_ACTIVITY_STATE_DIR` | see below | Directory for `bridge.sqlite` (watermark and spool). |
+| `WIZZO_ACTIVITY_STATE_DIR` | see below | Directory for `bridge.sqlite` (watermark, spool, cached prompts, and generation counters). |
 | `WIZZO_ACTIVITY_HTTP_TIMEOUT` | `0.8` | Per-request timeout in seconds. The first failure marks the process offline and the rest of the batch is spooled. |
 | `WIZZO_ACTIVITY_SYNC_DIRS` | unset | `os.pathsep`-separated directories for `sync` when `--sync-dir` is omitted. |
 | `WIZZO_MACHINE` | hostname | `machine` field on register, heartbeat metadata and ingest. |

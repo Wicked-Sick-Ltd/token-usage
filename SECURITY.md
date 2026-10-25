@@ -99,9 +99,10 @@ can start the stdio server.
   stdin EOF or a broken pipe. Tool handlers read the locations above and may
   refresh the summary index. They do not modify transcripts.
 - The activity bridge, when configured, appends to `bridge.sqlite` in its
-  state directory (owner-only when the filesystem allows). Deleting that
-  directory drops the watermark and any spooled turns. Hook invocations still
-  exit 0 if the directory cannot be created.
+  state directory (owner-only when the filesystem allows). The file holds the
+  delivery watermark, any spooled turns, cached prompt text, and per-generation
+  token counters. Deleting that directory drops all of them. Hook invocations
+  still exit 0 if the directory cannot be created.
 
 Deleting `~/.cache/token-usage/` removes summary caches and hook ledgers.
 Deleting `$COPILOT_HOME/token-usage/` removes Copilot capture files. The

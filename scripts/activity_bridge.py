@@ -69,6 +69,7 @@ ENV_NAMES = (
 FIELD_LIMIT = 20000
 _GIT_CACHE = {}
 _DISABLED = {"0", "off", "false", "no"}
+_TRANSCRIPT_GENERATION = "__transcript__"
 _SKIP_TYPES = {
     "session_meta",
     "progress",
@@ -116,6 +117,7 @@ class Turn:
         self.model = ""
         self.timestamp = ""
         self.usage = _empty_usage()
+        self.turn_id = ""
         # requestId -> per-field maxima, folded into usage when the turn closes.
         self.request_usage = {}
 
@@ -486,6 +488,17 @@ class Store:
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY (session_id, generation_id, agent_key)
             );
+            CREATE TABLE IF NOT EXISTS generation_usage (
+                session_id TEXT NOT NULL,
+                generation_id TEXT NOT NULL,
+                agent_key TEXT NOT NULL DEFAULT '',
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+                in_transcript INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (session_id, generation_id, agent_key)
+            );
             """
         )
         self._migrate()
@@ -644,6 +657,74 @@ class Store:
             (session_id, agent_key or ""),
         ).fetchone()
         return int(row[0] if row else 1)
+
+    def save_generation_usage(self, session_id, generation_id, agent_key, usage):
+        """Keep the fullest snapshot of one generation. A repeat does not add again."""
+        agent_key = agent_key or ""
+        self.db.execute(
+            """
+            INSERT INTO generation_usage (
+                session_id, generation_id, agent_key,
+                input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, in_transcript
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+            ON CONFLICT(session_id, generation_id, agent_key) DO UPDATE SET
+                input_tokens = MAX(generation_usage.input_tokens, excluded.input_tokens),
+                output_tokens = MAX(generation_usage.output_tokens, excluded.output_tokens),
+                cache_read_tokens = MAX(generation_usage.cache_read_tokens, excluded.cache_read_tokens),
+                cache_write_tokens = MAX(generation_usage.cache_write_tokens, excluded.cache_write_tokens)
+            """,
+            (session_id, generation_id, agent_key,
+             int(usage.get("input_tokens") or 0), int(usage.get("output_tokens") or 0),
+             int(usage.get("cache_read_tokens") or 0), int(usage.get("cache_write_tokens") or 0)),
+        )
+        self.db.commit()
+
+    def replace_transcript_usage(self, session_id, agent_key, usage):
+        """The transcript total replaces generation counters for this session.
+
+        Rows already stored stay, marked included, so a later payload does not
+        add them on top of the transcript. A new generation id still adds.
+        """
+        agent_key = agent_key or ""
+        self.db.execute(
+            """
+            INSERT INTO generation_usage (
+                session_id, generation_id, agent_key,
+                input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, in_transcript
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+            ON CONFLICT(session_id, generation_id, agent_key) DO UPDATE SET
+                input_tokens = excluded.input_tokens,
+                output_tokens = excluded.output_tokens,
+                cache_read_tokens = excluded.cache_read_tokens,
+                cache_write_tokens = excluded.cache_write_tokens,
+                in_transcript = 0
+            """,
+            (session_id, _TRANSCRIPT_GENERATION, agent_key,
+             int(usage.get("input_tokens") or 0), int(usage.get("output_tokens") or 0),
+             int(usage.get("cache_read_tokens") or 0), int(usage.get("cache_write_tokens") or 0)),
+        )
+        self.db.execute(
+            "UPDATE generation_usage SET in_transcript=1 "
+            "WHERE session_id=? AND agent_key=? AND generation_id!=?",
+            (session_id, agent_key, _TRANSCRIPT_GENERATION),
+        )
+        self.db.commit()
+
+    def combined_usage(self, session_id, agent_key=""):
+        """Transcript total plus generations not already covered by that total."""
+        row = self.db.execute(
+            "SELECT COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0), "
+            "COALESCE(SUM(cache_read_tokens), 0), COALESCE(SUM(cache_write_tokens), 0) "
+            "FROM generation_usage WHERE session_id=? AND agent_key=? "
+            "AND (generation_id=? OR in_transcript=0)",
+            (session_id, agent_key or "", _TRANSCRIPT_GENERATION),
+        ).fetchone()
+        return {
+            "input_tokens": int(row[0] or 0),
+            "output_tokens": int(row[1] or 0),
+            "cache_read_tokens": int(row[2] or 0),
+            "cache_write_tokens": int(row[3] or 0),
+        }
 
 
 def post_json(url, body, token, timeout):
@@ -868,6 +949,52 @@ def _empty_usage():
     }
 
 
+def _any_usage(usage):
+    return any(int(usage.get(key) or 0) for key in _empty_usage())
+
+
+def _codex_counter(usage, key):
+    """Codex counters are non-negative numbers. A bad value fails open as None."""
+    value = usage.get(key, 0)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        return None
+    return int(value)
+
+
+def _codex_flat_usage(total):
+    """Net Codex totals. input_tokens includes cache; reasoning is inside output.
+
+    Matches `_codex_flat` in token_usage.py, but returns None instead of raising
+    so a hook can skip one bad notification.
+    """
+    if not isinstance(total, dict):
+        return None
+    if "input_tokens" not in total or "output_tokens" not in total:
+        return None
+    cached = _codex_counter(total, "cached_input_tokens")
+    written = _codex_counter(total, "cache_write_input_tokens")
+    incoming = _codex_counter(total, "input_tokens")
+    outgoing = _codex_counter(total, "output_tokens")
+    if None in (cached, written, incoming, outgoing):
+        return None
+    if cached + written > incoming:
+        return None
+    return {
+        "input_tokens": incoming - cached - written,
+        "output_tokens": outgoing,
+        "cache_read_tokens": cached,
+        "cache_write_tokens": written,
+    }
+
+
+def _codex_usage_mode(records):
+    """Per-response records win for the whole file. Otherwise totals are cumulative."""
+    for rec in records:
+        if isinstance(rec, dict) and rec.get("type") == "token_usage_record":
+            return "records"
+    return "cumulative"
+
+
 def _usage(rec):
     msg = rec.get("message") if isinstance(rec.get("message"), dict) else {}
     usage = rec.get("usage") or msg.get("usage") or rec.get("token_usage") or rec.get("tokens") or {}
@@ -879,15 +1006,37 @@ def _usage(rec):
     if five_m is None and one_h is None:
         # Flat total is the whole cache-creation count. Nested TTL buckets, when
         # present, already include that total and must not be added again.
-        cache_write = _num(usage, "cache_write_tokens", "cache_creation_input_tokens", "cache_write")
+        cache_write = _num(
+            usage, "cache_write_tokens", "cache_creation_input_tokens",
+            "cache_write_input_tokens", "cache_write",
+        )
     else:
         cache_write = int(five_m or 0) + int(one_h or 0)
+    input_tokens = _num(usage, "input_tokens", "input")
+    output_tokens = _num(usage, "output_tokens", "output")
+    cache_read = _num(
+        usage, "cache_read_tokens", "cache_read_input_tokens", "cache_read", "cached_input_tokens",
+    )
+    # Codex input_tokens already includes cached_input_tokens and
+    # cache_write_input_tokens. Claude's cache_read_input_tokens does not.
+    codex_keys = "cached_input_tokens" in usage or "cache_write_input_tokens" in usage
+    if codex_keys:
+        flat = _codex_flat_usage(usage)
+        if flat is not None:
+            input_tokens = flat["input_tokens"]
+            output_tokens = flat["output_tokens"]
+            cache_read = flat["cache_read_tokens"]
+            if five_m is None and one_h is None:
+                cache_write = flat["cache_write_tokens"]
+        else:
+            cached = _num(usage, "cached_input_tokens")
+            written = _num(usage, "cache_write_input_tokens")
+            if cached + written > input_tokens:
+                input_tokens = 0
     return {
-        "input_tokens": _num(usage, "input_tokens", "input"),
-        "output_tokens": _num(usage, "output_tokens", "output"),
-        "cache_read_tokens": _num(
-            usage, "cache_read_tokens", "cache_read_input_tokens", "cache_read", "cached_input_tokens",
-        ),
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_read_tokens": cache_read,
         "cache_write_tokens": cache_write,
     }
 
@@ -1076,28 +1225,85 @@ def _apply_usage(turn, rec):
     _max_usage(bucket, usage)
 
 
-def iter_turns(records, on_record=None):
+def iter_turns(records, on_record=None, codex_usage=None):
     """Yield turns one at a time so a large JSONL file is not kept twice.
 
     Tool text is clipped as it is attached. Assistant usage snapshots that share
     a requestId keep per-field maxima; snapshots with no id still sum.
+
+    Codex rollouts that contain any token_usage_record use only that stream.
+    Otherwise event_msg token_count totals are cumulative and become deltas.
+    A turn_context that arrives after the open turn already has a prompt or
+    assistant text belongs to the next turn. It must not relabel this one.
     """
+    if codex_usage is None:
+        codex_usage = _codex_usage_mode(records) if isinstance(records, (list, tuple)) else "records"
     current = None
     pending_model = ""
+    pending_turn_id = ""
+    pending_turn = None
+    divert = False
+    previous_cumulative = None
 
-    def close():
+    def fold(turn):
+        if turn is None:
+            return
+        for bucket in turn.request_usage.values():
+            turn.add_usage(bucket)
+        turn.request_usage = {}
+
+    def close_content():
+        """Return the open turn when it has chat text. Leave a usage-only turn open."""
         nonlocal current
         if current is None:
             return None
-        for bucket in current.request_usage.values():
-            current.add_usage(bucket)
-        current.request_usage = {}
-        if current.prompt or current.has_assistant:
-            yield_turn = current
-        else:
-            yield_turn = None
+        fold(current)
+        if not current.prompt and not current.has_assistant:
+            return None
+        finished = current
         current = None
-        return yield_turn
+        return finished
+
+    def usage_target():
+        """Usage after a new turn_context waits for that turn instead of the previous one."""
+        nonlocal current, pending_turn
+        if divert:
+            if pending_turn is None:
+                pending_turn = Turn()
+                pending_turn.model = pending_model
+                pending_turn.turn_id = pending_turn_id
+            return pending_turn
+        if current is None:
+            current = Turn()
+            if pending_model and not current.model:
+                current.model = pending_model
+            if pending_turn_id and not current.turn_id:
+                current.turn_id = pending_turn_id
+        return current
+
+    def apply_cumulative(rec):
+        nonlocal previous_cumulative
+        payload = rec.get("payload") if isinstance(rec.get("payload"), dict) else {}
+        info = payload.get("info") if isinstance(payload.get("info"), dict) else None
+        total = info.get("total_token_usage") if info is not None else None
+        flat = _codex_flat_usage(total) if isinstance(total, dict) else None
+        if flat is None:
+            return
+        if previous_cumulative is not None and any(flat[key] < previous_cumulative[key] for key in flat):
+            previous_cumulative = flat
+            return
+        if previous_cumulative is None:
+            delta = flat
+        else:
+            delta = {key: flat[key] - previous_cumulative[key] for key in flat}
+        previous_cumulative = flat
+        if not any(delta.values()):
+            return
+        target = usage_target()
+        target.add_usage(delta)
+        seen_at = _timestamp(rec)
+        if seen_at and not target.timestamp:
+            target.timestamp = seen_at
 
     for rec in records:
         if not isinstance(rec, dict):
@@ -1108,23 +1314,43 @@ def iter_turns(records, on_record=None):
         typ = rec.get("type")
         if typ == "turn_context":
             found = _model(rec)
+            raw_id = rec.get("turn_id")
+            turn_id = raw_id.strip() if isinstance(raw_id, str) else ""
             if found:
                 pending_model = found
-                if current is not None:
+            if turn_id:
+                pending_turn_id = turn_id
+            same_turn = bool(turn_id) and current is not None and current.turn_id == turn_id
+            started = current is not None and bool(current.prompt or current.has_assistant)
+            if started and not same_turn:
+                # The next turn's context often precedes its user message.
+                divert = True
+                if pending_turn is not None and found:
+                    pending_turn.model = found
+                if pending_turn is not None and turn_id:
+                    pending_turn.turn_id = turn_id
+            elif current is not None:
+                if turn_id and not current.turn_id:
+                    current.turn_id = turn_id
+                if found and not current.model:
                     current.model = found
-            ts = _timestamp(rec)
-            if current is not None and ts and not current.timestamp:
-                current.timestamp = ts
+                seen_at = _timestamp(rec)
+                if seen_at and not current.timestamp:
+                    current.timestamp = seen_at
+            continue
+        if typ == "event_msg":
+            payload = rec.get("payload") if isinstance(rec.get("payload"), dict) else {}
+            if payload.get("type") == "token_count" and codex_usage == "cumulative":
+                apply_cumulative(rec)
             continue
         if typ == "token_usage_record":
-            if current is None:
-                current = Turn()
-            _apply_usage(current, rec)
-            if pending_model and not current.model:
-                current.model = pending_model
-            ts = _timestamp(rec)
-            if ts and not current.timestamp:
-                current.timestamp = ts
+            if codex_usage == "cumulative":
+                continue
+            target = usage_target()
+            _apply_usage(target, rec)
+            seen_at = _timestamp(rec)
+            if seen_at and not target.timestamp:
+                target.timestamp = seen_at
             continue
         role = _role(rec)
         if not role or role == "system":
@@ -1144,12 +1370,41 @@ def iter_turns(records, on_record=None):
                 if model:
                     current.model = model
                 continue
-            finished = close()
+            finished = close_content()
             if finished is not None:
                 yield finished
+            carried = None
+            if current is not None:
+                fold(current)
+                carried = current
+                current = None
+            extra = None
+            if pending_turn is not None:
+                fold(pending_turn)
+                extra = pending_turn
+                pending_turn = None
+            divert = False
             current = Turn()
+            if carried is not None:
+                current.add_usage(carried.usage)
+                if carried.turn_id:
+                    current.turn_id = carried.turn_id
+                if carried.model and not pending_model:
+                    current.model = carried.model
+                if carried.timestamp and not ts:
+                    current.timestamp = carried.timestamp
+            if extra is not None:
+                current.add_usage(extra.usage)
+                if extra.turn_id:
+                    current.turn_id = extra.turn_id
+                if extra.model:
+                    current.model = extra.model
+                if extra.timestamp and not current.timestamp:
+                    current.timestamp = extra.timestamp
             current.prompt = clip(text)
-            current.timestamp = ts
+            current.timestamp = ts or current.timestamp
+            if pending_turn_id and not current.turn_id:
+                current.turn_id = pending_turn_id
             if pending_model:
                 current.model = pending_model
                 pending_model = ""
@@ -1161,12 +1416,14 @@ def iter_turns(records, on_record=None):
         if current is None:
             current = Turn()
             current.timestamp = ts
-            if pending_model:
+            if pending_turn_id and not divert:
+                current.turn_id = pending_turn_id
+            if pending_model and not divert:
                 current.model = pending_model
                 pending_model = ""
         if model:
             current.model = model
-        elif pending_model and not current.model:
+        elif pending_model and not current.model and not divert:
             current.model = pending_model
             pending_model = ""
         if ts and not current.timestamp:
@@ -1189,9 +1446,17 @@ def iter_turns(records, on_record=None):
             continue
         if role == "tool":
             _attach_results(current, [_tool_message_result(rec)])
-    finished = close()
+    finished = close_content()
     if finished is not None:
         yield finished
+    if current is not None:
+        fold(current)
+        if current.prompt or current.has_assistant or _any_usage(current.usage):
+            yield current
+    if pending_turn is not None:
+        fold(pending_turn)
+        if pending_turn.prompt or pending_turn.has_assistant or _any_usage(pending_turn.usage):
+            yield pending_turn
 
 
 def extract_turns(records):
@@ -1218,6 +1483,14 @@ def _iter_records(path):
 
 def read_jsonl(path):
     return list(_iter_records(path))
+
+
+def _path_codex_mode(path):
+    """Second read so a one-pass extract can pick records vs cumulative totals."""
+    for rec in _iter_records(path):
+        if rec.get("type") == "token_usage_record":
+            return "records"
+    return "cumulative"
 
 
 def _identity_state(path):
@@ -1503,12 +1776,15 @@ def _runtime_from_payload(payload):
 
 def publish_turn(bridge, session_id, turn_index, turn, vendor, surface, model,
                  cwd, repo, branch, machine, cost, cost_basis, usage, turns,
-                 started_at, include_ingest, include_summary=True, subagent_id=""):
+                 started_at, include_ingest, include_summary=True, subagent_id="",
+                 updated_at=""):
     """Register, heartbeat, optional ingest, and optionally the session summary.
 
     The turn's own model wins over the session's first model. Prompt hooks pass
     include_summary=False so a later prompt cannot replace a real summary with
     empty usage. Sync publishes the summary once per file, not once per turn.
+    updated_at is the transcript's last timestamp. turn.timestamp stays the
+    prompt time and is what ingest metadata records.
     """
     model = turn.model or model or "unknown"
     reg_id = "register:" + session_id
@@ -1523,7 +1799,7 @@ def publish_turn(bridge, session_id, turn_index, turn, vendor, surface, model,
     bridge.send("heartbeat", live_id, beat, session_id=session_id, turn_index=turn_index)
     bridge.send("turn", live_id, beat, session_id=session_id, turn_index=turn_index)
     if include_summary:
-        updated = turn.timestamp or started_at or ""
+        updated = updated_at or turn.timestamp or started_at or ""
         bridge.send(
             "ai_sessions", "ai-sessions:" + session_id, ai_sessions_body(
                 session_id, vendor, surface, usage, turns, repo, branch,
@@ -1580,7 +1856,10 @@ def _stream_transcript(path):
     def observe(rec):
         _observe_identity(path, state, rec)
 
-    for index, turn in enumerate(iter_turns(_iter_records(path), on_record=observe), start=1):
+    codex_usage = _path_codex_mode(path)
+    for index, turn in enumerate(
+        iter_turns(_iter_records(path), on_record=observe, codex_usage=codex_usage), start=1,
+    ):
         count = index
         for key in usage:
             usage[key] += int(turn.usage.get(key) or 0)
@@ -1639,6 +1918,7 @@ def _process_hook(bridge, payload, config, runtime, event):
     file_usage = _empty_usage()
     turn_count = 0
     started = ""
+    updated_at = ""
     target = None
     turn_index = 0
     if isinstance(transcript, str) and transcript and Path(transcript).is_file():
@@ -1649,6 +1929,8 @@ def _process_hook(bridge, payload, config, runtime, event):
         if not model:
             model = state["model"]
         started = state["started"]
+        # turn.timestamp is the prompt time. The summary clock is the last record.
+        updated_at = state["updated"] or ""
         if state["cwd"] and not payload.get("cwd") and not payload.get("workspace_roots"):
             cwd = state["cwd"]
             repo, branch = resolve_place(cwd, config)
@@ -1683,17 +1965,25 @@ def _process_hook(bridge, payload, config, runtime, event):
     if not target.model:
         target.model = model
     payload_usage = _payload_tokens(payload)
-    if any(payload_usage.values()):
-        usage = payload_usage
-    elif turn_count:
+    transcript_measured = bool(turn_count) and _any_usage(file_usage)
+    if transcript_measured:
+        # A full transcript already includes every generation. Do not also add
+        # the payload counters, which are one generation and would replace or
+        # double the file total.
+        bridge.store.replace_transcript_usage(session_id, agent_key, file_usage)
         usage = file_usage
+    elif any(payload_usage.values()):
+        bridge.store.save_generation_usage(session_id, generation_id, agent_key, payload_usage)
+        usage = bridge.store.combined_usage(session_id, agent_key)
     else:
-        usage = sum_usage([target])
+        usage = bridge.store.combined_usage(session_id, agent_key)
+        if not _any_usage(usage):
+            usage = file_usage if turn_count else sum_usage([target])
     count = turn_count or turn_index
     publish_turn(
         bridge, ledger_id, turn_index, target, vendor, surface, model,
         cwd, repo, branch, machine, cost, basis, usage, count, started or target.timestamp,
-        include_ingest=target.has_assistant, include_summary=True,
+        include_ingest=target.has_assistant, include_summary=True, updated_at=updated_at,
     )
 
 
@@ -1786,7 +2076,10 @@ def sync_file(bridge, path, config, vendor="", surface=""):
     def observe(rec):
         _observe_identity(path, state, rec)
 
-    turns = list(enumerate(iter_turns(_iter_records(path), on_record=observe), start=1))
+    turns = list(enumerate(
+        iter_turns(_iter_records(path), on_record=observe, codex_usage=_path_codex_mode(path)),
+        start=1,
+    ))
     if not turns:
         return
     cwd = state["cwd"] or str(path.parent)
