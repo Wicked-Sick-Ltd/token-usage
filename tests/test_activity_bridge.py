@@ -2534,6 +2534,457 @@ def test_older_snapshot_cannot_overwrite_a_newer_committed_scan(tmp_path, monkey
         store.close()
 
 
+def test_sync_summary_does_not_reuse_a_later_hooks_index(tmp_path, monkeypatch):
+    path = write_jsonl(tmp_path / "sess-gap.jsonl", [
+        {"role": "user", "content": "one", "ts": "2026-10-25T11:00:00Z"},
+        {
+            "role": "assistant", "content": "uno", "model": "m",
+            "ts": "2026-10-25T11:00:01Z",
+            "usage": {"input_tokens": 10, "output_tokens": 4},
+        },
+    ])
+    poster = FakePoster()
+    config = cfg(tmp_path)
+    armed = {"on": False}
+    original = bridge.publish_turn
+
+    def wrapped(*args, **kwargs):
+        if armed["on"]:
+            armed["on"] = False
+            bridge.process_hook({
+                "hook_event_name": "stop",
+                "conversation_id": "sess-gap",
+                "generation_id": "g-extra",
+                "model": "m",
+                "output": "later",
+                "input_tokens": 5,
+                "output_tokens": 1,
+            }, config, poster, runtime="claude")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(bridge, "publish_turn", wrapped)
+    armed["on"] = True
+    bridge.sync_tree(path, config, poster=poster, vendor="claude")
+    summaries = _summaries(poster, "sess-gap")
+    assert summaries[-1]["input_tokens"] == 15
+    assert not any(body["input_tokens"] == 10 and body["turns"] == 2 for body in summaries)
+    store = bridge.Store(config.state_dir)
+    try:
+        assert store.combined_usage("sess-gap")["input_tokens"] == 15
+    finally:
+        store.close()
+
+
+def test_incomplete_hook_index_cannot_publish_a_stale_total(tmp_path, monkeypatch):
+    path = write_jsonl(tmp_path / "sess-late.jsonl", [
+        {"role": "user", "content": "one", "ts": "2026-10-25T11:00:00Z"},
+        {
+            "role": "assistant", "content": "uno", "model": "m",
+            "ts": "2026-10-25T11:00:01Z",
+            "usage": {"input_tokens": 10, "output_tokens": 4},
+        },
+    ])
+    poster = FakePoster()
+    config = cfg(tmp_path)
+    store = bridge.Store(config.state_dir)
+    try:
+        store.replace_transcript_usage(
+            "sess-late", "", {"input_tokens": 10, "output_tokens": 4}, 1, [1],
+            open_prompt=0,
+        )
+    finally:
+        store.close()
+    entered = threading.Event()
+    release = threading.Event()
+    original_save = bridge.Store.save_generation_usage
+
+    def wrapped_save(self, session_id, generation_id, agent_key, usage, included=False):
+        if generation_id == "g-extra":
+            entered.set()
+            if not release.wait(3):
+                raise TimeoutError("hook save was not released")
+        return original_save(self, session_id, generation_id, agent_key, usage, included)
+
+    monkeypatch.setattr(bridge.Store, "save_generation_usage", wrapped_save)
+
+    def hook():
+        bridge.process_hook({
+            "hook_event_name": "stop",
+            "conversation_id": "sess-late",
+            "generation_id": "g-extra",
+            "model": "m",
+            "output": "later",
+            "input_tokens": 5,
+            "output_tokens": 1,
+        }, config, poster, runtime="claude")
+
+    worker = threading.Thread(target=hook)
+    worker.start()
+    assert entered.wait(3)
+    original_publish = bridge.publish_turn
+    released = {"done": False}
+
+    def wrapped_publish(*args, **kwargs):
+        if not released["done"]:
+            released["done"] = True
+            release.set()
+            worker.join(5)
+        return original_publish(*args, **kwargs)
+
+    monkeypatch.setattr(bridge, "publish_turn", wrapped_publish)
+    bridge.sync_tree(path, config, poster=poster, vendor="claude")
+    worker.join(5)
+    summaries = _summaries(poster, "sess-late")
+    assert summaries[-1]["input_tokens"] == 15
+    assert not any(
+        index > 0 and body["input_tokens"] == 10
+        and summaries[index - 1]["input_tokens"] == 15
+        for index, body in enumerate(summaries)
+    )
+    store = bridge.Store(config.state_dir)
+    try:
+        assert store.combined_usage("sess-late")["input_tokens"] == 15
+    finally:
+        store.close()
+
+
+def test_publication_snapshot_pairs_usage_with_its_revision(tmp_path, monkeypatch):
+    config = cfg(tmp_path)
+    store = bridge.Store(config.state_dir)
+    store.save_generation_usage(
+        "sess-pair", "g", "", {"input_tokens": 10, "output_tokens": 4})
+    done = threading.Event()
+    original = bridge.Store.usage_revision
+
+    def wrapped(self, session_id, agent_key=""):
+        if session_id == "sess-pair" and not done.is_set():
+            def bump():
+                other = bridge.Store(config.state_dir)
+                try:
+                    other.db.execute("PRAGMA busy_timeout=2000")
+                    other.save_generation_usage(
+                        "sess-pair", "g", "", {"input_tokens": 15, "output_tokens": 5})
+                finally:
+                    other.close()
+                    done.set()
+
+            threading.Thread(target=bump).start()
+            done.wait(0.4)
+        return original(self, session_id, agent_key)
+
+    monkeypatch.setattr(bridge.Store, "usage_revision", wrapped)
+    try:
+        usage, _water, revision = store.publication_snapshot("sess-pair", "")
+    finally:
+        store.close()
+    assert done.wait(3) is True
+    assert not (usage["input_tokens"] == 10 and revision >= 2)
+
+
+def test_second_offline_sync_keeps_the_queued_summary(tmp_path):
+    path = write_jsonl(tmp_path / "sess-off.jsonl", [
+        {"role": "user", "content": "one", "ts": "2026-10-25T11:00:00Z"},
+        {
+            "role": "assistant", "content": "uno", "model": "m",
+            "ts": "2026-10-25T11:00:01Z",
+            "usage": {"input_tokens": 10, "output_tokens": 4},
+        },
+    ])
+    poster = FakePoster(fail_substrings=["coord.test", "twin.test"])
+    config = cfg(tmp_path)
+    bridge.sync_tree(path, config, poster=poster, vendor="claude")
+    bridge.sync_tree(path, config, poster=poster, vendor="claude")
+    store = bridge.Store(config.state_dir)
+    try:
+        queued = [row for row in store.pending(20) if row[1] == "ai_sessions"]
+        assert len(queued) == 1
+        assert queued[0][-1] >= 2
+    finally:
+        store.close()
+
+
+def test_spool_conflict_keeps_the_later_publication_version(tmp_path):
+    store = bridge.Store(cfg(tmp_path).state_dir)
+    try:
+        assert store.enqueue(
+            "ai-sessions:s", "ai_sessions", "h15", "coord", "/api/ai-sessions",
+            {"input_tokens": 15}, "", "s", 2, 1, 1, 2,
+        )
+        assert store.enqueue(
+            "ai-sessions:s", "ai_sessions", "h15", "coord", "/api/ai-sessions",
+            {"input_tokens": 15}, "", "s", 1, 1, 1, 4,
+        )
+        queued = [row for row in store.pending(20) if row[1] == "ai_sessions"]
+        assert [(row[8], row[-1]) for row in queued] == [(2, 2)]
+        assert store.enqueue(
+            "ai-sessions:s", "ai_sessions", "h5", "coord", "/api/ai-sessions",
+            {"input_tokens": 5}, "", "s", 2, 1, 1, 1,
+        )
+        queued = [row for row in store.pending(20) if row[2] == "h15"]
+        assert len(queued) == 1
+        assert queued[0][8] == 2 and queued[0][-1] == 2
+    finally:
+        store.close()
+
+
+def _summary_body(incoming):
+    return bridge.ai_sessions_body(
+        "s", "claude", "cli", {"input_tokens": incoming, "output_tokens": 4}, 2,
+        "", "", "2026-10-25T11:00:00Z", "2026-10-25T11:00:01Z", "m", "box", 0.0, "unpriced",
+    )
+
+
+def test_repeated_summary_advances_delivered_revision(tmp_path):
+    poster = FakePoster()
+    opened = bridge.Bridge(cfg(tmp_path), poster=poster)
+    try:
+        fifteen = _summary_body(15)
+        ten = _summary_body(10)
+        assert opened.send("ai_sessions", "ai-sessions:s", fifteen, "s", 2, 1, 1)
+        assert opened.send("ai_sessions", "ai-sessions:s", fifteen, "s", 1, 1, 3)
+        held = opened.store.db.execute(
+            "SELECT turn_index, usage_revision FROM delivered WHERE endpoint='ai_sessions'"
+        ).fetchone()
+        assert held == (2, 1)
+        assert opened.send("ai_sessions", "ai-sessions:s", fifteen, "s", 2, 1, 3)
+        assert len(_summaries(poster, "s")) == 1
+        row = opened.store.db.execute(
+            "SELECT turn_index, usage_revision FROM delivered WHERE endpoint='ai_sessions'"
+        ).fetchone()
+        assert row == (2, 3)
+        assert opened.send("ai_sessions", "ai-sessions:s", ten, "s", 2, 1, 2)
+        assert [body["input_tokens"] for body in _summaries(poster, "s")] == [15]
+    finally:
+        opened.close()
+
+
+def test_flush_advances_a_duplicate_summary_before_an_older_revision(tmp_path):
+    poster = FakePoster()
+    opened = bridge.Bridge(cfg(tmp_path), poster=poster)
+    try:
+        fifteen = _summary_body(15)
+        ten = _summary_body(10)
+        assert opened.send("ai_sessions", "ai-sessions:s", fifteen, "s", 2, 1, 1)
+        assert opened.store.enqueue(
+            "ai-sessions:s", "ai_sessions", bridge._hash(fifteen), "coord", "/api/ai-sessions",
+            fifteen, "offline", "s", 2, 1, 1, 3,
+        )
+        assert opened.store.enqueue(
+            "ai-sessions:s", "ai_sessions", bridge._hash(ten), "coord", "/api/ai-sessions",
+            ten, "offline", "s", 2, 1, 1, 2,
+        )
+        assert opened.flush() == 0
+        assert [body["input_tokens"] for body in _summaries(poster, "s")] == [15]
+        row = opened.store.db.execute(
+            "SELECT usage_revision FROM delivered WHERE endpoint='ai_sessions'"
+        ).fetchone()
+        assert row == (3,)
+    finally:
+        opened.close()
+
+
+def _promote_same_body(config, body, revision):
+    other = bridge.Store(config.state_dir)
+    try:
+        other.enqueue(
+            "ai-sessions:s", "ai_sessions", bridge._hash(body), "coord", "/api/ai-sessions",
+            body, "rescan", "s", 2, 1, 1, revision,
+        )
+    finally:
+        other.close()
+
+
+def test_send_keeps_a_revision_promoted_during_the_post(tmp_path):
+    config = cfg(tmp_path)
+    fifteen = _summary_body(15)
+    ten = _summary_body(10)
+    poster = FakePoster()
+    promoted = {"done": False}
+
+    def sending(url, body, token, timeout):
+        if not promoted["done"] and url.endswith("/api/ai-sessions"):
+            promoted["done"] = True
+            _promote_same_body(config, fifteen, 3)
+        return poster(url, body, token, timeout)
+
+    opened = bridge.Bridge(config, poster=sending)
+    try:
+        assert opened.send("ai_sessions", "ai-sessions:s", fifteen, "s", 2, 1, 1)
+        row = opened.store.db.execute(
+            "SELECT usage_revision FROM delivered WHERE endpoint='ai_sessions'"
+        ).fetchone()
+        assert row == (3,)
+        assert opened.store.pending_count() == 0
+        assert opened.send("ai_sessions", "ai-sessions:s", ten, "s", 2, 1, 2)
+        assert [body["input_tokens"] for body in _summaries(poster, "s")] == [15]
+    finally:
+        opened.close()
+
+
+def test_flush_keeps_a_revision_promoted_during_the_post(tmp_path):
+    config = cfg(tmp_path)
+    fifteen = _summary_body(15)
+    ten = _summary_body(10)
+    poster = FakePoster()
+    promoted = {"done": False}
+
+    def sending(url, body, token, timeout):
+        if not promoted["done"] and url.endswith("/api/ai-sessions"):
+            promoted["done"] = True
+            _promote_same_body(config, fifteen, 3)
+        return poster(url, body, token, timeout)
+
+    opened = bridge.Bridge(config, poster=sending)
+    try:
+        assert opened.store.enqueue(
+            "ai-sessions:s", "ai_sessions", bridge._hash(fifteen), "coord", "/api/ai-sessions",
+            fifteen, "offline", "s", 2, 1, 1, 1,
+        )
+        assert opened.flush() == 1
+        row = opened.store.db.execute(
+            "SELECT usage_revision FROM delivered WHERE endpoint='ai_sessions'"
+        ).fetchone()
+        assert row == (3,)
+        assert opened.store.pending_count() == 0
+        assert opened.send("ai_sessions", "ai-sessions:s", ten, "s", 2, 1, 2)
+        assert [body["input_tokens"] for body in _summaries(poster, "s")] == [15]
+    finally:
+        opened.close()
+
+
+def test_flush_keeps_a_summary_promoted_after_it_was_fetched(tmp_path, monkeypatch):
+    config = cfg(tmp_path)
+    fifteen = _summary_body(15)
+    digest = bridge._hash(fifteen)
+    poster = FakePoster()
+    opened = bridge.Bridge(config, poster=poster)
+    promoted = {"done": False}
+    armed = {"on": False}
+    original = bridge.Store.newer_delivered
+
+    def wrapped(self, session_id, endpoint, turn_index, stage=0, usage_revision=0):
+        if (
+            armed["on"] and not promoted["done"] and endpoint == "ai_sessions"
+            and int(usage_revision or 0) == 1
+        ):
+            promoted["done"] = True
+            other = bridge.Store(config.state_dir)
+            try:
+                other.mark_delivered(
+                    "ai-sessions:s", "ai_sessions", digest, "s", 2, 1, 1, 2)
+                other.enqueue(
+                    "ai-sessions:s", "ai_sessions", digest, "coord", "/api/ai-sessions",
+                    fifteen, "rescan", "s", 2, 1, 1, 3,
+                )
+            finally:
+                other.close()
+        return original(self, session_id, endpoint, turn_index, stage, usage_revision)
+
+    monkeypatch.setattr(bridge.Store, "newer_delivered", wrapped)
+    try:
+        assert opened.store.enqueue(
+            "ai-sessions:s", "ai_sessions", digest, "coord", "/api/ai-sessions",
+            fifteen, "offline", "s", 2, 1, 1, 1,
+        )
+        armed["on"] = True
+        assert opened.flush() == 0
+        queued = [row for row in opened.store.pending(10) if row[1] == "ai_sessions"]
+        assert [(row[8], row[-1]) for row in queued] == [(2, 3)]
+    finally:
+        opened.close()
+
+
+def test_flush_duplicate_keeps_a_revision_promoted_after_the_fetch(tmp_path, monkeypatch):
+    config = cfg(tmp_path)
+    fifteen = _summary_body(15)
+    ten = _summary_body(10)
+    digest = bridge._hash(fifteen)
+    poster = FakePoster()
+    opened = bridge.Bridge(config, poster=poster)
+    promoted = {"done": False}
+    original = bridge.Store.is_delivered
+
+    def wrapped(self, source_id, endpoint, content_hash):
+        found = original(self, source_id, endpoint, content_hash)
+        if found and not promoted["done"] and endpoint == "ai_sessions":
+            promoted["done"] = True
+            other = bridge.Store(config.state_dir)
+            try:
+                other.enqueue(
+                    "ai-sessions:s", "ai_sessions", digest, "coord", "/api/ai-sessions",
+                    fifteen, "rescan", "s", 2, 1, 1, 4,
+                )
+            finally:
+                other.close()
+        return found
+
+    monkeypatch.setattr(bridge.Store, "is_delivered", wrapped)
+    try:
+        opened.store.mark_delivered(
+            "ai-sessions:s", "ai_sessions", digest, "s", 2, 1, 1, 1)
+        assert opened.store.enqueue(
+            "ai-sessions:s", "ai_sessions", digest, "coord", "/api/ai-sessions",
+            fifteen, "offline", "s", 2, 1, 1, 2,
+        )
+        assert opened.flush() == 0
+        row = opened.store.db.execute(
+            "SELECT usage_revision FROM delivered WHERE endpoint='ai_sessions'"
+        ).fetchone()
+        assert row == (4,)
+        assert opened.store.pending_count() == 0
+        assert opened.send("ai_sessions", "ai-sessions:s", ten, "s", 2, 1, 3) is True
+        assert _summaries(poster, "s") == []
+    finally:
+        opened.close()
+
+
+def test_retry_publishes_summary_at_the_captured_high_water(tmp_path, monkeypatch):
+    path = write_jsonl(tmp_path / "sess-early.jsonl", [
+        {"role": "user", "content": "one", "ts": "2026-10-25T11:00:00Z"},
+        {
+            "role": "assistant", "content": "uno", "model": "m",
+            "ts": "2026-10-25T11:00:01Z",
+            "usage": {"input_tokens": 10, "output_tokens": 4},
+        },
+    ])
+    poster = FakePoster()
+    config = cfg(tmp_path)
+    store = bridge.Store(config.state_dir)
+    try:
+        store.ensure_turn("sess-early", "", "g-old", "2026-10-25T11:00:00Z")
+        store.ensure_turn("sess-early", "", "g-later", "2026-10-25T11:00:02Z")
+    finally:
+        store.close()
+    armed = {"on": False}
+    original = bridge.publish_turn
+
+    def wrapped(*args, **kwargs):
+        if armed["on"]:
+            armed["on"] = False
+            bridge.process_hook({
+                "hook_event_name": "stop",
+                "conversation_id": "sess-early",
+                "generation_id": "g-old",
+                "model": "m",
+                "output": "later",
+                "input_tokens": 5,
+                "output_tokens": 1,
+            }, config, poster, runtime="claude")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(bridge, "publish_turn", wrapped)
+    armed["on"] = True
+    bridge.sync_tree(path, config, poster=poster, vendor="claude")
+    summaries = _summaries(poster, "sess-early")
+    assert summaries[-1]["input_tokens"] == 15
+    assert summaries[-1]["turns"] == 1
+    beats = [
+        call["body"]["turn_index"] for call in poster.calls
+        if call["url"].endswith("/session/heartbeat") and call["body"].get("last_output") == "later"
+    ]
+    assert beats == [1]
+
+
 def test_existing_turn_map_gains_transcript_turn(tmp_path):
     state = tmp_path / "state"
     state.mkdir()
@@ -2571,10 +3022,12 @@ def test_existing_turn_map_gains_transcript_turn(tmp_path):
         assert row == (3, 0)
         water_cols = [row[1] for row in store.db.execute("PRAGMA table_info(turn_high_water)")]
         assert "open_prompt" in water_cols
+        assert "usage_revision" in water_cols
         opened = store.db.execute(
-            "SELECT high_water, open_prompt FROM turn_high_water WHERE session_id='s'"
+            "SELECT high_water, open_prompt, usage_revision FROM turn_high_water "
+            "WHERE session_id='s'"
         ).fetchone()
-        assert opened == (3, 0)
+        assert opened == (3, 0, 0)
     finally:
         store.close()
 

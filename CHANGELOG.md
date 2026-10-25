@@ -61,7 +61,23 @@ adheres to [Semantic Versioning](https://semver.org/).
   still publishes the combined total when a payload has already allocated past
   the file. A counter-free snapshot records its length without replacing
   retained counters, and the freshness read shares the snapshot's immediate
-  transaction so an older scan cannot overwrite a newer one.
+  transaction so an older scan cannot overwrite a newer one. A sync captures
+  the combined total and its publication index together, so a hook that lands
+  during the post cannot attach the stale total to the hook's newer index.
+  Counter writes advance `usage_revision` in the same transaction, so a total
+  read before those counters cannot be delivered as the later completion.
+  A hook reads that total and revision together. An offline rescan of an
+  unchanged transcript updates the queued summary to the newer revision
+  instead of deleting it. The queued version is the later turn index, stage,
+  and revision, so a higher revision at an older index cannot demote it. A
+  repeated summary body advances the delivered revision without posting
+  again. The hook publishes that summary at the high water captured with
+  the counters; the body and the heartbeat stay on the generation's turn.
+  Acknowledging a post keeps the later queued or delivered version of that
+  same body when a rescan raises it during the request. A flush drops a stale
+  queued row only when that row still has the version it fetched, and a
+  duplicate already delivered is acknowledged the same way so a promotion
+  after the fetch is kept.
 
 ## [0.9.0] — 2026-10-18
 
