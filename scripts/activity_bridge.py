@@ -1088,7 +1088,7 @@ def iter_turns(records, on_record=None):
     def close():
         nonlocal current
         if current is None:
-            return
+            return None
         for bucket in current.request_usage.values():
             current.add_usage(bucket)
         current.request_usage = {}
