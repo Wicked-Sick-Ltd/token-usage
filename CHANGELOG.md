@@ -68,7 +68,11 @@ adheres to [Semantic Versioning](https://semver.org/).
   read before those counters cannot be delivered as the later completion.
   A hook reads that total and revision together. An offline rescan of an
   unchanged transcript updates the queued summary to the newer revision
-  instead of deleting it.
+  instead of deleting it. The queued version is the later turn index, stage,
+  and revision, so a higher revision at an older index cannot demote it. A
+  repeated summary body advances the delivered revision without posting
+  again. The hook publishes that summary at the high water captured with
+  the counters; the body and the heartbeat stay on the generation's turn.
 
 ## [0.9.0] — 2026-10-18
 

@@ -2703,6 +2703,133 @@ def test_second_offline_sync_keeps_the_queued_summary(tmp_path):
         store.close()
 
 
+def test_spool_conflict_keeps_the_later_publication_version(tmp_path):
+    store = bridge.Store(cfg(tmp_path).state_dir)
+    try:
+        assert store.enqueue(
+            "ai-sessions:s", "ai_sessions", "h15", "coord", "/api/ai-sessions",
+            {"input_tokens": 15}, "", "s", 2, 1, 1, 2,
+        )
+        assert store.enqueue(
+            "ai-sessions:s", "ai_sessions", "h15", "coord", "/api/ai-sessions",
+            {"input_tokens": 15}, "", "s", 1, 1, 1, 4,
+        )
+        queued = [row for row in store.pending(20) if row[1] == "ai_sessions"]
+        assert [(row[8], row[-1]) for row in queued] == [(2, 2)]
+        assert store.enqueue(
+            "ai-sessions:s", "ai_sessions", "h5", "coord", "/api/ai-sessions",
+            {"input_tokens": 5}, "", "s", 2, 1, 1, 1,
+        )
+        queued = [row for row in store.pending(20) if row[2] == "h15"]
+        assert len(queued) == 1
+        assert queued[0][8] == 2 and queued[0][-1] == 2
+    finally:
+        store.close()
+
+
+def _summary_body(incoming):
+    return bridge.ai_sessions_body(
+        "s", "claude", "cli", {"input_tokens": incoming, "output_tokens": 4}, 2,
+        "", "", "2026-10-25T11:00:00Z", "2026-10-25T11:00:01Z", "m", "box", 0.0, "unpriced",
+    )
+
+
+def test_repeated_summary_advances_delivered_revision(tmp_path):
+    poster = FakePoster()
+    opened = bridge.Bridge(cfg(tmp_path), poster=poster)
+    try:
+        fifteen = _summary_body(15)
+        ten = _summary_body(10)
+        assert opened.send("ai_sessions", "ai-sessions:s", fifteen, "s", 2, 1, 1)
+        assert opened.send("ai_sessions", "ai-sessions:s", fifteen, "s", 1, 1, 3)
+        held = opened.store.db.execute(
+            "SELECT turn_index, usage_revision FROM delivered WHERE endpoint='ai_sessions'"
+        ).fetchone()
+        assert held == (2, 1)
+        assert opened.send("ai_sessions", "ai-sessions:s", fifteen, "s", 2, 1, 3)
+        assert len(_summaries(poster, "s")) == 1
+        row = opened.store.db.execute(
+            "SELECT turn_index, usage_revision FROM delivered WHERE endpoint='ai_sessions'"
+        ).fetchone()
+        assert row == (2, 3)
+        assert opened.send("ai_sessions", "ai-sessions:s", ten, "s", 2, 1, 2)
+        assert [body["input_tokens"] for body in _summaries(poster, "s")] == [15]
+    finally:
+        opened.close()
+
+
+def test_flush_advances_a_duplicate_summary_before_an_older_revision(tmp_path):
+    poster = FakePoster()
+    opened = bridge.Bridge(cfg(tmp_path), poster=poster)
+    try:
+        fifteen = _summary_body(15)
+        ten = _summary_body(10)
+        assert opened.send("ai_sessions", "ai-sessions:s", fifteen, "s", 2, 1, 1)
+        assert opened.store.enqueue(
+            "ai-sessions:s", "ai_sessions", bridge._hash(fifteen), "coord", "/api/ai-sessions",
+            fifteen, "offline", "s", 2, 1, 1, 3,
+        )
+        assert opened.store.enqueue(
+            "ai-sessions:s", "ai_sessions", bridge._hash(ten), "coord", "/api/ai-sessions",
+            ten, "offline", "s", 2, 1, 1, 2,
+        )
+        assert opened.flush() == 0
+        assert [body["input_tokens"] for body in _summaries(poster, "s")] == [15]
+        row = opened.store.db.execute(
+            "SELECT usage_revision FROM delivered WHERE endpoint='ai_sessions'"
+        ).fetchone()
+        assert row == (3,)
+    finally:
+        opened.close()
+
+
+def test_retry_publishes_summary_at_the_captured_high_water(tmp_path, monkeypatch):
+    path = write_jsonl(tmp_path / "sess-early.jsonl", [
+        {"role": "user", "content": "one", "ts": "2026-10-25T11:00:00Z"},
+        {
+            "role": "assistant", "content": "uno", "model": "m",
+            "ts": "2026-10-25T11:00:01Z",
+            "usage": {"input_tokens": 10, "output_tokens": 4},
+        },
+    ])
+    poster = FakePoster()
+    config = cfg(tmp_path)
+    store = bridge.Store(config.state_dir)
+    try:
+        store.ensure_turn("sess-early", "", "g-old", "2026-10-25T11:00:00Z")
+        store.ensure_turn("sess-early", "", "g-later", "2026-10-25T11:00:02Z")
+    finally:
+        store.close()
+    armed = {"on": False}
+    original = bridge.publish_turn
+
+    def wrapped(*args, **kwargs):
+        if armed["on"]:
+            armed["on"] = False
+            bridge.process_hook({
+                "hook_event_name": "stop",
+                "conversation_id": "sess-early",
+                "generation_id": "g-old",
+                "model": "m",
+                "output": "later",
+                "input_tokens": 5,
+                "output_tokens": 1,
+            }, config, poster, runtime="claude")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(bridge, "publish_turn", wrapped)
+    armed["on"] = True
+    bridge.sync_tree(path, config, poster=poster, vendor="claude")
+    summaries = _summaries(poster, "sess-early")
+    assert summaries[-1]["input_tokens"] == 15
+    assert summaries[-1]["turns"] == 1
+    beats = [
+        call["body"]["turn_index"] for call in poster.calls
+        if call["url"].endswith("/session/heartbeat") and call["body"].get("last_output") == "later"
+    ]
+    assert beats == [1]
+
+
 def test_existing_turn_map_gains_transcript_turn(tmp_path):
     state = tmp_path / "state"
     state.mkdir()
