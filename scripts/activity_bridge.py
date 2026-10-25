@@ -808,21 +808,53 @@ class Store:
             usage_turns = list(range(1, covered_turns + 1))
         else:
             usage_turns = [int(index) for index in usage_turns if int(index) > 0]
-        row = self.db.execute(
-            "SELECT covered_turns FROM generation_usage "
-            "WHERE session_id=? AND agent_key=? AND generation_id=?",
-            (session_id, agent_key, _TRANSCRIPT_GENERATION),
-        ).fetchone()
-        if row is not None and int(row[0] or 0) > covered_turns:
+        # The freshness read and every snapshot write share one immediate
+        # transaction. An older scan that already passed the check cannot
+        # commit after a newer scan, and a counter-free file still records
+        # its length so a later shorter scan is rejected.
+        if self.db.in_transaction:
+            self.db.rollback()
+        self.db.execute("BEGIN IMMEDIATE")
+        stored_turns = self._stored_covered_turns(session_id, agent_key)
+        if stored_turns is not None and stored_turns > covered_turns:
+            self.db.rollback()
             return False
         if apply_usage:
             self._replace_transcript_counters(
                 session_id, agent_key, usage, covered_turns, usage_turns)
+        else:
+            self._remember_snapshot_length(session_id, agent_key, covered_turns)
         self._write_high_water(session_id, agent_key, covered_turns)
         if open_prompt is not None:
             self._write_open_prompt(session_id, agent_key, open_prompt)
         self.db.commit()
         return True
+
+    def _stored_covered_turns(self, session_id, agent_key):
+        """Covered length of the retained snapshot, or None when none is stored."""
+        row = self.db.execute(
+            "SELECT covered_turns FROM generation_usage "
+            "WHERE session_id=? AND agent_key=? AND generation_id=?",
+            (session_id, agent_key, _TRANSCRIPT_GENERATION),
+        ).fetchone()
+        if row is None:
+            return None
+        return int(row[0] or 0)
+
+    def _remember_snapshot_length(self, session_id, agent_key, covered_turns):
+        """Record an accepted length without replacing counters already stored."""
+        self.db.execute(
+            """
+            INSERT INTO generation_usage (
+                session_id, generation_id, agent_key,
+                input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+                in_transcript, covered_turns
+            ) VALUES (?, ?, ?, 0, 0, 0, 0, 0, ?)
+            ON CONFLICT(session_id, generation_id, agent_key) DO UPDATE SET
+                covered_turns = MAX(generation_usage.covered_turns, excluded.covered_turns)
+            """,
+            (session_id, _TRANSCRIPT_GENERATION, agent_key, int(covered_turns or 0)),
+        )
 
     def _replace_transcript_counters(self, session_id, agent_key, usage, covered_turns,
                                      usage_turns):

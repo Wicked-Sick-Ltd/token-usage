@@ -2393,6 +2393,147 @@ def test_shorter_snapshot_does_not_reopen_a_passed_turn(tmp_path):
         store.close()
 
 
+def test_counter_free_snapshot_length_blocks_a_shorter_reopen(tmp_path):
+    full = []
+    for index, (text, ts) in enumerate((
+        ("one", "2026-10-25T11:00:00Z"),
+        ("two", "2026-10-25T11:01:00Z"),
+        ("three", "2026-10-25T11:02:00Z"),
+    ), start=1):
+        full.extend([
+            {"role": "user", "content": text, "ts": ts},
+            {"role": "assistant", "content": text + "-a", "model": "m", "ts": ts},
+        ])
+    path = write_jsonl(tmp_path / "sess-length.jsonl", full)
+    poster = FakePoster()
+    config = cfg(tmp_path)
+    bridge.sync_tree(path, config, poster=poster, vendor="claude")
+    write_jsonl(path, [
+        {"role": "user", "content": "one", "ts": "2026-10-25T11:00:00Z"},
+        {"role": "assistant", "content": "one-a", "model": "m", "ts": "2026-10-25T11:00:01Z"},
+        {"role": "user", "content": "two", "ts": "2026-10-25T11:01:00Z"},
+    ])
+    bridge.sync_tree(path, config, poster=poster, vendor="claude")
+    bridge.process_hook({
+        "hook_event_name": "stop",
+        "conversation_id": "sess-length",
+        "generation_id": "g-extra",
+        "model": "m",
+        "output": "extra",
+        "input_tokens": 7,
+        "output_tokens": 1,
+    }, config, poster, runtime="claude")
+    measured = []
+    for text, ts, incoming in (
+        ("one", "2026-10-25T11:00:00Z", 10),
+        ("two", "2026-10-25T11:01:00Z", 5),
+        ("three", "2026-10-25T11:02:00Z", 0),
+    ):
+        assistant = {"role": "assistant", "content": text + "-a", "model": "m", "ts": ts}
+        if incoming:
+            assistant["usage"] = {"input_tokens": incoming, "output_tokens": 1}
+        measured.extend([
+            {"role": "user", "content": text, "ts": ts},
+            assistant,
+        ])
+    write_jsonl(path, measured)
+    bridge.sync_tree(path, config, poster=poster, vendor="claude")
+    summary = _summaries(poster, "sess-length")[-1]
+    assert summary["input_tokens"] == 22
+    store = bridge.Store(config.state_dir)
+    try:
+        opened = store.db.execute(
+            "SELECT open_prompt FROM turn_high_water WHERE session_id=?",
+            ("sess-length",),
+        ).fetchone()
+        assert opened[0] == 0
+        row = store.db.execute(
+            "SELECT transcript_turn, in_transcript FROM turn_map "
+            "JOIN generation_usage USING (session_id, agent_key, generation_id) "
+            "WHERE session_id=? AND generation_id=?",
+            ("sess-length", "g-extra"),
+        ).fetchone()
+        assert row == (0, 0)
+        assert store.combined_usage("sess-length")["input_tokens"] == 22
+    finally:
+        store.close()
+
+
+def test_older_snapshot_cannot_overwrite_a_newer_committed_scan(tmp_path, monkeypatch):
+    config = cfg(tmp_path)
+    bridge.Store(config.state_dir).close()
+    entered = threading.Event()
+    release = threading.Event()
+    started = threading.Event()
+    finished = threading.Event()
+    seen = {}
+    original = bridge.Store._stored_covered_turns
+
+    def wrapped(self, session_id, agent_key=""):
+        if session_id == "sess-race" and getattr(self, "_pending_cover", 0) == 2:
+            seen["in_transaction"] = self.db.in_transaction
+        value = original(self, session_id, agent_key)
+        if session_id == "sess-race" and getattr(self, "_pending_cover", 0) == 2:
+            entered.set()
+            if not release.wait(3):
+                raise TimeoutError("older snapshot held the lock")
+        return value
+
+    monkeypatch.setattr(bridge.Store, "_stored_covered_turns", wrapped)
+    ten = {"input_tokens": 10, "output_tokens": 4, "cache_read_tokens": 0, "cache_write_tokens": 0}
+    fifteen = {"input_tokens": 15, "output_tokens": 5, "cache_read_tokens": 0, "cache_write_tokens": 0}
+
+    def older():
+        local = bridge.Store(config.state_dir)
+        local._pending_cover = 2
+        try:
+            local.replace_transcript_usage(
+                "sess-race", "", ten, 2, [1], open_prompt=2)
+        finally:
+            local.close()
+
+    def newer():
+        local = bridge.Store(config.state_dir)
+        local.db.execute("PRAGMA busy_timeout=5000")
+        local._pending_cover = 3
+        started.set()
+        try:
+            local.replace_transcript_usage(
+                "sess-race", "", fifteen, 3, [1, 2], open_prompt=0)
+        finally:
+            local.close()
+            finished.set()
+
+    first = threading.Thread(target=older)
+    second = threading.Thread(target=newer)
+    first.start()
+    assert entered.wait(3)
+    second.start()
+    assert started.wait(3)
+    threading.Event().wait(0.2)
+    assert finished.is_set() is False
+    release.set()
+    first.join(5)
+    second.join(5)
+    assert finished.is_set() is True
+    assert seen["in_transaction"] is True
+    store = bridge.Store(config.state_dir)
+    try:
+        row = store.db.execute(
+            "SELECT input_tokens, covered_turns FROM generation_usage "
+            "WHERE session_id=? AND generation_id=?",
+            ("sess-race", bridge._TRANSCRIPT_GENERATION),
+        ).fetchone()
+        assert row == (15, 3)
+        opened = store.db.execute(
+            "SELECT open_prompt FROM turn_high_water WHERE session_id=?",
+            ("sess-race",),
+        ).fetchone()
+        assert opened[0] == 0
+    finally:
+        store.close()
+
+
 def test_existing_turn_map_gains_transcript_turn(tmp_path):
     state = tmp_path / "state"
     state.mkdir()

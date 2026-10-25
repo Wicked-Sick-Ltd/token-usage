@@ -59,7 +59,9 @@ adheres to [Semantic Versioning](https://semver.org/).
   no assistant is open, and a shorter snapshot does not reopen one. A rejected
   shorter snapshot does not mark the generation included. An accepted rescan
   still publishes the combined total when a payload has already allocated past
-  the file.
+  the file. A counter-free snapshot records its length without replacing
+  retained counters, and the freshness read shares the snapshot's immediate
+  transaction so an older scan cannot overwrite a newer one.
 
 ## [0.9.0] — 2026-10-18
 
