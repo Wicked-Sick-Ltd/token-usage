@@ -549,6 +549,7 @@ class Store:
                 agent_key TEXT NOT NULL DEFAULT '',
                 high_water INTEGER NOT NULL DEFAULT 0,
                 started_at TEXT NOT NULL DEFAULT '',
+                open_prompt INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (session_id, agent_key)
             );
             """
@@ -608,6 +609,11 @@ class Store:
         if map_cols and "transcript_turn" not in map_cols:
             self.db.execute(
                 "ALTER TABLE turn_map ADD COLUMN transcript_turn INTEGER NOT NULL DEFAULT 0"
+            )
+        water_cols = self._columns("turn_high_water")
+        if water_cols and "open_prompt" not in water_cols:
+            self.db.execute(
+                "ALTER TABLE turn_high_water ADD COLUMN open_prompt INTEGER NOT NULL DEFAULT 0"
             )
 
     def close(self):
@@ -935,6 +941,33 @@ class Store:
         self._write_high_water(session_id, agent_key, count)
         self.db.commit()
 
+    def note_open_prompt(self, session_id, agent_key, turn_index):
+        """Remember a trailing turn that has no counters yet, or clear it.
+
+        The next new payload generation can claim that turn. A generation
+        allocated after the turn already has counters must not claim it.
+        """
+        agent_key = agent_key or ""
+        self.db.execute(
+            """
+            INSERT INTO turn_high_water (
+                session_id, agent_key, high_water, started_at, open_prompt
+            ) VALUES (?, ?, 0, '', ?)
+            ON CONFLICT(session_id, agent_key) DO UPDATE SET
+                open_prompt = excluded.open_prompt
+            """,
+            (session_id, agent_key, int(turn_index or 0)),
+        )
+        self.db.commit()
+
+    def transcript_turn_for(self, session_id, agent_key, generation_id):
+        row = self.db.execute(
+            "SELECT transcript_turn FROM turn_map "
+            "WHERE session_id=? AND agent_key=? AND generation_id=?",
+            (session_id, agent_key or "", generation_id),
+        ).fetchone()
+        return int(row[0] or 0) if row else 0
+
     def bind_turn(self, session_id, agent_key, generation_id, turn_index):
         """Map a generation onto a transcript turn index without lowering either."""
         agent_key = agent_key or ""
@@ -1000,10 +1033,29 @@ class Store:
                     self.db.commit()
                     return index, stored
                 index = self.high_water(session_id, agent_key) + 1
+                # The first payload after an open prompt belongs to that turn.
+                # A second generation must not claim it, or its counters would
+                # disappear once the prompt gains usage.
+                open_row = self.db.execute(
+                    "SELECT open_prompt FROM turn_high_water "
+                    "WHERE session_id=? AND agent_key=?",
+                    (session_id, agent_key),
+                ).fetchone()
+                open_prompt = int(open_row[0] or 0) if open_row else 0
+                transcript_turn = 0
+                if open_prompt:
+                    taken = self.db.execute(
+                        "SELECT 1 FROM turn_map WHERE session_id=? AND agent_key=? "
+                        "AND transcript_turn=? LIMIT 1",
+                        (session_id, agent_key, open_prompt),
+                    ).fetchone()
+                    if not taken:
+                        transcript_turn = open_prompt
                 self.db.execute(
-                    "INSERT INTO turn_map (session_id, agent_key, generation_id, turn_index, seen_at) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (session_id, agent_key, generation_id, index, seen_at or ""),
+                    "INSERT INTO turn_map ("
+                    "session_id, agent_key, generation_id, turn_index, seen_at, transcript_turn"
+                    ") VALUES (?, ?, ?, ?, ?, ?)",
+                    (session_id, agent_key, generation_id, index, seen_at or "", transcript_turn),
                 )
                 self._write_high_water(session_id, agent_key, index)
                 self.db.commit()
@@ -2319,27 +2371,27 @@ def _stream_transcript(path):
     return state, usage, count, last, last_index, updated, usage_turns
 
 
-def _transcript_covers_generation(transcript_turn, allocated_index, usage_turns, turn_count):
-    """True when the transcript total already includes this generation.
+def _coverage_turn(reader_turn, allocated_index, usage_turns, turn_count, stored_turn=0):
+    """Transcript turn this snapshot already counts, or 0 when it does not.
 
-    The allocated index is the stable source id and is not lowered when a
-    later transcript turn is behind it. Coverage still follows the turn the
-    reader assigned: if that turn is the end of this snapshot and it has
-    counters, the generation is included even though its source id is higher.
-    A trailing prompt keeps an earlier assistant turn from covering a
-    generation the file has not accounted for yet.
+    The allocated index is the stable source id. A stored association from the
+    open prompt wins when that turn now has counters, including when a later
+    prompt has made the snapshot longer than the publication index. Otherwise
+    the reader's turn counts only when it is the end of this snapshot, so a
+    trailing prompt cannot treat an earlier assistant turn as coverage.
     """
     covered = {int(index) for index in usage_turns or []}
-    transcript_turn = int(transcript_turn or 0)
+    reader_turn = int(reader_turn or 0)
     allocated_index = int(allocated_index or 0)
     turn_count = int(turn_count or 0)
+    stored_turn = int(stored_turn or 0)
     if allocated_index in covered:
-        return True
-    return (
-        transcript_turn in covered
-        and transcript_turn == turn_count
-        and allocated_index > turn_count
-    )
+        return reader_turn if reader_turn in covered else allocated_index
+    if stored_turn in covered and stored_turn <= turn_count:
+        return stored_turn
+    if reader_turn in covered and reader_turn == turn_count and allocated_index > turn_count:
+        return reader_turn
+    return 0
 
 
 def _process_hook(bridge, payload, config, runtime, event):
@@ -2409,6 +2461,8 @@ def _process_hook(bridge, payload, config, runtime, event):
         updated_at = state["updated"] or ""
         if turn_count:
             bridge.store.note_high_water(session_id, agent_key, turn_count)
+            open_prompt = turn_count if turn_count not in usage_turns else 0
+            bridge.store.note_open_prompt(session_id, agent_key, open_prompt)
         if turn_index:
             transcript_turn = int(turn_index)
             turn_index = bridge.store.bind_turn(session_id, agent_key, generation_id, turn_index)
@@ -2459,20 +2513,20 @@ def _process_hook(bridge, payload, config, runtime, event):
         # Generations past the snapshot's turn count stay additive. The stored
         # counters stay raw; Cursor normalization happens when a generation is summed.
         # bind_turn will not lower an index allocated before this turn existed.
-        # The reader's turn is stored only when this snapshot is accepted and
-        # actually covers the generation. A partial file cannot pin coverage
-        # to an earlier assistant turn, and a rejected shorter scan cannot
-        # replace a turn already stored. Later syncs mark from that stored turn.
-        covered_by_transcript = _transcript_covers_generation(
-            transcript_turn, turn_index, usage_turns, turn_count)
+        # A rejected shorter snapshot must not set inclusion: its reader turn
+        # can look covered while the retained baseline never counted this
+        # generation. Remember the covering turn only when the snapshot is kept.
+        stored_turn = bridge.store.transcript_turn_for(session_id, agent_key, generation_id)
+        coverage_turn = _coverage_turn(
+            transcript_turn, turn_index, usage_turns, turn_count, stored_turn)
         accepted = bridge.store.replace_transcript_usage(
             session_id, agent_key, file_usage, turn_count, usage_turns)
-        if accepted and covered_by_transcript and transcript_turn:
+        if accepted and coverage_turn:
             bridge.store.remember_transcript_turn(
-                session_id, agent_key, generation_id, transcript_turn)
+                session_id, agent_key, generation_id, coverage_turn)
         bridge.store.save_generation_usage(
             session_id, generation_id, agent_key, payload_usage or _empty_usage(),
-            included=covered_by_transcript,
+            included=bool(accepted and coverage_turn),
         )
         usage = bridge.store.combined_usage(session_id, agent_key, cursor=cursor_payload)
     elif any(payload_usage.values()):
@@ -2630,6 +2684,8 @@ def sync_file(bridge, path, config, vendor="", surface=""):
     session = _ledger_id(clean_id(session_id, path.stem), agent_key)
     usage_turns = [index for index, turn in turns if _any_usage(turn.usage)]
     bridge.store.note_high_water(session_id, agent_key, len(turns))
+    open_prompt = len(turns) if len(turns) not in usage_turns else 0
+    bridge.store.note_open_prompt(session_id, agent_key, open_prompt)
     if usage_turns:
         bridge.store.replace_transcript_usage(
             session_id, agent_key, usage, len(turns), usage_turns)
