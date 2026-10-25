@@ -2852,6 +2852,92 @@ def test_flush_keeps_a_revision_promoted_during_the_post(tmp_path):
         opened.close()
 
 
+def test_flush_keeps_a_summary_promoted_after_it_was_fetched(tmp_path, monkeypatch):
+    config = cfg(tmp_path)
+    fifteen = _summary_body(15)
+    digest = bridge._hash(fifteen)
+    poster = FakePoster()
+    opened = bridge.Bridge(config, poster=poster)
+    promoted = {"done": False}
+    armed = {"on": False}
+    original = bridge.Store.newer_delivered
+
+    def wrapped(self, session_id, endpoint, turn_index, stage=0, usage_revision=0):
+        if (
+            armed["on"] and not promoted["done"] and endpoint == "ai_sessions"
+            and int(usage_revision or 0) == 1
+        ):
+            promoted["done"] = True
+            other = bridge.Store(config.state_dir)
+            try:
+                other.mark_delivered(
+                    "ai-sessions:s", "ai_sessions", digest, "s", 2, 1, 1, 2)
+                other.enqueue(
+                    "ai-sessions:s", "ai_sessions", digest, "coord", "/api/ai-sessions",
+                    fifteen, "rescan", "s", 2, 1, 1, 3,
+                )
+            finally:
+                other.close()
+        return original(self, session_id, endpoint, turn_index, stage, usage_revision)
+
+    monkeypatch.setattr(bridge.Store, "newer_delivered", wrapped)
+    try:
+        assert opened.store.enqueue(
+            "ai-sessions:s", "ai_sessions", digest, "coord", "/api/ai-sessions",
+            fifteen, "offline", "s", 2, 1, 1, 1,
+        )
+        armed["on"] = True
+        assert opened.flush() == 0
+        queued = [row for row in opened.store.pending(10) if row[1] == "ai_sessions"]
+        assert [(row[8], row[-1]) for row in queued] == [(2, 3)]
+    finally:
+        opened.close()
+
+
+def test_flush_duplicate_keeps_a_revision_promoted_after_the_fetch(tmp_path, monkeypatch):
+    config = cfg(tmp_path)
+    fifteen = _summary_body(15)
+    ten = _summary_body(10)
+    digest = bridge._hash(fifteen)
+    poster = FakePoster()
+    opened = bridge.Bridge(config, poster=poster)
+    promoted = {"done": False}
+    original = bridge.Store.is_delivered
+
+    def wrapped(self, source_id, endpoint, content_hash):
+        found = original(self, source_id, endpoint, content_hash)
+        if found and not promoted["done"] and endpoint == "ai_sessions":
+            promoted["done"] = True
+            other = bridge.Store(config.state_dir)
+            try:
+                other.enqueue(
+                    "ai-sessions:s", "ai_sessions", digest, "coord", "/api/ai-sessions",
+                    fifteen, "rescan", "s", 2, 1, 1, 4,
+                )
+            finally:
+                other.close()
+        return found
+
+    monkeypatch.setattr(bridge.Store, "is_delivered", wrapped)
+    try:
+        opened.store.mark_delivered(
+            "ai-sessions:s", "ai_sessions", digest, "s", 2, 1, 1, 1)
+        assert opened.store.enqueue(
+            "ai-sessions:s", "ai_sessions", digest, "coord", "/api/ai-sessions",
+            fifteen, "offline", "s", 2, 1, 1, 2,
+        )
+        assert opened.flush() == 0
+        row = opened.store.db.execute(
+            "SELECT usage_revision FROM delivered WHERE endpoint='ai_sessions'"
+        ).fetchone()
+        assert row == (4,)
+        assert opened.store.pending_count() == 0
+        assert opened.send("ai_sessions", "ai-sessions:s", ten, "s", 2, 1, 3) is True
+        assert _summaries(poster, "s") == []
+    finally:
+        opened.close()
+
+
 def test_retry_publishes_summary_at_the_captured_high_water(tmp_path, monkeypatch):
     path = write_jsonl(tmp_path / "sess-early.jsonl", [
         {"role": "user", "content": "one", "ts": "2026-10-25T11:00:00Z"},

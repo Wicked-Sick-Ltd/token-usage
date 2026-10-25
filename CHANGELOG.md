@@ -74,7 +74,10 @@ adheres to [Semantic Versioning](https://semver.org/).
   again. The hook publishes that summary at the high water captured with
   the counters; the body and the heartbeat stay on the generation's turn.
   Acknowledging a post keeps the later queued or delivered version of that
-  same body when a rescan raises it during the request.
+  same body when a rescan raises it during the request. A flush drops a stale
+  queued row only when that row still has the version it fetched, and a
+  duplicate already delivered is acknowledged the same way so a promotion
+  after the fetch is kept.
 
 ## [0.9.0] — 2026-10-18
 

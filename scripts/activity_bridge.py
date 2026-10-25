@@ -860,6 +860,21 @@ class Store:
         )
         self.db.commit()
 
+    def drop_spool_version(self, source_id, endpoint, content_hash, turn_index, stage,
+                           usage_revision):
+        """Remove a queued row only when it still has the version the caller read.
+
+        A rescan can raise that row after the flush fetched it. Deleting by hash
+        alone would discard the newer summary.
+        """
+        self.db.execute(
+            "DELETE FROM spool WHERE source_id=? AND endpoint=? AND content_hash=? "
+            "AND turn_index=? AND stage=? AND usage_revision=?",
+            (source_id, endpoint, content_hash, int(turn_index), int(stage),
+             int(usage_revision or 0)),
+        )
+        self.db.commit()
+
     def pending(self, limit, targets=None):
         """Oldest spool rows, optionally only for targets this process can post.
 
@@ -1441,14 +1456,16 @@ class Bridge:
             if mutable and self.store.newer_delivered(
                 session_id, endpoint, turn_index, stage, usage_revision,
             ):
-                self.store.drop_spool(source_id, endpoint, content_hash)
+                self.store.drop_spool_version(
+                    source_id, endpoint, content_hash, turn_index, stage, usage_revision)
                 continue
             if self.store.is_delivered(source_id, endpoint, content_hash):
                 if mutable:
-                    self.store.advance_delivered(
-                        source_id, endpoint, content_hash, session_id, turn_index, stage,
-                        usage_revision)
-                self.store.drop_spool(source_id, endpoint, content_hash)
+                    self.store.acknowledge_delivery(
+                        source_id, endpoint, content_hash, session_id, turn_index, mutable,
+                        stage, usage_revision)
+                else:
+                    self.store.drop_spool(source_id, endpoint, content_hash)
                 continue
             token = self.config.coord_token if target == "coord" else self.config.twin_token
             try:
