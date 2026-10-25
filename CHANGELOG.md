@@ -38,6 +38,16 @@ adheres to [Semantic Versioning](https://semver.org/).
   reuse a history-index entry when mtime, size and the pricing fingerprint match.
   Codex, Antigravity, Gemini CLI and Copilot parse again on every corpus scan.
 
+### Fixed
+
+- **Activity bridge usage accounting.** A trailing prompt no longer marks a
+  generation included when the transcript has no counters for that turn. Turn
+  allocation holds the high-water read, insert, and update in one immediate
+  transaction. Codex `token_usage_record` rows whose `thread_id` belongs to
+  another rollout are ignored and cannot disable the local cumulative stream.
+  `sync` publishes combined usage, so a transcript without counters does not
+  replace totals already stored by live hooks.
+
 ## [0.9.0] — 2026-10-18
 
 ### Added

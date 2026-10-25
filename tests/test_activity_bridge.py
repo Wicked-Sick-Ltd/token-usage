@@ -1706,3 +1706,262 @@ def test_flush_limit_does_not_let_a_disabled_target_starve_coord(tmp_path):
     assert sent == 1
     assert [call["url"] for call in poster.calls] == ["http://coord.test:8140/session/register"]
     assert poster.calls[0]["body"]["ok"] is True
+
+
+def _summaries(poster, session_id=None):
+    rows = [call["body"] for call in poster.calls if call["url"].endswith("/api/ai-sessions")]
+    if session_id is None:
+        return rows
+    return [body for body in rows if body["session_id"] == session_id]
+
+
+def test_trailing_prompt_does_not_drop_usage_the_transcript_never_saw(tmp_path):
+    poster = FakePoster()
+    config = cfg(tmp_path)
+
+    def stop(generation, prompt, output, incoming, outgoing):
+        return {
+            "hook_event_name": "stop",
+            "conversation_id": "sess-cover",
+            "generation_id": generation,
+            "model": "m",
+            "prompt": prompt,
+            "output": output,
+            "input_tokens": incoming,
+            "output_tokens": outgoing,
+        }
+
+    bridge.process_hook(stop("g1", "one", "uno", 10, 4), config, poster, runtime="claude")
+    bridge.process_hook(stop("g2", "two", "dos", 5, 2), config, poster, runtime="claude")
+    assert _summaries(poster)[-1]["input_tokens"] == 15
+    write_jsonl(tmp_path / "sess-cover.jsonl", [
+        {"role": "user", "content": "one", "ts": "2026-10-25T11:00:00Z"},
+        {
+            "role": "assistant", "content": "uno", "model": "m",
+            "ts": "2026-10-25T11:00:01Z",
+            "usage": {"input_tokens": 10, "output_tokens": 4},
+        },
+        {"role": "user", "content": "two", "ts": "2026-10-25T11:01:00Z"},
+    ])
+    bridge.sync_tree(tmp_path / "sess-cover.jsonl", config, poster=poster, vendor="claude")
+    summary = _summaries(poster, "sess-cover")[-1]
+    assert summary["input_tokens"] == 15
+    assert summary["output_tokens"] == 6
+    store = bridge.Store(config.state_dir)
+    try:
+        flags = dict(store.db.execute(
+            "SELECT generation_id, in_transcript FROM generation_usage WHERE session_id=?",
+            ("sess-cover",),
+        ).fetchall())
+        assert flags["g1"] == 1
+        assert flags["g2"] == 0
+        assert store.combined_usage("sess-cover")["input_tokens"] == 15
+    finally:
+        store.close()
+    bridge.process_hook(stop("g2", "two", "dos", 5, 2), config, poster, runtime="claude")
+    summary = _summaries(poster, "sess-cover")[-1]
+    assert summary["input_tokens"] == 15
+    assert summary["output_tokens"] == 6
+
+
+def test_turn_allocation_sees_a_concurrent_high_water_update(tmp_path, monkeypatch):
+    config = cfg(tmp_path)
+    bridge.Store(config.state_dir).close()
+    path = config.state_dir / "bridge.sqlite"
+    holder_in = threading.Event()
+    release = threading.Event()
+    alloc_ready = threading.Event()
+    result = {}
+    seen = {}
+    original = bridge.Store.high_water
+
+    def wrapped(self, session_id, agent_key=""):
+        seen["in_transaction"] = self.db.in_transaction
+        value = original(self, session_id, agent_key)
+        seen["value"] = value
+        return value
+
+    monkeypatch.setattr(bridge.Store, "high_water", wrapped)
+
+    def hold():
+        db = sqlite3.connect(path, timeout=5)
+        try:
+            db.execute("PRAGMA busy_timeout=5000")
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                "INSERT INTO turn_high_water (session_id, agent_key, high_water, started_at) "
+                "VALUES ('sess-race', '', 5, '')"
+            )
+            holder_in.set()
+            if not release.wait(3):
+                result["error"] = "holder timed out"
+                db.rollback()
+                return
+            db.commit()
+        finally:
+            db.close()
+
+    def allocate():
+        local = bridge.Store(config.state_dir)
+        alloc_ready.set()
+        try:
+            if not holder_in.wait(3):
+                result["error"] = "allocation missed the lock"
+                return
+            index, _stamp = local.ensure_turn(
+                "sess-race", "", "g-new", "2026-10-25T11:00:00Z")
+            result["index"] = index
+        finally:
+            local.close()
+
+    allocator = threading.Thread(target=allocate)
+    holder = threading.Thread(target=hold)
+    allocator.start()
+    assert alloc_ready.wait(3)
+    holder.start()
+    assert holder_in.wait(3)
+    threading.Event().wait(0.2)
+    release.set()
+    allocator.join(5)
+    holder.join(5)
+    assert result.get("error") is None
+    assert seen["in_transaction"] is True
+    assert seen["value"] == 5
+    assert result["index"] == 6
+
+
+def test_concurrent_allocations_choose_distinct_indexes(tmp_path):
+    config = cfg(tmp_path)
+    bridge.Store(config.state_dir).close()
+    barrier = threading.Barrier(8)
+    found = []
+    errors = []
+    lock = threading.Lock()
+
+    def allocate(number):
+        local = bridge.Store(config.state_dir)
+        try:
+            barrier.wait(5)
+            index, _stamp = local.ensure_turn("sess-many", "", f"g{number}", "t")
+        except (sqlite3.Error, OSError, threading.BrokenBarrierError) as exc:
+            errors.append(repr(exc))
+            return
+        finally:
+            local.close()
+        with lock:
+            found.append(index)
+
+    threads = [threading.Thread(target=allocate, args=(number,)) for number in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(5)
+    assert errors == []
+    assert sorted(found) == list(range(1, 9))
+
+    same = []
+
+    def allocate_same():
+        local = bridge.Store(config.state_dir)
+        try:
+            barrier.wait(5)
+            index, _stamp = local.ensure_turn("sess-same", "", "g-shared", "t")
+        except (sqlite3.Error, OSError, threading.BrokenBarrierError) as exc:
+            errors.append(repr(exc))
+            return
+        finally:
+            local.close()
+        with lock:
+            same.append(index)
+
+    barrier = threading.Barrier(6)
+    threads = [threading.Thread(target=allocate_same) for _number in range(6)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(5)
+    assert errors == []
+    assert same == [1, 1, 1, 1, 1, 1]
+
+
+def test_foreign_codex_usage_records_do_not_inflate_or_disable_local_totals(tmp_path):
+    local = _codex_total()
+    foreign_usage = {"input_tokens": 900, "cached_input_tokens": 0, "output_tokens": 90}
+    cumulative = [
+        _codex_event("session_meta", {"id": "thread-1", "cwd": "/tmp/project"}),
+        _codex_event("turn_context", {"model": "gpt-test", "turn_id": "turn-1"}),
+        _codex_event("response_item", {"type": "message", "role": "user", "content": [
+            {"type": "input_text", "text": "check the change"},
+        ]}),
+        _codex_event("token_usage_record", {
+            "thread_id": "thread-other", "response_id": "foreign", "usage": foreign_usage,
+        }, 1),
+        _codex_event("event_msg", {"type": "token_count", "info": {"total_token_usage": local}}, 1),
+        _codex_event("response_item", {"type": "message", "role": "assistant", "content": [
+            {"type": "output_text", "text": "checked"},
+        ]}, 2),
+    ]
+    assert bridge._codex_usage_mode(cumulative) == "cumulative"
+    total = bridge.sum_usage(bridge.extract_turns(cumulative))
+    assert total["input_tokens"] == 60
+    assert total["output_tokens"] == 20
+    mixed = [
+        _codex_event("session_meta", {"id": "thread-1"}),
+        _codex_event("response_item", {"type": "message", "role": "user", "content": [
+            {"type": "input_text", "text": "local record"},
+        ]}),
+        _codex_event("token_usage_record", {
+            "thread_id": "thread-1", "response_id": "local", "usage": local,
+        }, 1),
+        _codex_event("token_usage_record", {
+            "thread_id": "thread-other", "response_id": "foreign", "usage": foreign_usage,
+        }, 1),
+        _codex_event("event_msg", {"type": "token_count", "info": {
+            "total_token_usage": _codex_total(400, 0, 80),
+        }}, 2),
+        _codex_event("response_item", {"type": "message", "role": "assistant", "content": [
+            {"type": "output_text", "text": "done"},
+        ]}, 2),
+    ]
+    assert bridge._codex_usage_mode(mixed) == "records"
+    total = bridge.sum_usage(bridge.extract_turns(mixed))
+    assert total["input_tokens"] == 60
+    assert total["output_tokens"] == 20
+    path = write_jsonl(tmp_path / "thread-1.jsonl", cumulative)
+    poster = FakePoster()
+    config = cfg(tmp_path)
+    bridge.sync_tree(path, config, poster=poster, vendor="codex")
+    summary = _summaries(poster, "thread-1")[-1]
+    assert summary["input_tokens"] == 60
+    assert summary["output_tokens"] == 20
+    store = bridge.Store(config.state_dir)
+    try:
+        stored = store.combined_usage("thread-1")
+    finally:
+        store.close()
+    assert stored["input_tokens"] == 60
+    assert stored["output_tokens"] == 20
+
+
+def test_sync_without_counters_preserves_hooked_totals(tmp_path):
+    poster = FakePoster()
+    config = cfg(tmp_path)
+    bridge.process_hook({
+        "hook_event_name": "stop",
+        "conversation_id": "sess-keep",
+        "generation_id": "g1",
+        "model": "m",
+        "prompt": "question",
+        "output": "answer",
+        "input_tokens": 80,
+        "output_tokens": 8,
+    }, config, poster, runtime="cursor")
+    path = write_jsonl(tmp_path / "sess-keep.jsonl", [
+        {"role": "user", "content": "question", "ts": "2026-10-25T11:00:00Z"},
+        {"role": "assistant", "content": "answer", "model": "m", "ts": "2026-10-25T11:00:01Z"},
+    ])
+    bridge.sync_tree(path, config, poster=poster, vendor="cursor")
+    summaries = _summaries(poster, "sess-keep")
+    assert summaries
+    assert all(body["input_tokens"] == 80 and body["output_tokens"] == 8 for body in summaries)
+    assert summaries[-1]["turns"] == 1
