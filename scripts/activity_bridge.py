@@ -789,7 +789,7 @@ class Store:
         self.db.commit()
 
     def replace_transcript_usage(self, session_id, agent_key, usage, covered_turns,
-                                 usage_turns=None):
+                                 usage_turns=None, open_prompt=None, apply_usage=True):
         """Store a transcript total and how many turns that snapshot covers.
 
         A later snapshot with fewer turns is ignored, so an earlier generation
@@ -815,6 +815,18 @@ class Store:
         ).fetchone()
         if row is not None and int(row[0] or 0) > covered_turns:
             return False
+        if apply_usage:
+            self._replace_transcript_counters(
+                session_id, agent_key, usage, covered_turns, usage_turns)
+        self._write_high_water(session_id, agent_key, covered_turns)
+        if open_prompt is not None:
+            self._write_open_prompt(session_id, agent_key, open_prompt)
+        self.db.commit()
+        return True
+
+    def _replace_transcript_counters(self, session_id, agent_key, usage, covered_turns,
+                                     usage_turns):
+        """Caller holds the transaction and has already accepted the snapshot."""
         self.db.execute(
             """
             INSERT INTO generation_usage (
@@ -876,8 +888,6 @@ class Store:
                 (session_id, agent_key, _TRANSCRIPT_GENERATION, session_id, agent_key,
                  covered_turns, *usage_turns),
             )
-        self.db.commit()
-        return True
 
     def combined_usage(self, session_id, agent_key="", cursor=False):
         """Transcript total plus generations not already covered by that total.
@@ -941,13 +951,8 @@ class Store:
         self._write_high_water(session_id, agent_key, count)
         self.db.commit()
 
-    def note_open_prompt(self, session_id, agent_key, turn_index):
-        """Remember a trailing turn that has no counters yet, or clear it.
-
-        The next new payload generation can claim that turn. A generation
-        allocated after the turn already has counters must not claim it.
-        """
-        agent_key = agent_key or ""
+    def _write_open_prompt(self, session_id, agent_key, turn_index):
+        """Caller holds the transaction. Only a prompt with no assistant is open."""
         self.db.execute(
             """
             INSERT INTO turn_high_water (
@@ -956,9 +961,8 @@ class Store:
             ON CONFLICT(session_id, agent_key) DO UPDATE SET
                 open_prompt = excluded.open_prompt
             """,
-            (session_id, agent_key, int(turn_index or 0)),
+            (session_id, agent_key or "", int(turn_index or 0)),
         )
-        self.db.commit()
 
     def transcript_turn_for(self, session_id, agent_key, generation_id):
         row = self.db.execute(
@@ -1046,7 +1050,8 @@ class Store:
                 if open_prompt:
                     taken = self.db.execute(
                         "SELECT 1 FROM turn_map WHERE session_id=? AND agent_key=? "
-                        "AND transcript_turn=? LIMIT 1",
+                        "AND CASE WHEN transcript_turn>0 THEN transcript_turn "
+                        "ELSE turn_index END=? LIMIT 1",
                         (session_id, agent_key, open_prompt),
                     ).fetchone()
                     if not taken:
@@ -2374,21 +2379,22 @@ def _stream_transcript(path):
 def _coverage_turn(reader_turn, allocated_index, usage_turns, turn_count, stored_turn=0):
     """Transcript turn this snapshot already counts, or 0 when it does not.
 
-    The allocated index is the stable source id. A stored association from the
-    open prompt wins when that turn now has counters, including when a later
-    prompt has made the snapshot longer than the publication index. Otherwise
-    the reader's turn counts only when it is the end of this snapshot, so a
-    trailing prompt cannot treat an earlier assistant turn as coverage.
+    A stored association is authoritative: when that turn has no counters this
+    snapshot does not cover the generation, even if the publication index does.
+    Otherwise the reader's turn counts only when it is the end of this snapshot,
+    so a trailing prompt cannot treat an earlier assistant turn as coverage.
     """
     covered = {int(index) for index in usage_turns or []}
     reader_turn = int(reader_turn or 0)
     allocated_index = int(allocated_index or 0)
     turn_count = int(turn_count or 0)
     stored_turn = int(stored_turn or 0)
+    if stored_turn > 0:
+        if stored_turn in covered and stored_turn <= turn_count:
+            return stored_turn
+        return 0
     if allocated_index in covered:
         return reader_turn if reader_turn in covered else allocated_index
-    if stored_turn in covered and stored_turn <= turn_count:
-        return stored_turn
     if reader_turn in covered and reader_turn == turn_count and allocated_index > turn_count:
         return reader_turn
     return 0
@@ -2446,6 +2452,7 @@ def _process_hook(bridge, payload, config, runtime, event):
     turn_index = 0
     transcript_turn = 0
     usage_turns = []
+    snapshot_accepted = False
     if isinstance(transcript, str) and transcript and Path(transcript).is_file():
         state, file_usage, turn_count, target, turn_index, _updated, usage_turns = (
             _stream_transcript(transcript)
@@ -2460,9 +2467,15 @@ def _process_hook(bridge, payload, config, runtime, event):
         # turn.timestamp is the prompt time. The summary clock is the last record.
         updated_at = state["updated"] or ""
         if turn_count:
-            bridge.store.note_high_water(session_id, agent_key, turn_count)
-            open_prompt = turn_count if turn_count not in usage_turns else 0
-            bridge.store.note_open_prompt(session_id, agent_key, open_prompt)
+            # A finished assistant turn is not an open prompt, even with no
+            # counters yet. A shorter snapshot must not reopen an older turn.
+            open_prompt = 0
+            if turn_count not in usage_turns and int(turn_index or 0) != turn_count:
+                open_prompt = turn_count
+            snapshot_accepted = bridge.store.replace_transcript_usage(
+                session_id, agent_key, file_usage, turn_count, usage_turns,
+                open_prompt=open_prompt, apply_usage=bool(_any_usage(file_usage)),
+            )
         if turn_index:
             transcript_turn = int(turn_index)
             turn_index = bridge.store.bind_turn(session_id, agent_key, generation_id, turn_index)
@@ -2519,8 +2532,7 @@ def _process_hook(bridge, payload, config, runtime, event):
         stored_turn = bridge.store.transcript_turn_for(session_id, agent_key, generation_id)
         coverage_turn = _coverage_turn(
             transcript_turn, turn_index, usage_turns, turn_count, stored_turn)
-        accepted = bridge.store.replace_transcript_usage(
-            session_id, agent_key, file_usage, turn_count, usage_turns)
+        accepted = snapshot_accepted
         if accepted and coverage_turn:
             bridge.store.remember_transcript_turn(
                 session_id, agent_key, generation_id, coverage_turn)
@@ -2683,12 +2695,16 @@ def sync_file(bridge, path, config, vendor="", surface=""):
     session_id, agent_key = _resolve_identity(path, state["session_id"], "")
     session = _ledger_id(clean_id(session_id, path.stem), agent_key)
     usage_turns = [index for index, turn in turns if _any_usage(turn.usage)]
-    bridge.store.note_high_water(session_id, agent_key, len(turns))
-    open_prompt = len(turns) if len(turns) not in usage_turns else 0
-    bridge.store.note_open_prompt(session_id, agent_key, open_prompt)
-    if usage_turns:
-        bridge.store.replace_transcript_usage(
-            session_id, agent_key, usage, len(turns), usage_turns)
+    last_index, last_turn = turns[-1]
+    open_prompt = 0
+    if last_turn.prompt and not last_turn.has_assistant and not _any_usage(last_turn.usage):
+        open_prompt = last_index
+    # Bounds and the baseline share one decision. A shorter file, including one
+    # with no counters, must not reopen a turn the retained snapshot already passed.
+    accepted = bridge.store.replace_transcript_usage(
+        session_id, agent_key, usage, len(turns), usage_turns,
+        open_prompt=open_prompt, apply_usage=bool(usage_turns),
+    )
     # A file with no counters must not replace totals live hooks already stored.
     # Equal turn index and stage would otherwise let an all-zero summary win.
     outgoing = bridge.store.combined_usage(
@@ -2709,6 +2725,11 @@ def sync_file(bridge, path, config, vendor="", surface=""):
             stage=1 if turn.has_assistant else 0,
         )
     _index, last_turn = live[-1]
+    # A payload can allocate past the file before delayed counters arrive. The
+    # accepted scan still owns the session total, so deliver it at the shared
+    # high water. A rejected shorter snapshot stays on the file length and
+    # cannot replace that later post.
+    summary_index = bridge.store.high_water(session_id, agent_key) if accepted else len(turns)
     bridge.send(
         "ai_sessions",
         "ai-sessions:" + session,
@@ -2718,7 +2739,7 @@ def sync_file(bridge, path, config, vendor="", surface=""):
             last_turn.model or state["model"] or "unknown", config.machine, 0.0, "unpriced",
         ),
         session_id=session,
-        turn_index=len(turns),
+        turn_index=summary_index,
         stage=1,
     )
     for index, turn in live:

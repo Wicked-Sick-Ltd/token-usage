@@ -2155,6 +2155,244 @@ def test_rejected_shorter_snapshot_does_not_include_a_later_generation(tmp_path)
         store.close()
 
 
+def test_claim_sees_a_generation_mapped_by_publication_index(tmp_path):
+    poster = FakePoster()
+    config = cfg(tmp_path)
+
+    def stop(generation, incoming, outgoing):
+        return {
+            "hook_event_name": "stop",
+            "conversation_id": "sess-fallback",
+            "generation_id": generation,
+            "model": "m",
+            "output": generation,
+            "input_tokens": incoming,
+            "output_tokens": outgoing,
+        }
+
+    bridge.process_hook(stop("g1", 10, 4), config, poster, runtime="claude")
+    bridge.process_hook(stop("g2", 5, 2), config, poster, runtime="claude")
+    path = write_jsonl(tmp_path / "sess-fallback.jsonl", [
+        {"role": "user", "content": "one", "ts": "2026-10-25T11:00:00Z"},
+        {
+            "role": "assistant", "content": "uno", "model": "m",
+            "ts": "2026-10-25T11:00:01Z",
+            "usage": {"input_tokens": 10, "output_tokens": 4},
+        },
+        {"role": "user", "content": "two", "ts": "2026-10-25T11:01:00Z"},
+    ])
+    bridge.sync_tree(path, config, poster=poster, vendor="claude")
+    bridge.process_hook(stop("g3", 7, 1), config, poster, runtime="claude")
+    assert _summaries(poster, "sess-fallback")[-1]["input_tokens"] == 22
+    write_jsonl(path, [
+        {"role": "user", "content": "one", "ts": "2026-10-25T11:00:00Z"},
+        {
+            "role": "assistant", "content": "uno", "model": "m",
+            "ts": "2026-10-25T11:00:01Z",
+            "usage": {"input_tokens": 10, "output_tokens": 4},
+        },
+        {"role": "user", "content": "two", "ts": "2026-10-25T11:01:00Z"},
+        {
+            "role": "assistant", "content": "dos", "model": "m",
+            "ts": "2026-10-25T11:01:01Z",
+            "usage": {"input_tokens": 5, "output_tokens": 2},
+        },
+    ])
+    bridge.sync_tree(path, config, poster=poster, vendor="claude")
+    summary = _summaries(poster, "sess-fallback")[-1]
+    assert summary["input_tokens"] == 22
+    store = bridge.Store(config.state_dir)
+    try:
+        rows = {
+            row[0]: row[1:]
+            for row in store.db.execute(
+                "SELECT generation_id, transcript_turn, in_transcript "
+                "FROM turn_map JOIN generation_usage "
+                "USING (session_id, agent_key, generation_id) WHERE session_id=?",
+                ("sess-fallback",),
+            )
+        }
+        assert rows["g2"][1] == 1
+        assert rows["g3"] == (0, 0)
+        assert store.combined_usage("sess-fallback")["input_tokens"] == 22
+    finally:
+        store.close()
+
+
+def test_completed_assistant_without_counters_is_not_an_open_prompt(tmp_path):
+    path = write_jsonl(tmp_path / "sess-plain.jsonl", [
+        {"role": "user", "content": "one", "ts": "2026-10-25T11:00:00Z"},
+        {"role": "assistant", "content": "uno", "model": "m", "ts": "2026-10-25T11:00:01Z"},
+    ])
+    poster = FakePoster()
+    config = cfg(tmp_path)
+    bridge.sync_tree(path, config, poster=poster, vendor="claude")
+    bridge.process_hook({
+        "hook_event_name": "stop",
+        "conversation_id": "sess-plain",
+        "generation_id": "g-new",
+        "model": "m",
+        "output": "later",
+        "input_tokens": 5,
+        "output_tokens": 1,
+    }, config, poster, runtime="claude")
+    write_jsonl(path, [
+        {"role": "user", "content": "one", "ts": "2026-10-25T11:00:00Z"},
+        {
+            "role": "assistant", "content": "uno", "model": "m",
+            "ts": "2026-10-25T11:00:01Z",
+            "usage": {"input_tokens": 10, "output_tokens": 4},
+        },
+    ])
+    bridge.sync_tree(path, config, poster=poster, vendor="claude")
+    summary = _summaries(poster, "sess-plain")[-1]
+    assert summary["input_tokens"] == 15
+    assert summary["output_tokens"] == 5
+    store = bridge.Store(config.state_dir)
+    try:
+        row = store.db.execute(
+            "SELECT transcript_turn, in_transcript FROM turn_map "
+            "JOIN generation_usage USING (session_id, agent_key, generation_id) "
+            "WHERE session_id=? AND generation_id=?",
+            ("sess-plain", "g-new"),
+        ).fetchone()
+        assert row == (0, 0)
+    finally:
+        store.close()
+
+
+def test_stored_turn_without_counters_stays_authoritative(tmp_path):
+    path = write_jsonl(tmp_path / "sess-stored.jsonl", [
+        {"role": "user", "content": "one", "ts": "2026-10-25T11:00:00Z"},
+        {
+            "role": "assistant", "content": "uno", "model": "m",
+            "ts": "2026-10-25T11:00:01Z",
+            "usage": {"input_tokens": 4, "output_tokens": 1},
+        },
+        {"role": "user", "content": "two", "ts": "2026-10-25T11:01:00Z"},
+        {
+            "role": "assistant", "content": "dos", "model": "m",
+            "ts": "2026-10-25T11:01:01Z",
+            "usage": {"input_tokens": 3, "output_tokens": 1},
+        },
+        {"role": "user", "content": "three", "ts": "2026-10-25T11:02:00Z"},
+        {"role": "assistant", "content": "tres", "model": "m", "ts": "2026-10-25T11:02:01Z"},
+        {"role": "user", "content": "four", "ts": "2026-10-25T11:03:00Z"},
+        {
+            "role": "assistant", "content": "cuatro", "model": "m",
+            "ts": "2026-10-25T11:03:01Z",
+            "usage": {"input_tokens": 2, "output_tokens": 1},
+        },
+    ])
+    config = cfg(tmp_path)
+    store = bridge.Store(config.state_dir)
+    try:
+        store.db.execute(
+            "INSERT INTO turn_map (session_id, agent_key, generation_id, turn_index, "
+            "seen_at, transcript_turn) VALUES ('sess-stored', '', 'g', 4, '', 3)"
+        )
+        store.db.execute(
+            "INSERT INTO generation_usage (session_id, generation_id, agent_key, "
+            "input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, "
+            "in_transcript, covered_turns) VALUES ('sess-stored', 'g', '', 5, 1, 0, 0, 0, 0)"
+        )
+        store.db.commit()
+    finally:
+        store.close()
+    poster = FakePoster()
+    bridge.process_hook({
+        "hook_event_name": "stop",
+        "conversation_id": "sess-stored",
+        "generation_id": "g",
+        "model": "m",
+        "output": "cuatro",
+        "input_tokens": 5,
+        "output_tokens": 1,
+        "transcript_path": str(path),
+    }, config, poster, runtime="claude")
+    summary = _summaries(poster, "sess-stored")[-1]
+    assert summary["input_tokens"] == 14
+    store = bridge.Store(config.state_dir)
+    try:
+        row = store.db.execute(
+            "SELECT turn_index, transcript_turn, in_transcript FROM turn_map "
+            "JOIN generation_usage USING (session_id, agent_key, generation_id) "
+            "WHERE session_id=? AND generation_id=?",
+            ("sess-stored", "g"),
+        ).fetchone()
+        assert row == (4, 3, 0)
+        assert store.combined_usage("sess-stored")["input_tokens"] == 14
+    finally:
+        store.close()
+
+
+def test_shorter_snapshot_does_not_reopen_a_passed_turn(tmp_path):
+    full = [
+        {"role": "user", "content": "one", "ts": "2026-10-25T11:00:00Z"},
+        {
+            "role": "assistant", "content": "uno", "model": "m",
+            "ts": "2026-10-25T11:00:01Z",
+            "usage": {"input_tokens": 10, "output_tokens": 4},
+        },
+        {"role": "user", "content": "two", "ts": "2026-10-25T11:01:00Z"},
+        {
+            "role": "assistant", "content": "dos", "model": "m",
+            "ts": "2026-10-25T11:01:01Z",
+            "usage": {"input_tokens": 5, "output_tokens": 1},
+        },
+        {"role": "user", "content": "three", "ts": "2026-10-25T11:02:00Z"},
+        {"role": "assistant", "content": "tres", "model": "m", "ts": "2026-10-25T11:02:01Z"},
+    ]
+    path = write_jsonl(tmp_path / "sess-reopen.jsonl", full)
+    poster = FakePoster()
+    config = cfg(tmp_path)
+    bridge.sync_tree(path, config, poster=poster, vendor="claude")
+    write_jsonl(path, [
+        {"role": "user", "content": "only", "ts": "2026-10-25T11:00:00Z"},
+    ])
+    bridge.sync_tree(path, config, poster=poster, vendor="claude")
+    write_jsonl(path, [
+        {"role": "user", "content": "one", "ts": "2026-10-25T11:00:00Z"},
+        {
+            "role": "assistant", "content": "uno", "model": "m",
+            "ts": "2026-10-25T11:00:01Z",
+            "usage": {"input_tokens": 10, "output_tokens": 4},
+        },
+        {"role": "user", "content": "two", "ts": "2026-10-25T11:01:00Z"},
+    ])
+    bridge.sync_tree(path, config, poster=poster, vendor="claude")
+    bridge.process_hook({
+        "hook_event_name": "stop",
+        "conversation_id": "sess-reopen",
+        "generation_id": "g-extra",
+        "model": "m",
+        "output": "extra",
+        "input_tokens": 7,
+        "output_tokens": 1,
+    }, config, poster, runtime="claude")
+    write_jsonl(path, full)
+    bridge.sync_tree(path, config, poster=poster, vendor="claude")
+    summary = _summaries(poster, "sess-reopen")[-1]
+    assert summary["input_tokens"] == 22
+    store = bridge.Store(config.state_dir)
+    try:
+        opened = store.db.execute(
+            "SELECT open_prompt FROM turn_high_water WHERE session_id=?",
+            ("sess-reopen",),
+        ).fetchone()
+        assert opened[0] == 0
+        row = store.db.execute(
+            "SELECT transcript_turn, in_transcript FROM turn_map "
+            "JOIN generation_usage USING (session_id, agent_key, generation_id) "
+            "WHERE session_id=? AND generation_id=?",
+            ("sess-reopen", "g-extra"),
+        ).fetchone()
+        assert row == (0, 0)
+        assert store.combined_usage("sess-reopen")["input_tokens"] == 22
+    finally:
+        store.close()
+
+
 def test_existing_turn_map_gains_transcript_turn(tmp_path):
     state = tmp_path / "state"
     state.mkdir()

@@ -51,10 +51,15 @@ adheres to [Semantic Versioning](https://semver.org/).
   counters, so a flag left on a trailing prompt cannot stick.   A transcript-backed
   stop covers the reader's turn when allocation has already moved past that index.
   That reader turn is stored separately from the publication index, so a later
-  prompt-only sync keeps the generation inside the transcript total. The first
+  prompt-only sync keeps the generation inside the transcript total.   The first
   payload after an open prompt claims that turn, so a later sync or a retry
-  behind a new prompt does not add the same counters again. A rejected shorter
-  snapshot does not mark the generation included.
+  behind a new prompt does not add the same counters again. A generation already
+  mapped onto that turn blocks the claim. A stored association is not replaced
+  by the publication index while its turn has no counters. Only a prompt with
+  no assistant is open, and a shorter snapshot does not reopen one. A rejected
+  shorter snapshot does not mark the generation included. An accepted rescan
+  still publishes the combined total when a payload has already allocated past
+  the file.
 
 ## [0.9.0] — 2026-10-18
 
