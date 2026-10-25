@@ -541,6 +541,7 @@ class Store:
                 generation_id TEXT NOT NULL,
                 turn_index INTEGER NOT NULL,
                 seen_at TEXT NOT NULL DEFAULT '',
+                transcript_turn INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (session_id, agent_key, generation_id)
             );
             CREATE TABLE IF NOT EXISTS turn_high_water (
@@ -602,6 +603,11 @@ class Store:
         if usage_cols and "covered_turns" not in usage_cols:
             self.db.execute(
                 "ALTER TABLE generation_usage ADD COLUMN covered_turns INTEGER NOT NULL DEFAULT 0"
+            )
+        map_cols = self._columns("turn_map")
+        if map_cols and "transcript_turn" not in map_cols:
+            self.db.execute(
+                "ALTER TABLE turn_map ADD COLUMN transcript_turn INTEGER NOT NULL DEFAULT 0"
             )
 
     def close(self):
@@ -785,7 +791,10 @@ class Store:
         are cleared first, then only the usage-bearing subset is marked. A
         trailing prompt with no counters stays additive, and so does a
         payload-only generation past the window. A flag left by an older sync
-        cannot survive a rescan via MAX in save_generation_usage.
+        cannot survive a rescan via MAX in save_generation_usage. Coverage uses
+        the stored transcript turn when a generation has one, so a stable
+        publication index past the snapshot cannot drop a turn the file already
+        counted.
         """
         agent_key = agent_key or ""
         covered_turns = int(covered_turns or 0)
@@ -820,16 +829,24 @@ class Store:
              int(usage.get("cache_read_tokens") or 0), int(usage.get("cache_write_tokens") or 0),
              covered_turns),
         )
+        # turn_index is the stable publication id. transcript_turn is the
+        # reader's turn and can sit behind that id. Clear both, then mark the
+        # usage-bearing coverage turn so a later prompt cannot un-cover it.
         self.db.execute(
             """
             UPDATE generation_usage SET in_transcript=0
             WHERE session_id=? AND agent_key=? AND generation_id!=?
               AND generation_id IN (
                   SELECT generation_id FROM turn_map
-                  WHERE session_id=? AND agent_key=? AND turn_index<=?
+                  WHERE session_id=? AND agent_key=?
+                    AND (
+                        turn_index<=?
+                        OR (transcript_turn>0 AND transcript_turn<=?)
+                    )
               )
             """,
-            (session_id, agent_key, _TRANSCRIPT_GENERATION, session_id, agent_key, covered_turns),
+            (session_id, agent_key, _TRANSCRIPT_GENERATION, session_id, agent_key,
+             covered_turns, covered_turns),
         )
         if usage_turns:
             marks = ",".join("?" for _ in usage_turns)
@@ -839,8 +856,15 @@ class Store:
                 WHERE session_id=? AND agent_key=? AND generation_id!=?
                   AND generation_id IN (
                       SELECT generation_id FROM turn_map
-                      WHERE session_id=? AND agent_key=? AND turn_index<=?
-                        AND turn_index IN ({marks})
+                      WHERE session_id=? AND agent_key=?
+                        AND (
+                            CASE WHEN transcript_turn>0 THEN transcript_turn
+                                 ELSE turn_index END
+                        )<=?
+                        AND (
+                            CASE WHEN transcript_turn>0 THEN transcript_turn
+                                 ELSE turn_index END
+                        ) IN ({marks})
                   )
                 """,
                 (session_id, agent_key, _TRANSCRIPT_GENERATION, session_id, agent_key,
@@ -930,6 +954,18 @@ class Store:
             (session_id, agent_key, generation_id),
         ).fetchone()
         return int(row[0])
+
+    def remember_transcript_turn(self, session_id, agent_key, generation_id, transcript_turn):
+        """Record the reader's turn without moving the stable publication index."""
+        transcript_turn = int(transcript_turn or 0)
+        if transcript_turn <= 0:
+            return
+        self.db.execute(
+            "UPDATE turn_map SET transcript_turn=? "
+            "WHERE session_id=? AND agent_key=? AND generation_id=?",
+            (transcript_turn, session_id, agent_key or "", generation_id),
+        )
+        self.db.commit()
 
     def ensure_turn(self, session_id, agent_key, generation_id, seen_at=""):
         """Return the stable index and first-seen timestamp for one generation.
@@ -2422,15 +2458,21 @@ def _process_hook(bridge, payload, config, runtime, event):
         # so a later payload retry can still restore usage the file never had.
         # Generations past the snapshot's turn count stay additive. The stored
         # counters stay raw; Cursor normalization happens when a generation is summed.
-        bridge.store.replace_transcript_usage(
-            session_id, agent_key, file_usage, turn_count, usage_turns)
         # bind_turn will not lower an index allocated before this turn existed.
-        # Coverage follows the reader's turn when that turn is the end of the
-        # snapshot and it has counters; the source id stays on the higher index.
+        # The reader's turn is stored only when this snapshot is accepted and
+        # actually covers the generation. A partial file cannot pin coverage
+        # to an earlier assistant turn, and a rejected shorter scan cannot
+        # replace a turn already stored. Later syncs mark from that stored turn.
+        covered_by_transcript = _transcript_covers_generation(
+            transcript_turn, turn_index, usage_turns, turn_count)
+        accepted = bridge.store.replace_transcript_usage(
+            session_id, agent_key, file_usage, turn_count, usage_turns)
+        if accepted and covered_by_transcript and transcript_turn:
+            bridge.store.remember_transcript_turn(
+                session_id, agent_key, generation_id, transcript_turn)
         bridge.store.save_generation_usage(
             session_id, generation_id, agent_key, payload_usage or _empty_usage(),
-            included=_transcript_covers_generation(
-                transcript_turn, turn_index, usage_turns, turn_count),
+            included=covered_by_transcript,
         )
         usage = bridge.store.combined_usage(session_id, agent_key, cursor=cursor_payload)
     elif any(payload_usage.values()):

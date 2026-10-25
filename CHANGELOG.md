@@ -48,8 +48,10 @@ adheres to [Semantic Versioning](https://semver.org/).
   `sync` publishes combined usage, so a transcript without counters does not
   replace totals already stored by live hooks. A rescan clears inclusion for
   mapped turns inside the accepted snapshot before marking the turns that have
-  counters, so a flag left on a trailing prompt cannot stick. A transcript-backed
+  counters, so a flag left on a trailing prompt cannot stick.   A transcript-backed
   stop covers the reader's turn when allocation has already moved past that index.
+  That reader turn is stored separately from the publication index, so a later
+  prompt-only sync keeps the generation inside the transcript total.
 
 ## [0.9.0] — 2026-10-18
 

@@ -1881,12 +1881,12 @@ def test_sync_before_hook_reconciles_coverage_with_the_transcript_turn(tmp_path)
     store = bridge.Store(config.state_dir)
     try:
         row = store.db.execute(
-            "SELECT turn_index, in_transcript FROM turn_map "
+            "SELECT turn_index, transcript_turn, in_transcript FROM turn_map "
             "JOIN generation_usage USING (session_id, agent_key, generation_id) "
             "WHERE session_id=? AND generation_id=?",
             ("sess-ahead", "g2"),
         ).fetchone()
-        assert row == (3, 0)
+        assert row == (3, 0, 0)
     finally:
         store.close()
 
@@ -1911,13 +1911,75 @@ def test_sync_before_hook_reconciles_coverage_with_the_transcript_turn(tmp_path)
     store = bridge.Store(config.state_dir)
     try:
         row = store.db.execute(
-            "SELECT turn_index, in_transcript FROM turn_map "
+            "SELECT turn_index, transcript_turn, in_transcript FROM turn_map "
             "JOIN generation_usage USING (session_id, agent_key, generation_id) "
             "WHERE session_id=? AND generation_id=?",
             ("sess-ahead", "g2"),
         ).fetchone()
-        assert row == (3, 1)
+        assert row == (3, 2, 1)
         assert store.combined_usage("sess-ahead")["input_tokens"] == 15
+    finally:
+        store.close()
+
+    write_jsonl(path, [
+        {"role": "user", "content": "one", "ts": "2026-10-25T11:00:00Z"},
+        {
+            "role": "assistant", "content": "uno", "model": "m",
+            "ts": "2026-10-25T11:00:01Z",
+            "usage": {"input_tokens": 10, "output_tokens": 4},
+        },
+        {"role": "user", "content": "two", "ts": "2026-10-25T11:01:00Z"},
+        {
+            "role": "assistant", "content": "dos", "model": "m",
+            "ts": "2026-10-25T11:01:01Z",
+            "usage": {"input_tokens": 5, "output_tokens": 1},
+        },
+        {"role": "user", "content": "three", "ts": "2026-10-25T11:02:00Z"},
+    ])
+    bridge.sync_tree(path, config, poster=poster, vendor="claude")
+    summary = _summaries(poster, "sess-ahead")[-1]
+    assert summary["input_tokens"] == 15
+    assert summary["output_tokens"] == 5
+    store = bridge.Store(config.state_dir)
+    try:
+        row = store.db.execute(
+            "SELECT turn_index, transcript_turn, in_transcript FROM turn_map "
+            "JOIN generation_usage USING (session_id, agent_key, generation_id) "
+            "WHERE session_id=? AND generation_id=?",
+            ("sess-ahead", "g2"),
+        ).fetchone()
+        assert row == (3, 2, 1)
+        assert store.combined_usage("sess-ahead")["input_tokens"] == 15
+        assert store.combined_usage("sess-ahead")["output_tokens"] == 5
+    finally:
+        store.close()
+
+
+def test_existing_turn_map_gains_transcript_turn(tmp_path):
+    state = tmp_path / "state"
+    state.mkdir()
+    db = sqlite3.connect(state / "bridge.sqlite")
+    db.execute(
+        "CREATE TABLE turn_map ("
+        "session_id TEXT NOT NULL, agent_key TEXT NOT NULL DEFAULT '', "
+        "generation_id TEXT NOT NULL, turn_index INTEGER NOT NULL, "
+        "seen_at TEXT NOT NULL DEFAULT '', "
+        "PRIMARY KEY (session_id, agent_key, generation_id))"
+    )
+    db.execute(
+        "INSERT INTO turn_map (session_id, agent_key, generation_id, turn_index, seen_at) "
+        "VALUES ('s', '', 'g', 3, '')"
+    )
+    db.commit()
+    db.close()
+    store = bridge.Store(state)
+    try:
+        cols = [row[1] for row in store.db.execute("PRAGMA table_info(turn_map)")]
+        assert "transcript_turn" in cols
+        row = store.db.execute(
+            "SELECT turn_index, transcript_turn FROM turn_map WHERE generation_id='g'"
+        ).fetchone()
+        assert row == (3, 0)
     finally:
         store.close()
 
