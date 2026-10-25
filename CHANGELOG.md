@@ -46,7 +46,10 @@ adheres to [Semantic Versioning](https://semver.org/).
   transaction. Codex `token_usage_record` rows whose `thread_id` belongs to
   another rollout are ignored and cannot disable the local cumulative stream.
   `sync` publishes combined usage, so a transcript without counters does not
-  replace totals already stored by live hooks.
+  replace totals already stored by live hooks. A rescan clears inclusion for
+  mapped turns inside the accepted snapshot before marking the turns that have
+  counters, so a flag left on a trailing prompt cannot stick. A transcript-backed
+  stop covers the reader's turn when allocation has already moved past that index.
 
 ## [0.9.0] — 2026-10-18
 

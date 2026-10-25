@@ -781,10 +781,11 @@ class Store:
         """Store a transcript total and how many turns that snapshot covers.
 
         A later snapshot with fewer turns is ignored, so an earlier generation
-        cannot shrink the baseline. A generation is marked included only when
-        its mapped turn is inside this snapshot and that turn carried usage.
-        A trailing prompt with no counters stays additive, and so does a
-        payload-only generation past the window.
+        cannot shrink the baseline. Mapped turns inside the accepted snapshot
+        are cleared first, then only the usage-bearing subset is marked. A
+        trailing prompt with no counters stays additive, and so does a
+        payload-only generation past the window. A flag left by an older sync
+        cannot survive a rescan via MAX in save_generation_usage.
         """
         agent_key = agent_key or ""
         covered_turns = int(covered_turns or 0)
@@ -818,6 +819,17 @@ class Store:
              int(usage.get("input_tokens") or 0), int(usage.get("output_tokens") or 0),
              int(usage.get("cache_read_tokens") or 0), int(usage.get("cache_write_tokens") or 0),
              covered_turns),
+        )
+        self.db.execute(
+            """
+            UPDATE generation_usage SET in_transcript=0
+            WHERE session_id=? AND agent_key=? AND generation_id!=?
+              AND generation_id IN (
+                  SELECT generation_id FROM turn_map
+                  WHERE session_id=? AND agent_key=? AND turn_index<=?
+              )
+            """,
+            (session_id, agent_key, _TRANSCRIPT_GENERATION, session_id, agent_key, covered_turns),
         )
         if usage_turns:
             marks = ",".join("?" for _ in usage_turns)
@@ -2271,6 +2283,29 @@ def _stream_transcript(path):
     return state, usage, count, last, last_index, updated, usage_turns
 
 
+def _transcript_covers_generation(transcript_turn, allocated_index, usage_turns, turn_count):
+    """True when the transcript total already includes this generation.
+
+    The allocated index is the stable source id and is not lowered when a
+    later transcript turn is behind it. Coverage still follows the turn the
+    reader assigned: if that turn is the end of this snapshot and it has
+    counters, the generation is included even though its source id is higher.
+    A trailing prompt keeps an earlier assistant turn from covering a
+    generation the file has not accounted for yet.
+    """
+    covered = {int(index) for index in usage_turns or []}
+    transcript_turn = int(transcript_turn or 0)
+    allocated_index = int(allocated_index or 0)
+    turn_count = int(turn_count or 0)
+    if allocated_index in covered:
+        return True
+    return (
+        transcript_turn in covered
+        and transcript_turn == turn_count
+        and allocated_index > turn_count
+    )
+
+
 def _process_hook(bridge, payload, config, runtime, event):
     if event in END_EVENTS:
         _publish_end(bridge, payload, config, runtime)
@@ -2321,6 +2356,7 @@ def _process_hook(bridge, payload, config, runtime, event):
     updated_at = ""
     target = None
     turn_index = 0
+    transcript_turn = 0
     usage_turns = []
     if isinstance(transcript, str) and transcript and Path(transcript).is_file():
         state, file_usage, turn_count, target, turn_index, _updated, usage_turns = (
@@ -2338,6 +2374,7 @@ def _process_hook(bridge, payload, config, runtime, event):
         if turn_count:
             bridge.store.note_high_water(session_id, agent_key, turn_count)
         if turn_index:
+            transcript_turn = int(turn_index)
             turn_index = bridge.store.bind_turn(session_id, agent_key, generation_id, turn_index)
         if started:
             started = bridge.store.remember_started(session_id, agent_key, started)
@@ -2387,9 +2424,13 @@ def _process_hook(bridge, payload, config, runtime, event):
         # counters stay raw; Cursor normalization happens when a generation is summed.
         bridge.store.replace_transcript_usage(
             session_id, agent_key, file_usage, turn_count, usage_turns)
+        # bind_turn will not lower an index allocated before this turn existed.
+        # Coverage follows the reader's turn when that turn is the end of the
+        # snapshot and it has counters; the source id stays on the higher index.
         bridge.store.save_generation_usage(
             session_id, generation_id, agent_key, payload_usage or _empty_usage(),
-            included=bool(turn_index) and turn_index in usage_turns,
+            included=_transcript_covers_generation(
+                transcript_turn, turn_index, usage_turns, turn_count),
         )
         usage = bridge.store.combined_usage(session_id, agent_key, cursor=cursor_payload)
     elif any(payload_usage.values()):

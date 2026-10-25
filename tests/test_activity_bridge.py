@@ -1764,6 +1764,164 @@ def test_trailing_prompt_does_not_drop_usage_the_transcript_never_saw(tmp_path):
     assert summary["output_tokens"] == 6
 
 
+def test_resync_clears_a_trailing_prompt_marked_included_by_the_old_bug(tmp_path):
+    config = cfg(tmp_path)
+    store = bridge.Store(config.state_dir)
+    try:
+        store.db.executemany(
+            "INSERT INTO turn_map (session_id, agent_key, generation_id, turn_index, seen_at) "
+            "VALUES ('sess-stuck', '', ?, ?, '')",
+            [("g1", 1), ("g2", 2)],
+        )
+        store.db.executemany(
+            "INSERT INTO generation_usage ("
+            "session_id, generation_id, agent_key, input_tokens, output_tokens, "
+            "cache_read_tokens, cache_write_tokens, in_transcript, covered_turns"
+            ") VALUES ('sess-stuck', ?, '', ?, ?, 0, 0, ?, ?)",
+            [
+                ("g1", 10, 4, 1, 0),
+                ("g2", 5, 2, 1, 0),
+                (bridge._TRANSCRIPT_GENERATION, 10, 4, 0, 2),
+            ],
+        )
+        store.db.execute(
+            "INSERT INTO turn_high_water (session_id, agent_key, high_water, started_at) "
+            "VALUES ('sess-stuck', '', 2, '')"
+        )
+        store.db.commit()
+        assert store.combined_usage("sess-stuck")["input_tokens"] == 10
+    finally:
+        store.close()
+    write_jsonl(tmp_path / "sess-stuck.jsonl", [
+        {"role": "user", "content": "one", "ts": "2026-10-25T11:00:00Z"},
+        {
+            "role": "assistant", "content": "uno", "model": "m",
+            "ts": "2026-10-25T11:00:01Z",
+            "usage": {"input_tokens": 10, "output_tokens": 4},
+        },
+        {"role": "user", "content": "two", "ts": "2026-10-25T11:01:00Z"},
+    ])
+    poster = FakePoster()
+    bridge.sync_tree(tmp_path / "sess-stuck.jsonl", config, poster=poster, vendor="claude")
+    summary = _summaries(poster, "sess-stuck")[-1]
+    assert summary["input_tokens"] == 15
+    assert summary["output_tokens"] == 6
+    bridge.process_hook({
+        "hook_event_name": "stop",
+        "conversation_id": "sess-stuck",
+        "generation_id": "g2",
+        "model": "m",
+        "prompt": "two",
+        "output": "dos",
+        "input_tokens": 5,
+        "output_tokens": 2,
+    }, config, poster, runtime="claude")
+    summary = _summaries(poster, "sess-stuck")[-1]
+    assert summary["input_tokens"] == 15
+    assert summary["output_tokens"] == 6
+    store = bridge.Store(config.state_dir)
+    try:
+        flags = dict(store.db.execute(
+            "SELECT generation_id, in_transcript FROM generation_usage WHERE session_id=?",
+            ("sess-stuck",),
+        ).fetchall())
+        assert flags["g1"] == 1
+        assert flags["g2"] == 0
+        assert store.combined_usage("sess-stuck")["input_tokens"] == 15
+    finally:
+        store.close()
+
+
+def test_sync_before_hook_reconciles_coverage_with_the_transcript_turn(tmp_path):
+    path = write_jsonl(tmp_path / "sess-ahead.jsonl", [
+        {"role": "user", "content": "one", "ts": "2026-10-25T11:00:00Z"},
+        {
+            "role": "assistant", "content": "uno", "model": "m",
+            "ts": "2026-10-25T11:00:01Z",
+            "usage": {"input_tokens": 10, "output_tokens": 4},
+        },
+        {"role": "user", "content": "two", "ts": "2026-10-25T11:01:00Z"},
+    ])
+    poster = FakePoster()
+    config = cfg(tmp_path)
+    bridge.sync_tree(path, config, poster=poster, vendor="claude")
+    assert _summaries(poster, "sess-ahead")[-1]["input_tokens"] == 10
+
+    def stop(**extra):
+        payload = {
+            "hook_event_name": "stop",
+            "conversation_id": "sess-ahead",
+            "generation_id": "g2",
+            "model": "m",
+            "output": "dos",
+            "input_tokens": 5,
+            "output_tokens": 1,
+        }
+        payload.update(extra)
+        return payload
+
+    bridge.process_hook(stop(), config, poster, runtime="claude")
+    summary = _summaries(poster, "sess-ahead")[-1]
+    assert summary["input_tokens"] == 15
+    assert summary["output_tokens"] == 5
+    store = bridge.Store(config.state_dir)
+    try:
+        index = store.db.execute(
+            "SELECT turn_index FROM turn_map WHERE session_id=? AND generation_id=?",
+            ("sess-ahead", "g2"),
+        ).fetchone()
+        assert index[0] == 3
+    finally:
+        store.close()
+
+    bridge.process_hook(stop(transcript_path=str(path)), config, poster, runtime="claude")
+    summary = _summaries(poster, "sess-ahead")[-1]
+    assert summary["input_tokens"] == 15
+    assert summary["output_tokens"] == 5
+    store = bridge.Store(config.state_dir)
+    try:
+        row = store.db.execute(
+            "SELECT turn_index, in_transcript FROM turn_map "
+            "JOIN generation_usage USING (session_id, agent_key, generation_id) "
+            "WHERE session_id=? AND generation_id=?",
+            ("sess-ahead", "g2"),
+        ).fetchone()
+        assert row == (3, 0)
+    finally:
+        store.close()
+
+    write_jsonl(path, [
+        {"role": "user", "content": "one", "ts": "2026-10-25T11:00:00Z"},
+        {
+            "role": "assistant", "content": "uno", "model": "m",
+            "ts": "2026-10-25T11:00:01Z",
+            "usage": {"input_tokens": 10, "output_tokens": 4},
+        },
+        {"role": "user", "content": "two", "ts": "2026-10-25T11:01:00Z"},
+        {
+            "role": "assistant", "content": "dos", "model": "m",
+            "ts": "2026-10-25T11:01:01Z",
+            "usage": {"input_tokens": 5, "output_tokens": 1},
+        },
+    ])
+    bridge.process_hook(stop(transcript_path=str(path)), config, poster, runtime="claude")
+    summary = _summaries(poster, "sess-ahead")[-1]
+    assert summary["input_tokens"] == 15
+    assert summary["output_tokens"] == 5
+    store = bridge.Store(config.state_dir)
+    try:
+        row = store.db.execute(
+            "SELECT turn_index, in_transcript FROM turn_map "
+            "JOIN generation_usage USING (session_id, agent_key, generation_id) "
+            "WHERE session_id=? AND generation_id=?",
+            ("sess-ahead", "g2"),
+        ).fetchone()
+        assert row == (3, 1)
+        assert store.combined_usage("sess-ahead")["input_tokens"] == 15
+    finally:
+        store.close()
+
+
 def test_turn_allocation_sees_a_concurrent_high_water_update(tmp_path, monkeypatch):
     config = cfg(tmp_path)
     bridge.Store(config.state_dir).close()
