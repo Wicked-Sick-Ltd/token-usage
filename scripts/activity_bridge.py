@@ -1,0 +1,1614 @@
+#!/usr/bin/env python3
+"""Opt-in activity stream from Cursor, Claude Code, Codex and Grok Bot to llm1.
+
+The bridge is inert until WIZZO_COORD_URL, WIZZO_TWIN_API_URL, or
+~/.config/wizzo/activity-bridge.env (honouring XDG_CONFIG_HOME) sets a
+destination. Hook entry points always exit 0. A short HTTP timeout and a
+local SQLite spool keep a turn when mcp-coordination (:8140) or twin-api
+(:8100) is unreachable. `sync` forwards new JSONL turns idempotently.
+
+Stdlib only. Python 3.9+.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import socket
+import sqlite3
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+CURSOR_EVENTS = {
+    "beforeSubmitPrompt",
+    "stop",
+    "subagentStart",
+    "subagentStop",
+    "afterAgentResponse",
+    "sessionEnd",
+}
+COMPLETION_EVENTS = {"stop", "subagentStop", "Stop", "SubagentStop", "afterAgentResponse"}
+PROMPT_EVENTS = {"beforeSubmitPrompt", "subagentStart"}
+END_EVENTS = {"sessionEnd", "SessionEnd"}
+ENDPOINTS = {
+    "register": ("coord", "/session/register"),
+    "heartbeat": ("coord", "/session/heartbeat"),
+    "turn": ("coord", "/session/turn"),
+    "ai_sessions": ("coord", "/api/ai-sessions"),
+    "end": ("coord", "/session/end"),
+    "ingest": ("twin", "/v1/ingest"),
+}
+ENV_NAMES = (
+    "WIZZO_COORD_URL",
+    "WIZZO_COORD_TOKEN",
+    "WIZZO_TWIN_API_URL",
+    "WIZZO_TWIN_TOKEN",
+    "WIZZO_ACTIVITY_BRIDGE",
+    "WIZZO_ACTIVITY_STATE_DIR",
+    "WIZZO_ACTIVITY_HTTP_TIMEOUT",
+    "WIZZO_ACTIVITY_SYNC_DIRS",
+    "WIZZO_MACHINE",
+    "WIZZO_REPO",
+    "WIZZO_BRANCH",
+    "WIZZO_SURFACE",
+    "WIZZO_VENDOR",
+    "XDG_CONFIG_HOME",
+    "XDG_CACHE_HOME",
+    "TOKEN_USAGE_LEDGER_DIR",
+)
+FIELD_LIMIT = 20000
+_GIT_CACHE = {}
+_DISABLED = {"0", "off", "false", "no"}
+_SKIP_TYPES = {
+    "session_meta",
+    "progress",
+    "event_msg",
+    "token_count",
+    "turn_context",
+    "rate_limit",
+    "rate_limit_event",
+    "system",
+}
+
+
+class DeliveryError(Exception):
+    """A POST did not land. The body stays in the local spool."""
+
+
+class Config:
+    """Resolved bridge settings. Empty URLs leave that target unused."""
+
+    def __init__(self, coord_url, coord_token, twin_url, twin_token, enabled,
+                 state_dir, timeout, machine, repo, branch, surface, vendor,
+                 sync_dirs):
+        self.coord_url = coord_url
+        self.coord_token = coord_token
+        self.twin_url = twin_url
+        self.twin_token = twin_token
+        self.enabled = enabled
+        self.state_dir = state_dir
+        self.timeout = timeout
+        self.machine = machine
+        self.repo = repo
+        self.branch = branch
+        self.surface = surface
+        self.vendor = vendor
+        self.sync_dirs = sync_dirs
+
+
+class Turn:
+    """One user prompt plus the tool calls and assistant text that followed."""
+
+    def __init__(self):
+        self.prompt = ""
+        self.assistant_parts = []
+        self.tools = []
+        self.model = ""
+        self.timestamp = ""
+        self.usage = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+        }
+
+    @property
+    def assistant(self):
+        return "\n\n".join(part for part in self.assistant_parts if part)
+
+    @property
+    def has_assistant(self):
+        return bool(self.assistant or self.tools)
+
+    def add_usage(self, usage):
+        if not usage:
+            return
+        for key in self.usage:
+            self.usage[key] += int(usage.get(key) or 0)
+
+
+def _warn(message):
+    try:
+        sys.stderr.write(str(message) + "\n")
+        sys.stderr.flush()
+    except OSError:
+        pass
+
+
+def _flush_stdout():
+    try:
+        sys.stdout.flush()
+    except OSError:
+        try:
+            fd = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(fd, sys.stdout.fileno())
+            os.close(fd)
+            sys.stdout.flush()
+        except (OSError, ValueError, AttributeError):
+            pass
+
+
+def _process_env():
+    """Literals so the README configuration check sees every variable."""
+    return {
+        "WIZZO_COORD_URL": os.environ.get("WIZZO_COORD_URL"),
+        "WIZZO_COORD_TOKEN": os.environ.get("WIZZO_COORD_TOKEN"),
+        "WIZZO_TWIN_API_URL": os.environ.get("WIZZO_TWIN_API_URL"),
+        "WIZZO_TWIN_TOKEN": os.environ.get("WIZZO_TWIN_TOKEN"),
+        "WIZZO_ACTIVITY_BRIDGE": os.environ.get("WIZZO_ACTIVITY_BRIDGE"),
+        "WIZZO_ACTIVITY_STATE_DIR": os.environ.get("WIZZO_ACTIVITY_STATE_DIR"),
+        "WIZZO_ACTIVITY_HTTP_TIMEOUT": os.environ.get("WIZZO_ACTIVITY_HTTP_TIMEOUT"),
+        "WIZZO_ACTIVITY_SYNC_DIRS": os.environ.get("WIZZO_ACTIVITY_SYNC_DIRS"),
+        "WIZZO_MACHINE": os.environ.get("WIZZO_MACHINE"),
+        "WIZZO_REPO": os.environ.get("WIZZO_REPO"),
+        "WIZZO_BRANCH": os.environ.get("WIZZO_BRANCH"),
+        "WIZZO_SURFACE": os.environ.get("WIZZO_SURFACE"),
+        "WIZZO_VENDOR": os.environ.get("WIZZO_VENDOR"),
+        "XDG_CONFIG_HOME": os.environ.get("XDG_CONFIG_HOME"),
+        "XDG_CACHE_HOME": os.environ.get("XDG_CACHE_HOME"),
+        "TOKEN_USAGE_LEDGER_DIR": os.environ.get("TOKEN_USAGE_LEDGER_DIR"),
+    }
+
+
+def config_file(environ=None):
+    source = _process_env() if environ is None else environ
+    xdg = _text(source.get("XDG_CONFIG_HOME"))
+    base = Path(xdg) if xdg else Path.home() / ".config"
+    return base / "wizzo" / "activity-bridge.env"
+
+
+def parse_env_file(path):
+    """KEY=VALUE lines. Does not expand shells or override existing keys."""
+    vals = {}
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return vals
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].strip()
+        if "=" not in line:
+            continue
+        key, val = line.split("=", 1)
+        key = key.strip()
+        val = val.strip()
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
+            val = val[1:-1]
+        if key:
+            vals[key] = val
+    return vals
+
+
+def _text(value):
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _timeout(raw):
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return 0.8
+    if val <= 0:
+        return 0.8
+    return val
+
+
+def _state_dir(vals):
+    explicit = _text(vals.get("WIZZO_ACTIVITY_STATE_DIR"))
+    if explicit:
+        return Path(explicit)
+    ledger = _text(vals.get("TOKEN_USAGE_LEDGER_DIR"))
+    if ledger:
+        return Path(ledger) / "activity-bridge"
+    xdg = _text(vals.get("XDG_CACHE_HOME"))
+    base = Path(xdg) if xdg else Path.home() / ".cache"
+    return base / "token-usage" / "activity-bridge"
+
+
+def _split_dirs(raw):
+    text = _text(raw)
+    if not text:
+        return []
+    return [part for part in text.split(os.pathsep) if part]
+
+
+def load_config(environ=None):
+    """File values first, then non-empty process environment.
+
+    Pass `environ` from tests so a developer machine with the bridge
+    configured cannot leak into the suite.
+    """
+    file_vals = parse_env_file(config_file(environ))
+    process = _process_env() if environ is None else {
+        name: environ.get(name) for name in ENV_NAMES
+    }
+    merged = dict(file_vals)
+    for key, val in process.items():
+        if _text(val):
+            merged[key] = _text(val)
+    flag = _text(merged.get("WIZZO_ACTIVITY_BRIDGE")).lower()
+    coord = _text(merged.get("WIZZO_COORD_URL")).rstrip("/")
+    twin = _text(merged.get("WIZZO_TWIN_API_URL")).rstrip("/")
+    enabled = flag not in _DISABLED and bool(coord or twin)
+    machine = _text(merged.get("WIZZO_MACHINE")) or socket.gethostname() or "unknown"
+    return Config(
+        coord_url=coord,
+        coord_token=_text(merged.get("WIZZO_COORD_TOKEN")),
+        twin_url=twin,
+        twin_token=_text(merged.get("WIZZO_TWIN_TOKEN")),
+        enabled=enabled,
+        state_dir=_state_dir(merged),
+        timeout=_timeout(merged.get("WIZZO_ACTIVITY_HTTP_TIMEOUT")),
+        machine=machine,
+        repo=_text(merged.get("WIZZO_REPO")),
+        branch=_text(merged.get("WIZZO_BRANCH")),
+        surface=_text(merged.get("WIZZO_SURFACE")),
+        vendor=_text(merged.get("WIZZO_VENDOR")),
+        sync_dirs=_split_dirs(merged.get("WIZZO_ACTIVITY_SYNC_DIRS")),
+    )
+
+
+def clip(text, limit=FIELD_LIMIT):
+    if text is None:
+        return ""
+    if not isinstance(text, str):
+        text = str(text)
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "\n…[truncated]"
+
+
+def clean_id(value, fallback="unknown"):
+    text = _text(value)
+    text = re.sub(r"[\r\n\x00]", "", text)
+    return text or fallback
+
+
+def vendor_name(runtime):
+    runtime = _text(runtime).lower().replace("-", "_")
+    if runtime in {"grok", "grok_bot"}:
+        return "grok"
+    if runtime in {"cursor", "cloud_agent"}:
+        return "cursor"
+    if runtime in {"claude", "claude_code"}:
+        return "claude"
+    if runtime == "codex":
+        return "codex"
+    if runtime in {"gemini", "antigravity"}:
+        return "gemini"
+    return runtime or "cursor"
+
+
+def source_type_name(runtime):
+    runtime = _text(runtime).lower().replace("-", "_")
+    if runtime in {"grok", "grok_bot"}:
+        return "grok_bot"
+    if runtime in {"cursor", "cloud_agent"}:
+        return "cursor"
+    if runtime in {"claude", "claude_code"}:
+        return "claude"
+    if runtime == "codex":
+        return "codex"
+    if runtime in {"gemini", "antigravity"}:
+        return "gemini"
+    return runtime or "cursor"
+
+
+def default_surface(runtime, path=""):
+    path_l = str(path or "").replace("\\", "/").lower()
+    if "cloud-agent" in path_l or "cloud_agent" in path_l:
+        return "cloud_agent"
+    runtime = _text(runtime).lower().replace("-", "_")
+    if runtime in {"grok", "grok_bot"}:
+        return "grok_bot"
+    if runtime == "codex":
+        return "codex"
+    if runtime in {"claude", "claude_code"}:
+        return "claude_code"
+    if runtime in {"gemini", "antigravity"}:
+        return "antigravity"
+    return "ide"
+
+
+def infer_runtime(path, vendor=""):
+    if _text(vendor):
+        return vendor_name(vendor)
+    path_l = str(path).replace("\\", "/").lower()
+    if "grok" in path_l:
+        return "grok"
+    if "codex" in path_l:
+        return "codex"
+    if ".claude" in path_l or "/claude/" in path_l:
+        return "claude"
+    if "gemini" in path_l or "antigravity" in path_l:
+        return "gemini"
+    return "cursor"
+
+
+def repo_slug(remote, toplevel):
+    """org/repo from an origin URL, else the checkout directory name."""
+    text = _text(remote)
+    text = text.removesuffix(".git")
+    if text:
+        if "://" in text:
+            text = text.split("://", 1)[1]
+            text = text.split("/", 1)[1] if "/" in text else ""
+        elif ":" in text:
+            text = text.split(":", 1)[1]
+        text = text.strip("/")
+        if text:
+            return text
+    if toplevel:
+        return Path(toplevel).name
+    return ""
+
+
+def lookup_git(cwd):
+    """(repo slug, branch) for cwd. Cached. Empty strings when git is absent."""
+    key = str(cwd or "")
+    if key in _GIT_CACHE:
+        return _GIT_CACHE[key]
+    repo, branch = "", ""
+    if key and Path(key).exists():
+        try:
+            top = subprocess.run(
+                ["git", "-C", key, "rev-parse", "--show-toplevel"],
+                capture_output=True, text=True, timeout=0.4, check=False,
+            )
+            if top.returncode == 0:
+                toplevel = _text(top.stdout)
+                remote = subprocess.run(
+                    ["git", "-C", key, "remote", "get-url", "origin"],
+                    capture_output=True, text=True, timeout=0.4, check=False,
+                )
+                repo = repo_slug(remote.stdout if remote.returncode == 0 else "", toplevel)
+                branch_run = subprocess.run(
+                    ["git", "-C", key, "symbolic-ref", "--short", "HEAD"],
+                    capture_output=True, text=True, timeout=0.4, check=False,
+                )
+                if branch_run.returncode != 0:
+                    branch_run = subprocess.run(
+                        ["git", "-C", key, "rev-parse", "--abbrev-ref", "HEAD"],
+                        capture_output=True, text=True, timeout=0.4, check=False,
+                    )
+                if branch_run.returncode == 0:
+                    branch = _text(branch_run.stdout)
+                    if branch == "HEAD":
+                        branch = ""
+        except (OSError, subprocess.TimeoutExpired):
+            repo, branch = "", ""
+    _GIT_CACHE[key] = (repo, branch)
+    return repo, branch
+
+
+def resolve_place(cwd, config):
+    repo, branch = config.repo, config.branch
+    if repo and branch:
+        return repo, branch
+    got_repo, got_branch = lookup_git(cwd)
+    return repo or got_repo, branch or got_branch
+
+
+def utc_now():
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _hash(body):
+    raw = json.dumps(body, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+class Store:
+    """SQLite watermark and spool. The directory is owner-only when it can be."""
+
+    def __init__(self, directory):
+        self.directory = Path(directory)
+        self.directory.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(self.directory, 0o700)
+        except OSError:
+            pass
+        self.path = self.directory / "bridge.sqlite"
+        self.db = sqlite3.connect(str(self.path), timeout=1.0)
+        self.db.execute("PRAGMA busy_timeout=1000")
+        self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS delivered (
+                source_id TEXT NOT NULL,
+                endpoint TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                delivered_at TEXT NOT NULL,
+                PRIMARY KEY (source_id, endpoint, content_hash)
+            );
+            CREATE TABLE IF NOT EXISTS spool (
+                source_id TEXT NOT NULL,
+                endpoint TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                target TEXT NOT NULL,
+                path TEXT NOT NULL,
+                body TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 1,
+                last_error TEXT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (source_id, endpoint, content_hash)
+            );
+            CREATE TABLE IF NOT EXISTS prompts (
+                session_id TEXT NOT NULL,
+                generation_id TEXT NOT NULL,
+                prompt TEXT NOT NULL,
+                model TEXT,
+                cwd TEXT,
+                turn_index INTEGER NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (session_id, generation_id)
+            );
+            """
+        )
+        self.db.commit()
+
+    def close(self):
+        self.db.close()
+
+    def is_delivered(self, source_id, endpoint, content_hash):
+        row = self.db.execute(
+            "SELECT 1 FROM delivered WHERE source_id=? AND endpoint=? AND content_hash=?",
+            (source_id, endpoint, content_hash),
+        ).fetchone()
+        return row is not None
+
+    def mark_delivered(self, source_id, endpoint, content_hash):
+        self.db.execute(
+            "INSERT OR REPLACE INTO delivered (source_id, endpoint, content_hash, delivered_at) "
+            "VALUES (?, ?, ?, ?)",
+            (source_id, endpoint, content_hash, utc_now()),
+        )
+        self.db.commit()
+
+    def enqueue(self, source_id, endpoint, content_hash, target, path, body, error):
+        self.db.execute(
+            "INSERT OR IGNORE INTO spool (source_id, endpoint, content_hash, target, path, "
+            "body, attempts, last_error, created_at) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)",
+            (source_id, endpoint, content_hash, target, path,
+             json.dumps(body, ensure_ascii=False), _text(error)[:300], utc_now()),
+        )
+        self.db.commit()
+
+    def drop_spool(self, source_id, endpoint, content_hash):
+        self.db.execute(
+            "DELETE FROM spool WHERE source_id=? AND endpoint=? AND content_hash=?",
+            (source_id, endpoint, content_hash),
+        )
+        self.db.commit()
+
+    def pending(self, limit):
+        return self.db.execute(
+            "SELECT source_id, endpoint, content_hash, target, path, body, attempts "
+            "FROM spool ORDER BY created_at, source_id LIMIT ?",
+            (int(limit),),
+        ).fetchall()
+
+    def note_failure(self, source_id, endpoint, content_hash, error):
+        self.db.execute(
+            "UPDATE spool SET attempts = attempts + 1, last_error=? "
+            "WHERE source_id=? AND endpoint=? AND content_hash=?",
+            (_text(error)[:300], source_id, endpoint, content_hash),
+        )
+        self.db.commit()
+
+    def pending_count(self):
+        return self.db.execute("SELECT COUNT(*) FROM spool").fetchone()[0]
+
+    def save_prompt(self, session_id, generation_id, prompt, model, cwd, turn_index):
+        self.db.execute(
+            "INSERT OR REPLACE INTO prompts (session_id, generation_id, prompt, model, cwd, "
+            "turn_index, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (session_id, generation_id, prompt, model or "", cwd or "", int(turn_index), utc_now()),
+        )
+        self.db.commit()
+
+    def load_prompt(self, session_id, generation_id):
+        row = self.db.execute(
+            "SELECT prompt, model, cwd, turn_index FROM prompts "
+            "WHERE session_id=? AND generation_id=?",
+            (session_id, generation_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return {"prompt": row[0], "model": row[1], "cwd": row[2], "turn_index": row[3]}
+
+    def next_turn_index(self, session_id):
+        row = self.db.execute(
+            "SELECT COALESCE(MAX(turn_index), 0) + 1 FROM prompts WHERE session_id=?",
+            (session_id,),
+        ).fetchone()
+        return int(row[0] if row else 1)
+
+
+def post_json(url, body, token, timeout):
+    """POST JSON. 2xx and 409 count as delivered. Other HTTP statuses and
+    network errors raise DeliveryError so the caller can spool the body."""
+    data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method="POST")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Accept", "application/json")
+    if token:
+        req.add_header("Authorization", "Bearer " + token)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            status = getattr(resp, "status", 200)
+            resp.read()
+        if 200 <= status < 300 or status == 409:
+            return status
+        raise DeliveryError("HTTP " + str(status))
+    except urllib.error.HTTPError as exc:
+        if 200 <= exc.code < 300 or exc.code == 409:
+            return exc.code
+        raise DeliveryError("HTTP " + str(exc.code)) from exc
+    except urllib.error.URLError as exc:
+        raise DeliveryError(str(getattr(exc, "reason", exc))) from exc
+
+
+class Bridge:
+    """Sends one process's posts. The first network failure spools the rest."""
+
+    def __init__(self, config, poster=None, store=None):
+        self.config = config
+        self.poster = poster or post_json
+        self.store = store or Store(config.state_dir)
+        self.offline = False
+        self.delivered = 0
+        self.spooled = 0
+
+    def close(self):
+        self.store.close()
+
+    def send(self, endpoint, source_id, body):
+        target, path = ENDPOINTS[endpoint]
+        base = self.config.coord_url if target == "coord" else self.config.twin_url
+        if not base:
+            return False
+        content_hash = _hash(body)
+        if self.store.is_delivered(source_id, endpoint, content_hash):
+            return True
+        if self.offline:
+            self.store.enqueue(source_id, endpoint, content_hash, target, path, body, "offline")
+            self.spooled += 1
+            return False
+        token = self.config.coord_token if target == "coord" else self.config.twin_token
+        try:
+            self.poster(base + path, body, token, self.config.timeout)
+        except DeliveryError as exc:
+            self.offline = True
+            self.store.enqueue(source_id, endpoint, content_hash, target, path, body, str(exc))
+            self.spooled += 1
+            return False
+        self.store.mark_delivered(source_id, endpoint, content_hash)
+        self.store.drop_spool(source_id, endpoint, content_hash)
+        self.delivered += 1
+        return True
+
+    def flush(self, limit=50):
+        sent = 0
+        for row in self.store.pending(limit):
+            source_id, endpoint, content_hash, target, path, body, _attempts = row
+            if self.offline:
+                break
+            base = self.config.coord_url if target == "coord" else self.config.twin_url
+            if not base:
+                continue
+            if self.store.is_delivered(source_id, endpoint, content_hash):
+                self.store.drop_spool(source_id, endpoint, content_hash)
+                continue
+            token = self.config.coord_token if target == "coord" else self.config.twin_token
+            try:
+                self.poster(base + path, json.loads(body), token, self.config.timeout)
+            except (DeliveryError, ValueError) as exc:
+                self.offline = True
+                self.store.note_failure(source_id, endpoint, content_hash, str(exc))
+            else:
+                self.store.mark_delivered(source_id, endpoint, content_hash)
+                self.store.drop_spool(source_id, endpoint, content_hash)
+                sent += 1
+                self.delivered += 1
+        return sent
+
+
+def _content(rec):
+    msg = rec.get("message")
+    if isinstance(msg, dict) and "content" in msg:
+        return msg.get("content")
+    if "content" in rec:
+        return rec.get("content")
+    if isinstance(rec.get("text"), str):
+        return rec.get("text")
+    return ""
+
+
+def _text_from_content(content):
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, (int, float)) and not isinstance(content, bool):
+        return str(content)
+    if isinstance(content, dict):
+        if isinstance(content.get("text"), str):
+            return content["text"].strip()
+        nested = content.get("content")
+        if isinstance(nested, str):
+            return nested.strip()
+        return ""
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, str):
+                if block.strip():
+                    parts.append(block.strip())
+                continue
+            if not isinstance(block, dict):
+                continue
+            kind = block.get("type")
+            if kind in {"tool_result", "tool_result_error", "tool_use", "tool_call"}:
+                continue
+            if isinstance(block.get("text"), str) and block["text"].strip():
+                parts.append(block["text"].strip())
+            elif (
+                kind in {None, "text", "output_text"}
+                and isinstance(block.get("content"), str)
+                and block["content"].strip()
+            ):
+                parts.append(block["content"].strip())
+        return "\n".join(parts).strip()
+    return ""
+
+
+def _role(rec):
+    typ = rec.get("type")
+    if isinstance(typ, str) and typ in _SKIP_TYPES:
+        return ""
+    if typ in {"tool_result", "tool"}:
+        return "tool"
+    msg = rec.get("message")
+    if isinstance(msg, dict) and isinstance(msg.get("role"), str):
+        return msg["role"].strip().lower()
+    if isinstance(rec.get("role"), str):
+        return rec["role"].strip().lower()
+    speaker = rec.get("speaker") or rec.get("author")
+    if isinstance(speaker, str):
+        speaker = speaker.strip().lower()
+        if speaker in {"human", "user"}:
+            return "user"
+        if speaker in {"assistant", "ai", "bot", "grok", "model"}:
+            return "assistant"
+        if speaker == "tool":
+            return "tool"
+    if typ in {"user", "assistant"}:
+        return typ
+    return ""
+
+
+def _model(rec):
+    msg = rec.get("message") if isinstance(rec.get("message"), dict) else {}
+    for candidate in (msg.get("model"), rec.get("model"), rec.get("subagent_model")):
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return ""
+
+
+def _timestamp(rec):
+    msg = rec.get("message") if isinstance(rec.get("message"), dict) else {}
+    for candidate in (rec.get("timestamp"), rec.get("ts"), rec.get("created_at"),
+                      rec.get("time"), msg.get("timestamp")):
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return ""
+
+
+def _num(usage, *keys):
+    for key in keys:
+        val = usage.get(key)
+        if isinstance(val, (int, float)) and not isinstance(val, bool):
+            return int(val)
+    return 0
+
+
+def _usage(rec):
+    msg = rec.get("message") if isinstance(rec.get("message"), dict) else {}
+    usage = rec.get("usage") or msg.get("usage") or rec.get("token_usage") or rec.get("tokens") or {}
+    if not isinstance(usage, dict):
+        return {}
+    cache_write = _num(usage, "cache_write_tokens", "cache_creation_input_tokens", "cache_write")
+    creation = usage.get("cache_creation")
+    if isinstance(creation, dict):
+        cache_write += _num(creation, "ephemeral_5m_input_tokens")
+        cache_write += _num(creation, "ephemeral_1h_input_tokens")
+    return {
+        "input_tokens": _num(usage, "input_tokens", "input"),
+        "output_tokens": _num(usage, "output_tokens", "output"),
+        "cache_read_tokens": _num(usage, "cache_read_tokens", "cache_read_input_tokens", "cache_read"),
+        "cache_write_tokens": cache_write,
+    }
+
+
+def _coerce_input(value):
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped[:1] in "{[":
+            try:
+                return json.loads(stripped)
+            except ValueError:
+                return value
+        return value
+    if isinstance(value, (dict, list)):
+        return value
+    if value is None:
+        return {}
+    return {"value": value}
+
+
+def _tool_calls(rec, content):
+    calls = []
+    blocks = content if isinstance(content, list) else []
+    msg = rec.get("message") if isinstance(rec.get("message"), dict) else {}
+    extras = []
+    for source in (rec.get("tool_calls"), msg.get("tool_calls")):
+        if isinstance(source, list):
+            extras.extend(source)
+    for block in list(blocks) + extras:
+        if not isinstance(block, dict):
+            continue
+        kind = block.get("type")
+        if kind not in {None, "tool_use", "tool_call", "function"} and "name" not in block and "function" not in block:
+            continue
+        fn = block.get("function") if isinstance(block.get("function"), dict) else {}
+        name = block.get("name") or block.get("tool") or fn.get("name")
+        if not name:
+            continue
+        if kind not in {None, "tool_use", "tool_call", "function"} and "input" not in block and "arguments" not in block:
+            continue
+        raw_input = block.get("input") if "input" in block else block.get("arguments", fn.get("arguments"))
+        calls.append({
+            "id": str(block.get("id") or block.get("tool_use_id") or ""),
+            "name": str(name),
+            "input": _coerce_input(raw_input),
+            "result": "",
+        })
+    return calls
+
+
+def _tool_results(content):
+    results = []
+    if not isinstance(content, list):
+        return results
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") not in {"tool_result", "tool_result_error"}:
+            continue
+        results.append({
+            "id": str(block.get("tool_use_id") or block.get("id") or ""),
+            "name": str(block.get("name") or ""),
+            "text": _text_from_content(block.get("content")),
+        })
+    return results
+
+
+def _tool_only(content):
+    if not isinstance(content, list) or not content:
+        return False
+    saw = False
+    for block in content:
+        if not isinstance(block, dict):
+            return False
+        if block.get("type") not in {"tool_result", "tool_result_error"}:
+            return False
+        saw = True
+    return saw
+
+
+def _attach_results(turn, results):
+    for result in results:
+        if not result:
+            continue
+        matched = None
+        rid = result.get("id") or ""
+        name = result.get("name") or ""
+        if rid:
+            for call in turn.tools:
+                if call.get("id") == rid:
+                    matched = call
+                    break
+        if matched is None and name:
+            for call in turn.tools:
+                if call.get("name") == name and not call.get("result"):
+                    matched = call
+                    break
+        if matched is None:
+            matched = {"id": rid, "name": name or "tool", "input": {}, "result": ""}
+            turn.tools.append(matched)
+        text = result.get("text") or ""
+        if not text:
+            continue
+        if matched["result"]:
+            matched["result"] += "\n" + text
+        else:
+            matched["result"] = text
+
+
+def _tool_message_result(rec):
+    return {
+        "id": str(rec.get("tool_call_id") or rec.get("tool_use_id") or rec.get("id") or ""),
+        "name": str(rec.get("name") or rec.get("tool") or ""),
+        "text": _text_from_content(_content(rec)),
+    }
+
+
+def extract_turns(records):
+    """Group JSONL records into turns. Tool results stay on the open turn."""
+    turns = []
+    current = None
+
+    def close():
+        nonlocal current
+        if current is not None and (current.prompt or current.has_assistant):
+            turns.append(current)
+        current = None
+
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        role = _role(rec)
+        if not role or role == "system":
+            continue
+        content = _content(rec)
+        ts = _timestamp(rec)
+        model = _model(rec)
+        if role == "user":
+            results = _tool_results(content)
+            text = "" if _tool_only(content) else _text_from_content(content)
+            if results and not text:
+                if current is None:
+                    current = Turn()
+                _attach_results(current, results)
+                if ts and not current.timestamp:
+                    current.timestamp = ts
+                continue
+            close()
+            current = Turn()
+            current.prompt = text
+            current.timestamp = ts
+            if results:
+                _attach_results(current, results)
+            continue
+        if current is None:
+            current = Turn()
+            current.timestamp = ts
+        if model and not current.model:
+            current.model = model
+        if ts and not current.timestamp:
+            current.timestamp = ts
+        if role == "assistant":
+            text = _text_from_content(content)
+            if text:
+                current.assistant_parts.append(text)
+            seen = {
+                (call.get("id"), call.get("name"), _input_text(call.get("input")))
+                for call in current.tools
+            }
+            for call in _tool_calls(rec, content):
+                key = (call.get("id"), call.get("name"), _input_text(call.get("input")))
+                if key in seen:
+                    continue
+                seen.add(key)
+                current.tools.append(call)
+            current.add_usage(_usage(rec))
+            continue
+        if role == "tool":
+            _attach_results(current, [_tool_message_result(rec)])
+    close()
+    return turns
+
+
+def read_jsonl(path):
+    records = []
+    try:
+        with Path(path).open(encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(rec, dict):
+                    records.append(rec)
+    except OSError:
+        return records
+    return records
+
+
+def session_identity(path, records):
+    """(session_id, model, started_at, cwd) from a transcript path and records."""
+    path = Path(path)
+    session_id = path.stem
+    if path.name.lower() in {"transcript.jsonl", "session.jsonl", "messages.jsonl"} and path.parent.name:
+        session_id = path.parent.name
+    model = ""
+    started = ""
+    cwd = ""
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        if rec.get("type") == "session_meta" or rec.get("type") == "session":
+            for key in ("session_id", "id", "conversation_id"):
+                if isinstance(rec.get(key), str) and rec[key].strip() and session_id == path.stem:
+                    session_id = rec[key].strip()
+                    break
+            if isinstance(rec.get("model"), str) and rec["model"].strip() and not model:
+                model = rec["model"].strip()
+            if isinstance(rec.get("cwd"), str) and rec["cwd"].strip() and not cwd:
+                cwd = rec["cwd"].strip()
+        if (
+            isinstance(rec.get("session_id"), str)
+            and rec["session_id"].strip()
+            and session_id in {path.stem, path.parent.name}
+        ):
+            session_id = rec["session_id"].strip()
+        if not model:
+            found = _model(rec)
+            if found:
+                model = found
+        if not started:
+            started = _timestamp(rec)
+        if not cwd:
+            for key in ("cwd", "workspace"):
+                if isinstance(rec.get(key), str) and rec[key].strip():
+                    cwd = rec[key].strip()
+                    break
+    if not cwd:
+        cwd = str(path.parent)
+    return session_id, model, started, cwd
+
+
+def _input_text(value):
+    if value is None or value == {}:
+        return "{}"
+    if isinstance(value, str):
+        return clip(value)
+    try:
+        return clip(json.dumps(value, ensure_ascii=False, sort_keys=True, default=str))
+    except (TypeError, ValueError):
+        return clip(str(value))
+
+
+def format_turn_markdown(vendor, model, turn):
+    """The twin-api `content` body for one turn."""
+    lines = [
+        "# Chat turn — {}/{}".format(vendor_name(vendor), model or "unknown"),
+        "",
+        "## User",
+        clip(turn.prompt),
+        "",
+        "## Tools",
+    ]
+    if not turn.tools:
+        lines.append("(none)")
+    else:
+        for call in turn.tools:
+            lines.append("- `{}` {}".format(call.get("name") or "tool", _input_text(call.get("input"))))
+            if call.get("result"):
+                result = clip(call["result"]).replace("\n", "\n  ")
+                lines.append("  result: " + result)
+    lines.extend(["", "## Assistant", clip(turn.assistant), ""])
+    return "\n".join(lines)
+
+
+def source_id_for(session_id, turn_index, subagent_id=""):
+    if subagent_id:
+        return f"{session_id}:{subagent_id}:turn-{int(turn_index)}"
+    return f"{session_id}:turn-{int(turn_index)}"
+
+
+def sum_usage(turns):
+    total = {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+    }
+    for turn in turns:
+        for key in total:
+            total[key] += int(turn.usage.get(key) or 0)
+    return total
+
+
+def _payload_tokens(payload):
+    if not isinstance(payload, dict):
+        return {}
+    nested = payload.get("tokens") if isinstance(payload.get("tokens"), dict) else {}
+    found = {}
+    mapping = {
+        "input_tokens": ("input_tokens", "input"),
+        "output_tokens": ("output_tokens", "output"),
+        "cache_read_tokens": ("cache_read_tokens", "cache_read"),
+        "cache_write_tokens": ("cache_write_tokens", "cache_write"),
+    }
+    for dest, keys in mapping.items():
+        for source in (payload, nested):
+            for key in keys:
+                val = source.get(key) if isinstance(source, dict) else None
+                if isinstance(val, (int, float)) and not isinstance(val, bool):
+                    found[dest] = int(val)
+                    break
+            if dest in found:
+                break
+    return found
+
+
+def _cost(payload):
+    if not isinstance(payload, dict):
+        return 0.0, "unpriced"
+    for key in ("session_cost_usd", "cost_usd", "cost"):
+        val = payload.get(key)
+        if isinstance(val, (int, float)) and not isinstance(val, bool):
+            return float(val), "payload"
+    return 0.0, "unpriced"
+
+
+def register_body(session_id, machine, cwd, repo, branch, vendor, model, cost_basis):
+    return {
+        "session_id": session_id,
+        "machine": machine,
+        "cwd": cwd or "",
+        "repo": repo or "",
+        "branch": branch or "",
+        "vendor": vendor_name(vendor),
+        "model": model or "unknown",
+        "cost_basis": cost_basis or "unpriced",
+    }
+
+
+def heartbeat_body(session_id, prompt, output, turn_index, cost, model, vendor, surface):
+    return {
+        "session_id": session_id,
+        "last_prompt": clip(prompt),
+        "last_output": clip(output),
+        "turn_index": int(turn_index),
+        "session_cost_usd": float(cost or 0.0),
+        "model": model or "unknown",
+        "vendor": vendor_name(vendor),
+        "surface": surface,
+    }
+
+
+def ai_sessions_body(session_id, vendor, surface, usage, turns, repo, branch,
+                     started_at, updated_at, model, machine, cost, cost_basis):
+    usage = usage or {}
+    return {
+        "vendor": vendor_name(vendor),
+        "surface": surface,
+        "session_id": session_id,
+        "model": model or "unknown",
+        "input_tokens": int(usage.get("input_tokens") or 0),
+        "output_tokens": int(usage.get("output_tokens") or 0),
+        "cache_read_tokens": int(usage.get("cache_read_tokens") or 0),
+        "cache_write_tokens": int(usage.get("cache_write_tokens") or 0),
+        "turns": int(turns),
+        "repo": repo or "",
+        "branch": branch or "",
+        "machine": machine,
+        "started_at": started_at or updated_at,
+        "updated_at": updated_at,
+        "session_cost_usd": float(cost or 0.0),
+        "cost_basis": cost_basis or "unpriced",
+    }
+
+
+def ingest_body(session_id, turn_index, vendor, model, turn, repo, branch, machine, surface, subagent_id=""):
+    return {
+        "source_type": source_type_name(vendor),
+        "source_id": source_id_for(session_id, turn_index, subagent_id),
+        "content": format_turn_markdown(vendor, model or turn.model, turn),
+        "metadata": {
+            "repo": repo or "",
+            "branch": branch or "",
+            "machine": machine,
+            "surface": surface,
+            "timestamp": turn.timestamp or utc_now(),
+        },
+    }
+
+
+def end_body(session_id, vendor, surface, machine, repo, branch):
+    return {
+        "session_id": session_id,
+        "vendor": vendor_name(vendor),
+        "surface": surface,
+        "machine": machine,
+        "repo": repo or "",
+        "branch": branch or "",
+    }
+
+
+def _cwd_from_payload(payload):
+    cwd = payload.get("cwd")
+    if isinstance(cwd, str) and cwd.strip():
+        return cwd.strip()
+    roots = payload.get("workspace_roots")
+    if isinstance(roots, str) and roots.strip():
+        return roots.strip()
+    if isinstance(roots, list):
+        for root in roots:
+            if isinstance(root, str) and root.strip():
+                return root.strip()
+    return os.getcwd()
+
+
+def _payload_prompt(payload):
+    for key in ("prompt", "task", "last_prompt", "user_prompt"):
+        val = payload.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return ""
+
+
+def _payload_output(payload):
+    for key in ("output", "text", "response", "agent_message", "last_assistant_message", "last_output"):
+        val = payload.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return ""
+
+
+def _payload_tools(payload):
+    raw = payload.get("tool_calls") or payload.get("tools")
+    if not isinstance(raw, list):
+        return []
+    calls = []
+    for block in raw:
+        if isinstance(block, str):
+            calls.append({"id": "", "name": block, "input": {}, "result": ""})
+            continue
+        if not isinstance(block, dict):
+            continue
+        name = block.get("name") or block.get("tool")
+        if not name:
+            continue
+        calls.append({
+            "id": str(block.get("id") or ""),
+            "name": str(name),
+            "input": _coerce_input(block.get("input") if "input" in block else block.get("arguments")),
+            "result": _text_from_content(block.get("result") or block.get("output") or ""),
+        })
+    return calls
+
+
+def _runtime_from_payload(payload):
+    name = str(payload.get("hook_event_name") or "")
+    if name in CURSOR_EVENTS:
+        return "cursor"
+    if ("transcriptPath" in payload or "conversationId" in payload) and "transcript_path" not in payload:
+        return "gemini"
+    return "claude"
+
+
+def publish_turn(bridge, session_id, turn_index, turn, vendor, surface, model,
+                 cwd, repo, branch, machine, cost, cost_basis, usage, turns,
+                 started_at, include_ingest, subagent_id=""):
+    """Register, heartbeat, optional ingest, and the session summary."""
+    now = utc_now()
+    model = model or turn.model or "unknown"
+    reg_id = "register:" + session_id
+    bridge.send("register", reg_id, register_body(
+        session_id, machine, cwd, repo, branch, vendor, model, cost_basis))
+    live_id = source_id_for(session_id, turn_index, subagent_id)
+    beat = heartbeat_body(
+        session_id, turn.prompt, turn.assistant, turn_index, cost, model, vendor, surface)
+    bridge.send("heartbeat", live_id, beat)
+    bridge.send("turn", live_id, beat)
+    # Transcript timestamps keep the summary hash stable across syncs. A hook
+    # with no timestamp falls back to the clock so a live stop still updates.
+    updated = turn.timestamp or started_at or now
+    bridge.send("ai_sessions", "ai-sessions:" + session_id, ai_sessions_body(
+        session_id, vendor, surface, usage, turns, repo, branch,
+        started_at or turn.timestamp or now, updated, model, machine, cost, cost_basis))
+    if include_ingest and turn.has_assistant:
+        bridge.send("ingest", live_id, ingest_body(
+            session_id, turn_index, vendor, model, turn, repo, branch, machine, surface, subagent_id))
+    return live_id
+
+
+def _open_bridge(config, poster):
+    return Bridge(config, poster=poster, store=Store(config.state_dir))
+
+
+def process_hook(payload, config, poster=None, runtime=""):
+    """Forward one hook payload. Always returns 0."""
+    try:
+        if not isinstance(payload, dict) or not config.enabled:
+            return 0
+        runtime = vendor_name(runtime) if _text(runtime) else _runtime_from_payload(payload)
+        event = str(payload.get("hook_event_name") or "")
+        bridge = _open_bridge(config, poster or post_json)
+        try:
+            _process_hook(bridge, payload, config, runtime, event)
+        finally:
+            bridge.close()
+        if bridge.spooled:
+            _warn(f"activity-bridge: spooled {bridge.spooled} post(s)")
+        return 0
+    except Exception as exc:  # noqa: BLE001 — a hook must not break the session
+        _warn(f"activity-bridge: {type(exc).__name__}: {exc}")
+        return 0
+
+
+def _process_hook(bridge, payload, config, runtime, event):
+    if event in END_EVENTS:
+        _publish_end(bridge, payload, config, runtime)
+        return
+    session_id = clean_id(
+        payload.get("conversation_id") or payload.get("session_id") or payload.get("conversationId"),
+        "unknown",
+    )
+    subagent_id = clean_id(payload.get("subagent_id") or "", "")
+    if subagent_id == "unknown":
+        subagent_id = ""
+    generation_id = clean_id(payload.get("generation_id") or event or "turn", "turn")
+    cwd = _cwd_from_payload(payload)
+    repo, branch = resolve_place(cwd, config)
+    surface = config.surface or default_surface(runtime, payload.get("transcript_path") or "")
+    vendor = vendor_name(config.vendor or runtime)
+    model = _text(payload.get("model") or payload.get("subagent_model"))
+    cost, basis = _cost(payload)
+    machine = config.machine
+
+    if event in PROMPT_EVENTS:
+        prompt = _payload_prompt(payload)
+        stored = bridge.store.load_prompt(session_id, generation_id)
+        if stored:
+            turn_index = stored["turn_index"]
+        else:
+            turn_index = bridge.store.next_turn_index(session_id)
+        bridge.store.save_prompt(session_id, generation_id, prompt, model, cwd, turn_index)
+        turn = Turn()
+        turn.prompt = prompt
+        turn.model = model
+        turn.timestamp = utc_now()
+        publish_turn(
+            bridge, session_id, turn_index, turn, vendor, surface, model, cwd, repo, branch,
+            machine, cost, basis, _payload_tokens(payload), turn_index, turn.timestamp,
+            include_ingest=False, subagent_id=subagent_id if event == "subagentStart" else "",
+        )
+        return
+
+    transcript = payload.get("transcript_path") or payload.get("transcriptPath")
+    turns = []
+    started = ""
+    if isinstance(transcript, str) and transcript and Path(transcript).is_file():
+        records = read_jsonl(transcript)
+        ident_session, ident_model, started, ident_cwd = session_identity(transcript, records)
+        if session_id == "unknown":
+            session_id = clean_id(ident_session, "unknown")
+        if not model:
+            model = ident_model
+        if ident_cwd and not payload.get("cwd") and not payload.get("workspace_roots"):
+            cwd = ident_cwd
+            repo, branch = resolve_place(cwd, config)
+        turns = extract_turns(records)
+
+    target = None
+    turn_index = 0
+    complete = [(idx, turn) for idx, turn in enumerate(turns, start=1) if turn.has_assistant]
+    if complete:
+        turn_index, target = complete[-1]
+    if target is None:
+        stored = bridge.store.load_prompt(session_id, generation_id)
+        prompt = _payload_prompt(payload) or (stored["prompt"] if stored else "")
+        output = _payload_output(payload)
+        tools = _payload_tools(payload)
+        if stored:
+            turn_index = stored["turn_index"]
+            if not model:
+                model = stored["model"]
+        else:
+            turn_index = bridge.store.next_turn_index(session_id)
+            bridge.store.save_prompt(session_id, generation_id, prompt, model, cwd, turn_index)
+        if prompt or output or tools:
+            target = Turn()
+            target.prompt = prompt
+            target.model = model
+            target.timestamp = utc_now()
+            if output:
+                target.assistant_parts.append(output)
+            target.tools.extend(tools)
+    elif not target.prompt:
+        stored = bridge.store.load_prompt(session_id, generation_id)
+        if stored and stored.get("prompt"):
+            target.prompt = stored["prompt"]
+    if target is None:
+        return
+    if not target.model:
+        target.model = model
+    payload_usage = _payload_tokens(payload)
+    usage = payload_usage if any(payload_usage.values()) else sum_usage(turns or [target])
+    turn_count = len(turns) if turns else turn_index
+    publish_turn(
+        bridge, session_id, turn_index, target, vendor, surface, model or target.model,
+        cwd, repo, branch, machine, cost, basis, usage, turn_count, started or target.timestamp,
+        include_ingest=target.has_assistant,
+        subagent_id=subagent_id if event == "subagentStop" else "",
+    )
+
+
+def _publish_end(bridge, payload, config, runtime):
+    session_id = clean_id(
+        payload.get("session_id") or payload.get("conversation_id") or payload.get("conversationId"),
+        "unknown",
+    )
+    cwd = _cwd_from_payload(payload)
+    repo, branch = resolve_place(cwd, config)
+    surface = config.surface or default_surface(runtime, "")
+    vendor = vendor_name(config.vendor or runtime)
+    bridge.send("end", "end:" + session_id, end_body(
+        session_id, vendor, surface, config.machine, repo, branch))
+
+
+def iter_jsonl(root):
+    root = Path(root)
+    if root.is_file():
+        if root.suffix == ".jsonl":
+            yield root
+        return
+    if not root.is_dir():
+        return
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [
+            name for name in dirnames
+            if not name.startswith(".") and name not in {"node_modules", "__pycache__"}
+        ]
+        for name in sorted(filenames):
+            if name.endswith(".jsonl"):
+                yield Path(dirpath) / name
+
+
+def sync_tree(root, config, poster=None, vendor="", surface="", flush_limit=50):
+    """Forward new turns under `root`. Returns (delivered, spooled)."""
+    if not config.enabled:
+        return 0, 0
+    bridge = _open_bridge(config, poster or post_json)
+    try:
+        bridge.flush(flush_limit)
+        for path in iter_jsonl(root):
+            sync_file(bridge, path, config, vendor=vendor, surface=surface)
+        return bridge.delivered, bridge.spooled
+    finally:
+        bridge.close()
+
+
+def sync_file(bridge, path, config, vendor="", surface=""):
+    records = read_jsonl(path)
+    if not records:
+        return
+    session_id, model, started, cwd = session_identity(path, records)
+    runtime = infer_runtime(path, vendor or config.vendor)
+    surface = surface or config.surface or default_surface(runtime, path)
+    repo, branch = resolve_place(cwd, config)
+    turns = extract_turns(records)
+    if not turns:
+        return
+    usage = sum_usage(turns)
+    complete = [(idx, turn) for idx, turn in enumerate(turns, start=1)]
+    last_live = None
+    for idx, turn in complete:
+        if not turn.prompt and not turn.has_assistant:
+            continue
+        last_live = (idx, turn)
+        if not turn.has_assistant:
+            continue
+        publish_turn(
+            bridge, clean_id(session_id, path.stem), idx, turn, runtime, surface,
+            model or turn.model, cwd, repo, branch, config.machine, 0.0, "unpriced",
+            usage, len(turns), started or turn.timestamp, include_ingest=True,
+        )
+    if last_live and not last_live[1].has_assistant:
+        idx, turn = last_live
+        publish_turn(
+            bridge, clean_id(session_id, path.stem), idx, turn, runtime, surface,
+            model or turn.model, cwd, repo, branch, config.machine, 0.0, "unpriced",
+            usage, len(turns), started or turn.timestamp, include_ingest=False,
+        )
+
+
+def emit_hook_stdout(mode, payload):
+    if mode == "claude":
+        return
+    if mode == "cursor":
+        sys.stdout.write("{}\n")
+        return
+    if not isinstance(payload, dict):
+        return
+    name = str(payload.get("hook_event_name") or "")
+    antigravity = (
+        ("transcriptPath" in payload or "conversationId" in payload)
+        and "transcript_path" not in payload
+    )
+    if name in CURSOR_EVENTS or antigravity:
+        sys.stdout.write("{}\n")
+
+
+def _read_payload():
+    try:
+        raw = sys.stdin.buffer.read()
+    except (AttributeError, OSError, ValueError):
+        try:
+            raw = sys.stdin.read().encode("utf-8", "replace")
+        except (OSError, ValueError):
+            return None
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw.decode("utf-8", "replace"))
+    except ValueError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def cmd_hook(args):
+    payload = _read_payload()
+    try:
+        config = load_config()
+        if config.enabled and payload is not None:
+            process_hook(payload, config, runtime=args.runtime)
+    except Exception as exc:  # noqa: BLE001 — hook stdout contract still has to run
+        _warn(f"activity-bridge: {type(exc).__name__}: {exc}")
+    emit_hook_stdout(args.stdout, payload)
+    _flush_stdout()
+    return 0
+
+
+def cmd_sync(args, config):
+    dirs = list(args.sync_dir or [])
+    if not dirs:
+        dirs = list(config.sync_dirs)
+    if not dirs:
+        _warn("activity-bridge: pass --sync-dir or set WIZZO_ACTIVITY_SYNC_DIRS")
+        return 2
+    if args.interval <= 0:
+        _warn("activity-bridge: --interval must be > 0")
+        return 2
+    if not config.enabled:
+        _warn("activity-bridge: not configured (set WIZZO_COORD_URL or WIZZO_TWIN_API_URL)")
+        return 0
+    while True:
+        delivered = 0
+        spooled = 0
+        for directory in dirs:
+            got_d, got_s = sync_tree(
+                directory, config, vendor=args.vendor, surface=args.surface,
+                flush_limit=args.flush_limit,
+            )
+            delivered += got_d
+            spooled += got_s
+        _warn(f"activity-bridge: delivered={delivered} spooled={spooled}")
+        if not args.watch:
+            return 0
+        try:
+            time.sleep(args.interval)
+        except KeyboardInterrupt:
+            return 0
+
+
+def cmd_flush(args, config):
+    if not config.enabled:
+        _warn("activity-bridge: not configured")
+        return 0
+    bridge = _open_bridge(config, post_json)
+    try:
+        sent = bridge.flush(args.flush_limit)
+        left = bridge.store.pending_count()
+    finally:
+        bridge.close()
+    _warn(f"activity-bridge: flushed={sent} pending={left}")
+    return 0
+
+
+def cmd_end(args, config):
+    session_id = clean_id(args.session_id, "")
+    if not session_id:
+        _warn("activity-bridge: end requires --session-id")
+        return 2
+    if not config.enabled:
+        _warn("activity-bridge: not configured")
+        return 0
+    runtime = args.vendor or args.runtime or "cursor"
+    payload = {
+        "hook_event_name": "sessionEnd",
+        "session_id": session_id,
+        "cwd": os.getcwd(),
+    }
+    process_hook(payload, config, runtime=runtime)
+    bridge = _open_bridge(config, post_json)
+    try:
+        bridge.flush(args.flush_limit)
+    finally:
+        bridge.close()
+    return 0
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(prog="activity-bridge")
+    parser.add_argument("command", nargs="?", choices=("hook", "sync", "flush", "end"))
+    parser.add_argument("--sync-dir", action="append", default=[])
+    parser.add_argument("--watch", action="store_true")
+    parser.add_argument("--interval", type=float, default=15.0)
+    parser.add_argument("--vendor", default="")
+    parser.add_argument("--surface", default="")
+    parser.add_argument("--runtime", default="")
+    parser.add_argument("--stdout", choices=("auto", "cursor", "claude"), default="auto")
+    parser.add_argument("--session-id", default="")
+    parser.add_argument("--flush-limit", type=int, default=50)
+    return parser
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    command = args.command
+    if command is None and args.sync_dir:
+        command = "sync"
+    if command is None:
+        parser.error("choose hook, sync, flush, or end")
+    if command == "hook":
+        return cmd_hook(args)
+    try:
+        config = load_config()
+    except Exception as exc:  # noqa: BLE001
+        _warn(f"activity-bridge: {type(exc).__name__}: {exc}")
+        return 0
+    if command == "sync":
+        return cmd_sync(args, config)
+    if command == "flush":
+        return cmd_flush(args, config)
+    if command == "end":
+        return cmd_end(args, config)
+    parser.error("unknown command")
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

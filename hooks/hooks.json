@@ -8,6 +8,11 @@
             "type": "command",
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/token_usage.py\" hook",
             "timeout": 15
+          },
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/activity_bridge.py\" hook --runtime claude --stdout claude",
+            "timeout": 8
           }
         ]
       }
@@ -19,6 +24,11 @@
             "type": "command",
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/token_usage.py\" hook",
             "timeout": 15
+          },
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/activity_bridge.py\" hook --runtime claude --stdout claude",
+            "timeout": 8
           }
         ]
       }

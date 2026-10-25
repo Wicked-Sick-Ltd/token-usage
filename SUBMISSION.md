@@ -176,7 +176,8 @@ ledger current, which powers instant reports, an optional statusline and opt-in 
 nudges. A bundled stdio MCP server exposes `session_cost`, `history`, `insights`, `diff`
 and `top_consumers`. Cost figures are per-model, cache-aware API-price estimates,
 labelled as such for subscription users. Python 3.9+ standard library only: no
-dependencies, no network calls, no telemetry.
+dependencies. The analyser makes no network calls. An opt-in activity bridge
+posts turns only when the operator sets `WIZZO_COORD_URL` or `WIZZO_TWIN_API_URL`.
 
 The same repository also packages Codex (`.codex-plugin/`), Cursor
 (`.cursor-plugin/`), Google Antigravity (root `plugin.json`, `mcp_config.json`,
@@ -220,8 +221,13 @@ MCP enter the host conversation and follow its data policy. It does not call ven
 cloud APIs.
 
 **Does it send data to services other than its declared connectors?**
-No. It makes no network calls and has no telemetry or third-party services. The bundled
-MCP server is a local stdio process (`scripts/mcp_server.py`).
+Not by default. The analyser and the bundled MCP server (`scripts/mcp_server.py`,
+local stdio) make no network calls and have no telemetry or third-party analytics
+service. The optional activity bridge is a declared connector: when
+`WIZZO_COORD_URL` or `WIZZO_TWIN_API_URL` is set (or the same keys are present in
+`~/.config/wizzo/activity-bridge.env`), it POSTs the user's prompts, tool-call
+summaries and assistant responses to those operator endpoints. It is off otherwise.
+`WIZZO_ACTIVITY_BRIDGE=0` forces it off.
 
 **How long does it keep data?**
 Until the user deletes it. The plugin never prunes; deleting `~/.cache/token-usage/`

@@ -2,6 +2,8 @@
 
 The reporting interface is local. `scripts/token_usage.py` is the command-line script. `scripts/mcp_server.py` is a stdio MCP server that imports it. Both use the Python 3.9+ standard library. Neither opens a network port. Dashboard, live view and JSONL export are command-line commands. The MCP server exposes five tools: `session_cost`, `history`, `insights`, `diff` and `top_consumers`.
 
+`scripts/activity_bridge.py` is a separate opt-in command (`hook`, `sync`, `flush`, `end`, or `--sync-dir` as a shortcut for `sync`). It is not one of the reporting subcommands above. Configuration and the llm1 payloads are in the README section "Activity stream bridge (opt-in)".
+
 Costs are API-price estimates. Unknown model prices stay unknown. Runtime-specific limits are in the [Codex](codex-adapter.md), [Cursor](cursor-adapter.md) and [Gemini/Copilot](gemini-copilot.md) notes. Environment variables and the pricing overlay are in the README [Configuration](../README.md#configuration) section.
 
 ## Command-line reference

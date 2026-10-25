@@ -69,6 +69,17 @@ Cloud Agents run repository hooks from `.cursor/hooks.json` on the VM. This
 repository does not ship that file, so cloning token-usage does not by itself
 instrument the VM.
 
+Finished Cloud Agent JSONL can still be forwarded by the opt-in activity
+bridge. On the VM or the shared Grok Bot box:
+
+```bash
+python3 scripts/activity_bridge.py sync --sync-dir /workspace/cloud-agent-transcripts
+```
+
+That posts new turns to the configured llm1 endpoints and skips turns already
+recorded in the local watermark. The command does nothing until
+`WIZZO_COORD_URL` or `WIZZO_TWIN_API_URL` is set.
+
 Report a finished cloud run by passing the export file:
 
 ```bash
@@ -155,9 +166,12 @@ Cursor package sets `TOKEN_USAGE_RUNTIME=cursor` for its own MCP server.
 
 ## Privacy and security
 
-- No network calls, telemetry, or bundled credentials.
-- SQLite and exports are read locally; hook ledger stores truncated prompts only.
-- See [SECURITY.md](../SECURITY.md) for hook commands and ledger paths.
+- The Cursor adapter and hook ledger make no network calls and bundle no credentials.
+- SQLite and exports are read locally; the hook ledger stores truncated prompts only.
+- `hooks/hooks-cursor.json` also runs the opt-in activity bridge. It is inert
+  until configured, and when configured it sends the full turn (not the
+  120-character ledger preview) to the operator endpoints documented in the
+  README. See [SECURITY.md](../SECURITY.md).
 
 ## Future adapter contract (Gemini, others)
 

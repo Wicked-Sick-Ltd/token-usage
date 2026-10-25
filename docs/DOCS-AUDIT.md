@@ -115,7 +115,7 @@ status note.
 | CONTRIBUTING: "type hints" in the house style | **fixed**: the scripts use essentially no annotations (1 annotated function in `scripts/`) | `rg` over `scripts/` |
 | CONTRIBUTING: version lives in `.claude-plugin/plugin.json` | **fixed**: three manifests carry `version` and must agree | `.codex-plugin/plugin.json` was already 0.7.0 while the others said 0.6.1 |
 | docs/cursor-adapter.md: Codex is a "future adapter" | **fixed**: `CodexAdapter` shipped (#14) | :3636 |
-| SECURITY.md scope (Claude, Cursor, Codex reads and writes; no network) | verified | as above |
+| SECURITY.md scope (Claude, Cursor, Codex reads and writes; analyser makes no network calls) | updated | the opt-in activity bridge is the exception and is documented in SECURITY.md and the README |
 
 ## Ported from Notion
 

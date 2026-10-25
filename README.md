@@ -95,7 +95,9 @@ Per-flag detail is in the [reference](docs/reference.md).
 
 ## Privacy and data handling
 
-token-usage runs entirely on your machine. The analyser uses only the Python standard library and makes **no network calls**: there is no telemetry, no remote API, no update check and no third-party service. The plugin sends no telemetry or remote requests. Reports returned through MCP enter the host conversation and follow that host's data policy. Copilot also runs a small JavaScript collector using its bundled SDK and Node standard library.
+token-usage's analyser runs on your machine. It uses only the Python standard library. Reports, history, insights, the dashboard, live view, export and the stdio MCP server make **no network calls**: there is no update check and no third-party analytics service. Reports returned through MCP enter the host conversation and follow that host's data policy. Copilot also runs a small JavaScript collector using its bundled SDK and Node standard library.
+
+The optional [activity stream bridge](#activity-stream-bridge-opt-in) is the one exception. It stays off until `WIZZO_COORD_URL`, `WIZZO_TWIN_API_URL`, or `~/.config/wizzo/activity-bridge.env` names a destination. When it is on, it sends turn text (the prompt, a tool-call summary, and the assistant response) to those operator endpoints. Set `WIZZO_ACTIVITY_BRIDGE=0` to force it off. The analyser never opens a connection on its own.
 
 **What it reads** (read-only, and only for the runtime you ask about):
 
@@ -109,7 +111,7 @@ token-usage runs entirely on your machine. The analyser uses only the Python sta
 | Copilot CLI | `~/.copilot/session-state/*/events.jsonl` and `~/.copilot/token-usage/*.jsonl` | `TOKEN_USAGE_COPILOT_HOME`, else `COPILOT_HOME` |
 | All | the bundled `data/pricing.json` and your optional overlay `~/.config/token-usage/pricing.json` (honours `XDG_CONFIG_HOME`) | — |
 
-Transcripts contain your prompts and code. token-usage reads them only to count tokens and label activities. It reads no credentials or auth files. It does not call Cursor, Codex, Gemini, Copilot or Claude cloud APIs.
+Transcripts contain your prompts and code. token-usage reads them only to count tokens and label activities. It reads no credentials or auth files. It does not call Cursor, Codex, Gemini, Copilot or Claude cloud APIs. The activity bridge, when configured, also reads the JSONL file a hook payload names and the directories passed to `sync`. It asks git for the origin slug and the current branch. It does not read git credentials or vendor auth files.
 
 **What it writes.** Summary caches and hook ledgers go under `~/.cache/token-usage/` (override with `TOKEN_USAGE_LEDGER_DIR`):
 
@@ -122,15 +124,17 @@ Copilot additionally writes `~/.copilot/token-usage/<session-id>.jsonl` under `C
 
 `dashboard` and `export` also write the one file you name with `--output` (dashboard defaults to `token-usage-dashboard.html` in the current directory; `--output -` writes to stdout).
 
-**Retention.** token-usage never deletes or prunes anything. The data stays until you remove it. Deleting `~/.cache/token-usage/` (or your `TOKEN_USAGE_LEDGER_DIR`) removes those caches and hook ledgers. The next run rebuilds the cache from your transcripts. Remove `$COPILOT_HOME/token-usage/` separately to remove Copilot capture files.
+When the activity bridge is configured it also writes `activity-bridge/bridge.sqlite` under `WIZZO_ACTIVITY_STATE_DIR`, or under `TOKEN_USAGE_LEDGER_DIR/activity-bridge` when that override is set, or otherwise under `~/.cache/token-usage/activity-bridge` (`XDG_CACHE_HOME` when set). The database is a watermark of delivered turns plus a spool of undelivered JSON bodies, which include prompt and assistant text until a flush succeeds. The directory is created owner-only (`0700`) where the filesystem supports it. Bearer tokens are not written there.
+
+**Retention.** token-usage never deletes or prunes anything. The data stays until you remove it. Deleting `~/.cache/token-usage/` (or your `TOKEN_USAGE_LEDGER_DIR`) removes those caches, hook ledgers and, when the spool lives there, undelivered bridge posts. The next run rebuilds the cache from your transcripts. Remove `$COPILOT_HOME/token-usage/` separately to remove Copilot capture files. Remove the bridge state directory separately when it is not under that cache.
 
 **What runs.**
 
-- **Hooks** fail open: they always exit 0 and never block the session. The timeout in each hook file is 15 seconds.
-  - Claude Code (`hooks/hooks.json`): `Stop` and `SubagentStop` run `scripts/token_usage.py hook`. Stdout is empty, or one budget `systemMessage`.
-  - Codex (`hooks/hooks-codex.json`): the same events run `codex-hook`. Ledgers are `codex-` prefixed. Windows uses `python` via `commandWindows`.
-  - Antigravity (root `hooks.json`): `Stop` runs `hook`. A camelCase payload (`conversationId`, `transcriptPath`, and no `transcript_path`) is read as the `gemini` runtime. Stdout is `{}`, or a budget `systemMessage` when a multiple is crossed. Whether the Antigravity UI shows that message is the host's behaviour.
-  - Cursor (`hooks/hooks-cursor.json`): `beforeSubmitPrompt`, `stop`, `subagentStart` and `subagentStop` run `cursor-hook` and print `{}`.
+- **Hooks** fail open: they always exit 0 and never block the session. The token-ledger command times out after 15 seconds. The activity-bridge command times out after 8 seconds and returns immediately when it is not configured.
+  - Claude Code (`hooks/hooks.json`): `Stop` and `SubagentStop` run `scripts/token_usage.py hook`, then `scripts/activity_bridge.py hook`. The ledger command's stdout is empty, or one budget `systemMessage`. The bridge command prints nothing.
+  - Codex (`hooks/hooks-codex.json`): the same events run `codex-hook`, then the bridge. Ledgers are `codex-` prefixed. Windows uses `python` via `commandWindows`.
+  - Antigravity (root `hooks.json`): `Stop` runs `hook`. A camelCase payload (`conversationId`, `transcriptPath`, and no `transcript_path`) is read as the `gemini` runtime. Stdout is `{}`, or a budget `systemMessage` when a multiple is crossed. Whether the Antigravity UI shows that message is the host's behaviour. Antigravity does not register the activity bridge.
+  - Cursor (`hooks/hooks-cursor.json`): `beforeSubmitPrompt`, `stop`, `subagentStart` and `subagentStop` run `cursor-hook`, then the bridge. Both print `{}`. The bridge reads `beforeSubmitPrompt` for the prompt and `stop` / `subagentStop` for the finished turn.
 - **MCP server**: `scripts/mcp_server.py`, a local stdio process. It has no network listener. It exits quietly on stdin EOF or a broken pipe. The five tools read the locations above and may refresh the `index/` cache. They never modify transcripts.
 
 ## Installation
@@ -411,7 +415,7 @@ The server reads local transcripts on the host. Pricing overlay edits apply on t
 
 ## Configuration
 
-Settings are the environment variables below, plus the optional pricing overlay. The table lists every name read from `scripts/token_usage.py` or `scripts/mcp_server.py`:
+Settings are the environment variables below, plus the optional pricing overlay. The table lists every name read from `scripts/token_usage.py`, `scripts/mcp_server.py`, or `scripts/activity_bridge.py`:
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -432,7 +436,8 @@ Settings are the environment variables below, plus the optional pricing overlay.
 | `TOKEN_USAGE_CODEX_HOME` | unset | Codex home holding `sessions/` and `archived_sessions/`. When unset, `CODEX_HOME` is used. |
 | `CODEX_HOME` | `~/.codex` | Codex home. Used only when `TOKEN_USAGE_CODEX_HOME` is unset. Codex sets this. |
 | `CODEX_THREAD_ID` | set by Codex | Current Codex thread, used for current-session discovery. |
-| `XDG_CONFIG_HOME` | `~/.config` | Parent of the user pricing overlay `token-usage/pricing.json`. |
+| `XDG_CONFIG_HOME` | `~/.config` | Parent of the user pricing overlay `token-usage/pricing.json` and of `wizzo/activity-bridge.env`. |
+| `XDG_CACHE_HOME` | `~/.cache` | Used only when `WIZZO_ACTIVITY_STATE_DIR` and `TOKEN_USAGE_LEDGER_DIR` are both unset, as the parent of `token-usage/activity-bridge/`. |
 
 ### Pricing overlay
 
@@ -445,6 +450,85 @@ To price a model the bundled table omits, or to replace one bundled rate, create
 ```
 
 `input` and `output` are required US dollars per million tokens. `cache_read` is optional. Each rate must be a finite number greater than or equal to zero (`0` is a valid free tier). A key replaces the bundled rate for that same key. The analyser matches the longest prefix that ends on a segment boundary, so a dated model id can use the undated key. A malformed file is ignored. An invalid entry is skipped. Either case is reported as a warning, and the remaining rates still apply. The file is read on the next CLI command or MCP call.
+
+### Activity stream bridge (opt-in)
+
+`scripts/activity_bridge.py` forwards Cursor, Claude Code, Codex and Grok Bot turns to an operator-run llm1 box. Nothing is sent until a destination is configured. `WIZZO_ACTIVITY_BRIDGE=0` (also `off`, `false`, or `no`) forces it off even when URLs are present.
+
+Hook commands in `hooks/hooks-cursor.json`, `hooks/hooks.json` and `hooks/hooks-codex.json` call `activity_bridge.py hook`. Cursor's `beforeSubmitPrompt` registers the session and heartbeats the prompt. `stop` and `subagentStop` send the finished turn. Claude Code and Codex do the same from `Stop` and `SubagentStop`, reading `transcript_path`. The command always exits 0. The first failed POST in a process is spooled; later posts in that process are spooled without waiting out another timeout.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `WIZZO_COORD_URL` | unset | mcp-coordination base URL, for example `http://100.105.90.34:8140`. Receives `POST /session/register`, `POST /session/heartbeat`, `POST /session/turn`, `POST /api/ai-sessions` and `POST /session/end`. |
+| `WIZZO_COORD_TOKEN` | unset | Bearer token for `WIZZO_COORD_URL`. Sent as `Authorization: Bearer …`. Omit it on a trusted network. |
+| `WIZZO_TWIN_API_URL` | unset | twin-api base URL, for example `http://100.105.90.34:8100`. Receives `POST /v1/ingest`. |
+| `WIZZO_TWIN_TOKEN` | unset | Bearer token for `WIZZO_TWIN_API_URL`. |
+| `WIZZO_ACTIVITY_BRIDGE` | on when a URL is set | `0`, `off`, `false` or `no` disables the bridge. |
+| `WIZZO_ACTIVITY_STATE_DIR` | see below | Directory for `bridge.sqlite` (watermark and spool). |
+| `WIZZO_ACTIVITY_HTTP_TIMEOUT` | `0.8` | Per-request timeout in seconds. The first failure marks the process offline and the rest of the batch is spooled. |
+| `WIZZO_ACTIVITY_SYNC_DIRS` | unset | `os.pathsep`-separated directories for `sync` when `--sync-dir` is omitted. |
+| `WIZZO_MACHINE` | hostname | `machine` field on register, heartbeat metadata and ingest. |
+| `WIZZO_REPO` | git origin slug | `repo` field. `org/name` from `origin` when unset. |
+| `WIZZO_BRANCH` | current git branch | `branch` field. |
+| `WIZZO_SURFACE` | per runtime | Overrides `ide`, `cloud_agent`, `grok_bot`, `claude_code`, `codex` or `antigravity`. A path containing `cloud-agent` is `cloud_agent`. |
+| `WIZZO_VENDOR` | per runtime | Overrides the vendor. Cursor posts `cursor`. Grok Bot posts `grok` (ingest `source_type` `grok_bot`). Claude Code posts `claude`. Codex posts `codex`. |
+
+The same keys can live in `~/.config/wizzo/activity-bridge.env` (`$XDG_CONFIG_HOME/wizzo/activity-bridge.env`). A non-empty process environment variable wins over the file. `export ` prefixes and matching quotes are accepted. The file is how a desktop session enables the bridge without editing the plugin.
+
+```
+WIZZO_COORD_URL=http://100.105.90.34:8140
+WIZZO_COORD_TOKEN=
+WIZZO_TWIN_API_URL=http://100.105.90.34:8100
+WIZZO_TWIN_TOKEN=
+WIZZO_REPO=Wicked-Sick-Ltd/token-usage
+WIZZO_BRANCH=main
+```
+
+**SSH tunnel.** When the box is only reachable through a jump host, forward the two ports and point the bridge at localhost. A down tunnel is the offline case: turns stay in the spool and the next `flush` or `sync` retries them.
+
+```bash
+ssh -J user@bastion -L 8140:127.0.0.1:8140 -L 8100:127.0.0.1:8100 user@100.105.90.34
+```
+
+```
+WIZZO_COORD_URL=http://127.0.0.1:8140
+WIZZO_TWIN_API_URL=http://127.0.0.1:8100
+```
+
+**What is posted.** `POST /session/register` sends `session_id`, `machine`, `cwd`, `repo`, `branch`, `vendor`, `model` and `cost_basis`. `POST /session/heartbeat` and `POST /session/turn` send `last_prompt`, `last_output`, `turn_index`, `session_cost_usd`, `model`, `vendor` and `surface`. `POST /api/ai-sessions` upserts one session summary: `vendor`, `surface`, token counts, `turns`, `repo`, `branch`, `machine`, `model`, `started_at` and `updated_at`. `cost_basis` is `payload` when the hook included a cost and `unpriced` otherwise. `POST /v1/ingest` sends `source_type`, `source_id` (`{session_id}:turn-{N}`, or `{session_id}:{subagent_id}:turn-{N}`), markdown `content` starting with `# Chat turn — {vendor}/{model}`, and `metadata` (`repo`, `branch`, `machine`, `surface`, `timestamp`). Prompt, tool and assistant fields are capped at 20,000 characters. `POST /session/end` is the `end` subcommand (and a `sessionEnd` hook payload). A normal `stop` does not end the session.
+
+**Live hooks.** Cursor pairs `beforeSubmitPrompt` with the later `stop` for the same `generation_id` when the stop payload has no transcript. Claude Code and Codex read the latest complete turn from `transcript_path`.
+
+**Backfill.** On the shared Grok Bot box or a Cursor Cloud Agent VM, run a one-shot scan or leave it under cron or systemd. Delivered turns are skipped by a SQLite watermark keyed on session, endpoint and body hash, so a second scan does not repeat a post. Appending a turn sends only the new one. `bin/token-usage-activity-sync` is the same `sync` command.
+
+```bash
+python3 scripts/activity_bridge.py sync \
+  --sync-dir /workspace/cloud-agent-transcripts \
+  --vendor cursor --surface cloud_agent
+
+python3 scripts/activity_bridge.py sync --watch --interval 15 \
+  --sync-dir /var/lib/grok/transcripts \
+  --vendor grok --surface grok_bot
+
+python3 scripts/activity_bridge.py flush
+python3 scripts/activity_bridge.py end --session-id SESSION
+```
+
+JSONL may be Claude-style (`type` / `message`), flat `{role, content, tool_calls}`, or a Grok `{role: tool}` result. Blank and malformed lines are skipped. A path containing `cloud-agent` is reported as Cursor `cloud_agent` unless `--vendor` / `--surface` say otherwise. A path containing `grok` defaults to Grok Bot.
+
+```
+# /etc/systemd/system/token-usage-activity-sync.service
+[Service]
+EnvironmentFile=%h/.config/wizzo/activity-bridge.env
+ExecStart=/usr/bin/python3 /opt/token-usage/scripts/activity_bridge.py sync --watch --interval 15 --sync-dir /workspace/cloud-agent-transcripts --vendor cursor --surface cloud_agent
+Restart=on-failure
+```
+
+A cron line that does not use `--watch` exits 0 when posts are spooled, so a down llm1 does not page on every minute:
+
+```
+* * * * * python3 /opt/token-usage/scripts/activity_bridge.py --sync-dir /workspace/cloud-agent-transcripts --vendor cursor --surface cloud_agent
+```
 
 ## Insights
 

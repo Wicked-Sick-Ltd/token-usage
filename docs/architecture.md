@@ -1,6 +1,6 @@
 # Architecture
 
-token-usage is one AI agent plugin with a package per assistant. It uses two
+token-usage is one AI agent plugin with a package per assistant. It uses three
 Python 3.9+ standard-library scripts plus per-host packaging. There is no build
 step or Python dependency. Copilot supplies the SDK for its small JavaScript
 collector. The same checkout is the Claude Code, Codex, Cursor, Antigravity,
@@ -14,6 +14,8 @@ they are not extra runtimes.
 |---|---|
 | `scripts/token_usage.py` | The whole analyser: transcript parsing and deduplication, attribution, pricing, the history index, insights, rendering, and every CLI subcommand (`report`, `json`, `history`, `insights`, `top_consumers`, `dashboard`, `live`, `export`, plus the `hook`, `codex-hook` and `cursor-hook` entry points). `hook` also serves the Antigravity `Stop` payload. |
 | `scripts/mcp_server.py` | A stdio MCP server that imports `token_usage.py` and exposes `session_cost`, `history`, `insights`, `diff` and `top_consumers`. |
+| `scripts/activity_bridge.py` | Opt-in llm1 activity bridge. Hook mode reads a host payload on stdin. `sync` tails JSONL directories. Off unless `WIZZO_COORD_URL` or `WIZZO_TWIN_API_URL` is set. Stdlib only. |
+| `bin/token-usage-activity-sync` | Wrapper that runs `activity_bridge.py sync`. |
 | `data/pricing.json` | The bundled per-model API prices. The user overlay `~/.config/token-usage/pricing.json` adds to it. |
 | `.claude-plugin/plugin.json` | Claude Code manifest. It declares the MCP server inline; the skill in `skills/` and the hooks in `hooks/hooks.json` load from their default locations. |
 | `.codex-plugin/plugin.json` | Codex manifest: `codex-skills/`, `.mcp-codex.json` and `hooks/hooks-codex.json`. |
@@ -23,7 +25,7 @@ they are not extra runtimes.
 | `.plugin/plugin.json` | Copilot CLI manifest, MCP server, skill and native extension. |
 | `copilot-extensions/token-usage/extension.mjs` | Saves transient Copilot usage locally using the host-bundled SDK. |
 | `skills/report/`, `codex-skills/report/` | The report skill (`/token-usage:report` in Claude Code), and its Codex counterpart. |
-| `hooks/` | Claude, Codex and Cursor hook files. Antigravity's hook file is the repository-root `hooks.json`. All run `scripts/token_usage.py` and fail open. Copilot registers no hooks. |
+| `hooks/` | Claude, Codex and Cursor hook files. Antigravity's hook file is the repository-root `hooks.json`. Ledger hooks run `scripts/token_usage.py` and fail open. Claude, Codex and Cursor also run `scripts/activity_bridge.py hook`, which no-ops until configured. Copilot registers no hooks. |
 | `examples/` | Optional statusline scripts for Claude Code (`statusline.sh` needs `jq`; `statusline.ps1` needs PowerShell 7+). |
 | `tests/` | The pytest suite, with synthetic fixtures only. |
 | `docs/` | This documentation. `docs/superpowers/` holds dated design records. |

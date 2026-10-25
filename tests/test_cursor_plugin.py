@@ -58,13 +58,16 @@ def test_hooks_cursor_json_matches_cursor_documented_flat_schema():
     for event in HOOK_EVENTS:
         entries = hooks[event]
         assert isinstance(entries, list) and entries
+        commands = []
         for entry in entries:
             assert "hooks" not in entry, f"{event} must not nest a hooks array"
             assert entry.get("type", "command") == "command"
             cmd = entry["command"]
+            commands.append(cmd)
             assert "${CURSOR_PLUGIN_ROOT}" in cmd
-            assert "cursor-hook" in cmd
-            assert entry.get("timeout") == 15
+            assert entry.get("timeout") in (8, 15)
+        assert any("cursor-hook" in cmd for cmd in commands)
+        assert any("activity_bridge.py" in cmd and "--stdout cursor" in cmd for cmd in commands)
 
 
 def test_changelog_does_not_claim_afterAgentResponse_is_registered():
