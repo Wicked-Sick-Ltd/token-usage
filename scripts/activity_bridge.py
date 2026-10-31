@@ -561,6 +561,7 @@ class Store:
         self.db.commit()
 
     def _columns(self, table):
+        # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query -- reviewed: table names come only from hardcoded literals in _migrate(), no user input reaches the SQL text.
         return [row[1] for row in self.db.execute(f"PRAGMA table_info({table})")]
 
     def _migrate(self):
@@ -594,16 +595,21 @@ class Store:
             if not cols:
                 continue
             if "session_id" not in cols:
+                # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query -- reviewed: table is from the literal tuple ("spool", "delivered"), no user input reaches the SQL text.
                 self.db.execute(f"ALTER TABLE {table} ADD COLUMN session_id TEXT DEFAULT ''")
             if "turn_index" not in cols:
+                # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query -- reviewed: table is from the literal tuple ("spool", "delivered"), no user input reaches the SQL text.
                 self.db.execute(f"ALTER TABLE {table} ADD COLUMN turn_index INTEGER DEFAULT 0")
             if "mutable" not in cols:
+                # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query -- reviewed: table is from the literal tuple ("spool", "delivered"), no user input reaches the SQL text.
                 self.db.execute(f"ALTER TABLE {table} ADD COLUMN mutable INTEGER DEFAULT 0")
             if "stage" not in cols:
+                # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query -- reviewed: table is from the literal tuple ("spool", "delivered"), no user input reaches the SQL text.
                 self.db.execute(
                     f"ALTER TABLE {table} ADD COLUMN stage INTEGER NOT NULL DEFAULT 0"
                 )
             if "usage_revision" not in cols:
+                # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query -- reviewed: table is from the literal tuple ("spool", "delivered"), no user input reaches the SQL text.
                 self.db.execute(
                     f"ALTER TABLE {table} ADD COLUMN usage_revision INTEGER NOT NULL DEFAULT 0"
                 )
@@ -887,6 +893,7 @@ class Store:
         )
         limit = int(limit)
         if targets is None:
+            # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query -- reviewed: columns is a hardcoded literal; limit is bound via ?, no user input reaches the SQL text.
             return self.db.execute(
                 f"SELECT {columns} FROM spool ORDER BY created_at, source_id LIMIT ?",
                 (limit,),
@@ -1101,6 +1108,7 @@ class Store:
         )
         if usage_turns:
             marks = ",".join("?" for _ in usage_turns)
+            # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query -- reviewed: marks is only "?" placeholders; all values are bound parameters, no user input reaches the SQL text.
             self.db.execute(
                 f"""
                 UPDATE generation_usage SET in_transcript=1
