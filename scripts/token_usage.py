@@ -4645,6 +4645,38 @@ def _cursor_cloud_state():
         return {}
 
 
+def _cursor_cloud_save_state(state, warnings=None):
+    try:
+        cursor_cloud_dir().mkdir(parents=True, exist_ok=True)
+        atomic_write_text(_cursor_cloud_state_path(), json.dumps(state))
+    except OSError as exc:
+        warn(f"cannot write Cursor cloud sync state: {exc}", warnings)
+
+
+@contextlib.contextmanager
+def _cursor_cloud_lock():
+    """Serialise syncs: each one is a read-modify-write of the ledgers and
+    the state file. POSIX advisory lock; a no-op where fcntl is missing."""
+    root = cursor_cloud_dir()
+    root.mkdir(parents=True, exist_ok=True)
+    try:
+        import fcntl
+    except ImportError:  # Windows
+        yield
+        return
+    with open(root / ".sync.lock", "a+") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+def _cursor_cloud_autosync_enabled():
+    return bool(os.environ.get(CURSOR_CLOUD_KEY_ENV)) and os.environ.get(
+        "TOKEN_USAGE_CURSOR_CLOUD_AUTOSYNC", "1") not in ("0", "false", "no")
+
+
 def sync_cursor_cloud(since=None, agent_id=None, api_key=None, user_key=None,
                       warnings=None, request=None, now_ms=None):
     """Pull Cloud Agent usage events into the local ledgers. Returns a summary.
@@ -4659,15 +4691,24 @@ def sync_cursor_cloud(since=None, agent_id=None, api_key=None, user_key=None,
     user_key = user_key if user_key is not None else os.environ.get(CURSOR_CLOUD_USER_KEY_ENV)
     request = request or _cursor_cloud_request
     now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
+    with _cursor_cloud_lock():
+        return _sync_cursor_cloud_locked(since, agent_id, api_key, user_key,
+                                         warnings, request, now_ms)
+
+
+def _sync_cursor_cloud_locked(since, agent_id, api_key, user_key, warnings,
+                              request, now_ms):
     state = _cursor_cloud_state()
+    previous_hw = state.get("high_water_ms") if isinstance(
+        state.get("high_water_ms"), int) else None
     if since:
         from datetime import datetime
         cutoff = since_cutoff(since)
         start = int(datetime.fromisoformat(
             (cutoff if "T" in cutoff else cutoff + "T00:00:00+00:00").replace("Z", "+00:00"))
             .timestamp() * 1000)
-    elif agent_id is None and isinstance(state.get("high_water_ms"), int):
-        start = state["high_water_ms"] - CURSOR_CLOUD_OVERLAP_MS
+    elif agent_id is None and previous_hw is not None:
+        start = previous_hw - CURSOR_CLOUD_OVERLAP_MS
     else:
         start = now_ms - CURSOR_CLOUD_DEFAULT_SINCE_DAYS * 86400 * 1000
     fetched = {}
@@ -4683,7 +4724,7 @@ def sync_cursor_cloud(since=None, agent_id=None, api_key=None, user_key=None,
             resp = request("POST", "/teams/filtered-usage-events", api_key, body)
             for ev in (resp or {}).get("usageEvents") or []:
                 clean = _cursor_cloud_clean_event(ev)
-                if clean is not None:
+                if clean is not None and (agent_id is None or clean["cloudAgentId"] == agent_id):
                     fetched.setdefault(clean["cloudAgentId"], []).append(clean)
             pagination = (resp or {}).get("pagination") or {}
             if not pagination.get("hasNextPage"):
@@ -4697,28 +4738,29 @@ def sync_cursor_cloud(since=None, agent_id=None, api_key=None, user_key=None,
 
     root = cursor_cloud_dir()
     existing = {p.stem for p in root.glob("bc-*.jsonl")} if root.is_dir() else set()
-    targets = set(fetched) | ({agent_id} if agent_id else existing)
     written = 0
-    for aid in sorted(targets):
+    # Only agents the API returned rows for have their window replaced: an
+    # empty or truncated answer must never erase usage already on disk.
+    for aid in sorted(set(fetched) | existing):
         path = _cursor_cloud_ledger(aid)
         meta, events = _cursor_cloud_read_ledger(path)
-        kept = [e for e in events if not in_window(e)]
-        new = fetched.get(aid, [])
-        if not new and len(kept) == len(events):
-            continue
+        new = fetched.get(aid)
         if meta is None and user_key:
             meta = _cursor_cloud_agent_meta(aid, user_key, request)
+            if meta is not None and not new:
+                _cursor_cloud_write_ledger(path, meta, events)
+        if not new:
+            continue
+        kept = [e for e in events if not in_window(e)]
         _cursor_cloud_write_ledger(path, meta, kept + new)
         written += len(new)
     if agent_id is None:
-        state.update({"high_water_ms": now_ms, "last_sync_ms": now_ms})
-    else:
+        # The incremental cursor only moves when this fetch covered everything
+        # since the previous one; a narrower --since must not skip the gap.
+        if previous_hw is None or start <= previous_hw:
+            state["high_water_ms"] = now_ms
         state["last_sync_ms"] = now_ms
-    try:
-        root.mkdir(parents=True, exist_ok=True)
-        atomic_write_text(_cursor_cloud_state_path(), json.dumps(state))
-    except OSError as exc:
-        warn(f"cannot write Cursor cloud sync state: {exc}", warnings)
+    _cursor_cloud_save_state(state, warnings)
     return {"agents": sorted(fetched), "events": written,
             "window": [_cursor_cloud_ms_to_iso(start), _cursor_cloud_ms_to_iso(now_ms)]}
 
@@ -4727,18 +4769,23 @@ def _cursor_cloud_maybe_autosync(warnings=None):
     """Refresh ledgers before a scan when a key is configured and the last
     sync is stale. Offline (no key, or TOKEN_USAGE_CURSOR_CLOUD_AUTOSYNC=0) the
     adapter just reads whatever ledgers exist."""
-    if not os.environ.get(CURSOR_CLOUD_KEY_ENV):
-        return
-    if os.environ.get("TOKEN_USAGE_CURSOR_CLOUD_AUTOSYNC", "1") in ("0", "false", "no"):
+    if not _cursor_cloud_autosync_enabled():
         return
     try:
         interval = float(os.environ.get("TOKEN_USAGE_CURSOR_CLOUD_SYNC_INTERVAL",
                                         CURSOR_CLOUD_SYNC_INTERVAL_S))
     except ValueError:
         interval = CURSOR_CLOUD_SYNC_INTERVAL_S
-    last = _cursor_cloud_state().get("last_sync_ms")
-    if isinstance(last, int) and time.time() * 1000 - last < interval * 1000:
+    state = _cursor_cloud_state()
+    now_ms = int(time.time() * 1000)
+    # A failed attempt counts too, so a bad key or a 429 is not retried on
+    # every scan of the same dashboard render.
+    last = max((v for v in (state.get("last_sync_ms"), state.get("last_attempt_ms"))
+                if isinstance(v, int)), default=None)
+    if last is not None and now_ms - last < interval * 1000:
         return
+    state["last_attempt_ms"] = now_ms
+    _cursor_cloud_save_state(state, warnings)
     try:
         sync_cursor_cloud(warnings=warnings)
     except (RuntimeError, OSError, ValueError) as exc:
@@ -4766,12 +4813,15 @@ def parse_cursor_cloud_ledger(path):
     partial = False
     name = (meta or {}).get("name") or ""
     for ev in sorted(events, key=_cursor_cloud_ts):
-        conv = ev.get("conversationId") or "(no conversation)"
+        iso = _cursor_cloud_ms_to_iso(ev.get("timestamp"))
+        # One segment per conversation per local day, so day rollups bill each
+        # call on the day it happened.
+        conv = (ev.get("conversationId") or "(no conversation)", _local_day(iso))
         seg = by_conv.get(conv)
         if seg is None:
             label = (f"automation:{ev['automationId']}" if ev.get("automationId")
                      else CURSOR_CLOUD_LABEL)
-            seg = {"label": label, "start_ts": _cursor_cloud_ms_to_iso(ev.get("timestamp")),
+            seg = {"label": label, "start_ts": iso,
                    "prompt": str(name)[:120], "by_model": {}, "subagents": [],
                    "charged_by_model": {}}
             by_conv[conv] = seg
@@ -4829,11 +4879,14 @@ class CursorCloudAdapter(RuntimeAdapter):
             if not match:
                 return None
             path = _cursor_cloud_ledger(match.group(0))
-            if not path.is_file() and os.environ.get(CURSOR_CLOUD_KEY_ENV):
-                try:
-                    sync_cursor_cloud(agent_id=match.group(0))
-                except (RuntimeError, OSError, ValueError) as exc:
-                    warn(f"Cursor cloud usage sync failed: {exc}")
+            if _cursor_cloud_autosync_enabled():
+                if path.is_file():
+                    _cursor_cloud_maybe_autosync()
+                else:
+                    try:
+                        sync_cursor_cloud(agent_id=match.group(0))
+                    except (RuntimeError, OSError, ValueError) as exc:
+                        warn(f"Cursor cloud usage sync failed: {exc}")
             return path if path.is_file() else None
         paths = list(self.iter_sessions())
         return max(paths, key=lambda p: p.stat().st_mtime_ns) if paths else None
@@ -4847,8 +4900,11 @@ class CursorCloudAdapter(RuntimeAdapter):
     def project(self, source):
         meta, _ = _cursor_cloud_read_ledger(Path(source))
         repo = (meta or {}).get("repository")
-        if isinstance(repo, str) and repo:
-            return re.sub(r"^(https?://)?(www\.)?github\.com/", "", repo).rstrip("/")
+        if isinstance(repo, str) and repo.strip():
+            parsed = urllib.parse.urlsplit(repo.strip() if "://" in repo else "//" + repo.strip())
+            path = re.sub(r"\.git$", "", parsed.path.strip("/"))
+            if path:
+                return path
         return "cursor-cloud"
 
     def describe(self, source):
@@ -5056,7 +5112,7 @@ def cached_adapter_summary(adapter, source, pricing, warnings=None):
     st = _adapter_source_stat(adapter, source)
     # Codex parent reports include independently growing child rollouts. A
     # parent-only stat cannot validate that cache; recompute the family.
-    if cache_file.exists() and adapter.name not in ("codex", "gemini", "copilot"):
+    if cache_file.exists() and adapter.name not in ("codex", "gemini", "copilot", "cursor-cloud"):
         try:
             c = json.loads(cache_file.read_text(encoding="utf-8", errors="replace"))
             if (isinstance(c, dict) and c.get("version") == INDEX_VERSION

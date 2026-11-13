@@ -244,11 +244,11 @@ python3 scripts/token_usage.py report --runtime cursor-cloud bc-xxxxxxxx-xxxx-xx
 python3 scripts/token_usage.py history --runtime cursor-cloud --by model
 ```
 
-- One session per agent run, one activity segment per conversation. The project is the agent's repository when `CURSOR_API_KEY` is set, else `cursor-cloud`.
+- One session per agent run, one activity segment per conversation per local day. The project is the agent's repository when `CURSOR_API_KEY` is set, else `cursor-cloud`.
 - Cost is Cursor's own `chargedCents` (model cost plus any Cursor Token Rate), not a pricing-table estimate, so it reconciles with the team usage dashboard. Usage paid from a credit grant shows `0`.
 - `measurement` is `exact` when every call carried token counts and `partial` when some were request-billed without tokens.
 - With the key set, scans refresh the ledgers at most every 15 minutes (`TOKEN_USAGE_CURSOR_CLOUD_SYNC_INTERVAL`); set `TOKEN_USAGE_CURSOR_CLOUD_AUTOSYNC=0` to read cached ledgers only. Without a key the runtime is read-only over existing ledgers and makes no network call.
-- Cursor aggregates usage events hourly, so a run's latest calls can take up to an hour to appear. Each sync re-reads a three-hour overlap and replaces it, so nothing is counted twice.
+- Cursor aggregates usage events hourly, so a run's latest calls can take up to an hour to appear. Each sync re-reads a three-hour overlap and replaces it, so nothing is counted twice. An empty API answer never erases a ledger, failed automatic syncs are throttled like successful ones, and concurrent syncs are serialised with a lock file.
 - `auto` never selects `cursor-cloud`; ask for it by name.
 
 ### Codex

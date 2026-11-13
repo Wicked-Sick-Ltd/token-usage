@@ -175,3 +175,77 @@ def test_cli_report_reads_a_synced_ledger(tu, cloud_dir):
     data = json.loads(proc.stdout)
     assert data["runtime"] == "cursor-cloud"
     assert data["total"]["cost_usd"] == pytest.approx(0.24)
+
+
+def test_empty_answer_never_erases_ledgers(tu, cloud_dir):
+    sync(tu, since="2026-11-13")
+    empty = {"usageEvents": [], "pagination": {"hasNextPage": False}}
+    sync(tu, since="2026-11-13", request=fake_api(pages=[empty]))
+    sync(tu, since="2026-11-13", agent_id=AGENT_A, request=fake_api(pages=[empty]))
+    lines = (cloud_dir / f"{AGENT_A}.jsonl").read_text().splitlines()
+    assert len(lines) == 2
+
+
+def test_high_water_and_last_sync_only_move_on_full_team_syncs(tu, cloud_dir):
+    sync(tu, now_ms=NOW_MS)
+    state = json.loads((cloud_dir / ".sync-state.json").read_text())
+    assert state["high_water_ms"] == NOW_MS
+    later = NOW_MS + 10 * 86400 * 1000
+    sync(tu, since="2026-11-22", now_ms=later)  # starts after the previous high water
+    state = json.loads((cloud_dir / ".sync-state.json").read_text())
+    assert state["high_water_ms"] == NOW_MS
+    sync(tu, agent_id=AGENT_A, now_ms=later + 1)
+    state = json.loads((cloud_dir / ".sync-state.json").read_text())
+    assert state["high_water_ms"] == NOW_MS and state["last_sync_ms"] == later
+
+
+def test_conversation_spanning_days_bills_each_day(tu, cloud_dir):
+    cloud_dir.mkdir(parents=True)
+    rows = [{"type": "usage", "timestamp": str(ts), "cloudAgentId": AGENT_A,
+             "conversationId": "c", "model": "m",
+             "tokenUsage": {"inputTokens": 1, "outputTokens": 1}, "chargedCents": 100}
+            for ts in (1794592800000, 1794592800000 + 2 * 86400 * 1000)]
+    (cloud_dir / f"{AGENT_A}.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    adapter = tu.get_runtime_adapter("cursor-cloud")
+    summary, _ = tu.cached_adapter_summary(adapter, cloud_dir / f"{AGENT_A}.jsonl", {})
+    assert sorted(v["cost_usd"] for v in summary["by_day"].values()) == [1.0, 1.0]
+
+
+def test_project_from_any_repository_host(tu, cloud_dir):
+    adapter = tu.get_runtime_adapter("cursor-cloud")
+    cloud_dir.mkdir(parents=True)
+    path = cloud_dir / f"{AGENT_A}.jsonl"
+    for repo, want in (("https://gitlab.com/group/sub/app.git", "group/sub/app"),
+                       ("github.com/example-org/legacy-app", "example-org/legacy-app"),
+                       ("", "cursor-cloud")):
+        path.write_text(json.dumps({"type": "agent", "id": AGENT_A, "repository": repo}) + "\n")
+        assert adapter.project(path) == want
+
+
+def test_failed_autosync_is_throttled_and_autosync_off_means_no_network(tu, cloud_dir, monkeypatch):
+    calls = []
+
+    def failing(method, path, key, body=None):
+        calls.append(path)
+        raise RuntimeError("Cursor API returned HTTP 401")
+    monkeypatch.setattr(tu, "_cursor_cloud_request", failing)
+    monkeypatch.setenv("CURSOR_ADMIN_API_KEY", "test-admin-key")
+    adapter = tu.get_runtime_adapter("cursor-cloud")
+    warnings = []
+    list(adapter.iter_sessions(warnings=warnings))
+    list(adapter.iter_sessions(warnings=warnings))
+    assert len(calls) == 1
+    assert any("sync failed" in w for w in warnings)
+    monkeypatch.setenv("TOKEN_USAGE_CURSOR_CLOUD_AUTOSYNC", "0")
+    assert adapter.locate(AGENT_B) is None
+    assert len(calls) == 1
+
+
+def test_metadata_backfills_for_unchanged_ledgers(tu, cloud_dir):
+    sync(tu, since="2026-11-13")
+    agent = {"name": "Track 2", "source": {"repository": "github.com/example-org/legacy-app"}}
+    empty = {"usageEvents": [], "pagination": {"hasNextPage": False}}
+    sync(tu, user_key="user-key", request=fake_api(pages=[empty], agent=agent))
+    adapter = tu.get_runtime_adapter("cursor-cloud")
+    assert adapter.project(cloud_dir / f"{AGENT_A}.jsonl") == "example-org/legacy-app"
+    assert len((cloud_dir / f"{AGENT_A}.jsonl").read_text().splitlines()) == 3

@@ -140,7 +140,7 @@ Pulls Cursor Cloud Agent usage events from the Cursor Admin API (`POST /teams/fi
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--since` | incremental from the last sync (three-hour overlap), else the last 30 days | Window start, `Nd` or `YYYY-MM-DD`. Every ledger event inside the fetched window is replaced by what the API returns. |
+| `--since` | incremental from the last sync (three-hour overlap), else the last 30 days | Window start, `Nd` or `YYYY-MM-DD`. For each agent the API returned rows for, the ledger events inside the fetched window are replaced by those rows; an empty answer never erases a ledger. A narrower `--since` does not move the incremental cursor. |
 | `--agent` | all cloud agents | Sync one run by its `bc-…` id. |
 | `--json` | off | Print `{agents, events, window, warnings}` as JSON. |
 
