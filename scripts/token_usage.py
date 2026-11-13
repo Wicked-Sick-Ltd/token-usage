@@ -4776,20 +4776,28 @@ def _cursor_cloud_maybe_autosync(warnings=None):
                                         CURSOR_CLOUD_SYNC_INTERVAL_S))
     except ValueError:
         interval = CURSOR_CLOUD_SYNC_INTERVAL_S
-    state = _cursor_cloud_state()
-    now_ms = int(time.time() * 1000)
-    # A failed attempt counts too, so a bad key or a 429 is not retried on
-    # every scan of the same dashboard render.
-    last = max((v for v in (state.get("last_sync_ms"), state.get("last_attempt_ms"))
-                if isinstance(v, int)), default=None)
-    if last is not None and now_ms - last < interval * 1000:
-        return
-    state["last_attempt_ms"] = now_ms
-    _cursor_cloud_save_state(state, warnings)
-    try:
-        sync_cursor_cloud(warnings=warnings)
-    except (RuntimeError, OSError, ValueError) as exc:
-        warn(f"Cursor cloud usage sync failed; reading cached ledgers: {exc}", warnings)
+    api_key = os.environ.get(CURSOR_CLOUD_KEY_ENV)
+    user_key = os.environ.get(CURSOR_CLOUD_USER_KEY_ENV)
+    # The throttle check, last_attempt_ms write, and fetch must share the
+    # sync lock: otherwise two reports can both pass the interval and a
+    # stale last_attempt write can roll back a newer high_water_ms.
+    with _cursor_cloud_lock():
+        state = _cursor_cloud_state()
+        now_ms = int(time.time() * 1000)
+        # A failed attempt counts too, so a bad key or a 429 is not retried on
+        # every scan of the same dashboard render.
+        last = max((v for v in (state.get("last_sync_ms"), state.get("last_attempt_ms"))
+                    if isinstance(v, int)), default=None)
+        if last is not None and now_ms - last < interval * 1000:
+            return
+        state["last_attempt_ms"] = now_ms
+        _cursor_cloud_save_state(state, warnings)
+        try:
+            _sync_cursor_cloud_locked(
+                since=None, agent_id=None, api_key=api_key, user_key=user_key,
+                warnings=warnings, request=_cursor_cloud_request, now_ms=now_ms)
+        except (RuntimeError, OSError, ValueError) as exc:
+            warn(f"Cursor cloud usage sync failed; reading cached ledgers: {exc}", warnings)
 
 
 def _cursor_cloud_flat(token_usage):

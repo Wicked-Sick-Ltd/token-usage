@@ -1,8 +1,11 @@
 """cursor-cloud runtime: Cloud Agent usage from the Cursor Admin API, offline."""
+import contextlib
 import json
 import os
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -249,3 +252,104 @@ def test_metadata_backfills_for_unchanged_ledgers(tu, cloud_dir):
     adapter = tu.get_runtime_adapter("cursor-cloud")
     assert adapter.project(cloud_dir / f"{AGENT_A}.jsonl") == "example-org/legacy-app"
     assert len((cloud_dir / f"{AGENT_A}.jsonl").read_text().splitlines()) == 3
+
+
+def test_autosync_state_access_holds_the_lock(tu, cloud_dir, monkeypatch):
+    depth = {"n": 0}
+    real_lock = tu._cursor_cloud_lock
+    real_state = tu._cursor_cloud_state
+    real_save = tu._cursor_cloud_save_state
+
+    @contextlib.contextmanager
+    def wrapped_lock():
+        depth["n"] += 1
+        try:
+            with real_lock():
+                yield
+        finally:
+            depth["n"] -= 1
+
+    def state():
+        assert depth["n"] > 0, "autosync read state outside _cursor_cloud_lock"
+        return real_state()
+
+    def save(state, warnings=None):
+        assert depth["n"] > 0, "autosync wrote state outside _cursor_cloud_lock"
+        return real_save(state, warnings)
+
+    monkeypatch.setattr(tu, "_cursor_cloud_lock", wrapped_lock)
+    monkeypatch.setattr(tu, "_cursor_cloud_state", state)
+    monkeypatch.setattr(tu, "_cursor_cloud_save_state", save)
+    monkeypatch.setattr(tu, "_cursor_cloud_request", fake_api())
+    monkeypatch.setenv("CURSOR_ADMIN_API_KEY", "test-admin-key")
+    tu._cursor_cloud_maybe_autosync()
+    written = json.loads((cloud_dir / ".sync-state.json").read_text())
+    assert "last_attempt_ms" in written and "high_water_ms" in written
+
+
+def test_concurrent_autosync_does_not_clobber_high_water(tu, cloud_dir, monkeypatch):
+    cloud_dir.mkdir(parents=True)
+    # Use the wall clock: maybe_autosync stamps high_water_ms with time.time().
+    seeded = int(time.time() * 1000) - 3600 * 1000
+    (cloud_dir / ".sync-state.json").write_text(json.dumps({
+        "high_water_ms": seeded, "last_sync_ms": 0,
+    }))
+    monkeypatch.setenv("CURSOR_ADMIN_API_KEY", "test-admin-key")
+    monkeypatch.setattr(tu, "_cursor_cloud_request", fake_api())
+
+    about_to_save = threading.Event()
+    other_done = threading.Event()
+    real_save = tu._cursor_cloud_save_state
+    first_tid = {"id": None, "paused": False}
+    observed = []
+
+    def save(state, warnings=None):
+        tid = threading.get_ident()
+        if first_tid["id"] is None:
+            first_tid["id"] = tid
+        if tid == first_tid["id"] and not first_tid["paused"]:
+            first_tid["paused"] = True
+            about_to_save.set()
+            other_done.wait(timeout=1.0)
+            before = None
+            path = cloud_dir / ".sync-state.json"
+            if path.is_file():
+                before = json.loads(path.read_text()).get("high_water_ms")
+            real_save(state, warnings)
+            after = json.loads(path.read_text()).get("high_water_ms")
+            observed.append((before, after))
+            return
+        return real_save(state, warnings)
+
+    monkeypatch.setattr(tu, "_cursor_cloud_save_state", save)
+    finished = []
+
+    def run_first():
+        tu._cursor_cloud_maybe_autosync()
+        finished.append("first")
+
+    def run_second():
+        try:
+            assert about_to_save.wait(timeout=5)
+            tu._cursor_cloud_maybe_autosync()
+            finished.append("second")
+        finally:
+            other_done.set()
+
+    threads = [threading.Thread(target=run_first), threading.Thread(target=run_second)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+        assert not t.is_alive()
+    assert sorted(finished) == ["first", "second"]
+    assert observed
+    before, after = observed[0]
+    # A completed peer sync must not have its high_water rolled back by a
+    # stale last_attempt_ms write that raced outside the lock.
+    if before is not None:
+        assert after >= before
+    state = json.loads((cloud_dir / ".sync-state.json").read_text())
+    assert state["high_water_ms"] >= seeded
+    assert "last_attempt_ms" in state
+
