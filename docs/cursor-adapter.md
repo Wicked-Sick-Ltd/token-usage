@@ -244,3 +244,20 @@ with `TOKEN_USAGE_LEDGER_DIR`). They write no per-session JSON and no
 `latest.json`, so the PowerShell statusline example does not apply. Use
 `python3 scripts/token_usage.py live --runtime cursor` when you want a refreshing
 terminal view of the current Cursor session.
+
+## Cursor Cloud Agents (runtime `cursor-cloud`)
+
+The `cursor` runtime reads local Cursor data. Cloud Agent runs (`bc-…` ids) write none, and their conversation API and exported transcripts carry no token or model fields (checked against `GET /v0/agents/{id}/conversation` and dumped transcripts in November 2026). The authoritative source is the team billing record:
+
+| Source | Endpoint | Per-agent? | Fields used |
+|---|---|---|---|
+| Admin API usage events | `POST https://api.cursor.com/teams/filtered-usage-events` with `cloudAgentId` (`*` for all runs) | yes, `cloudAgentId` on each row | `timestamp`, `cloudAgentId`, `conversationId`, `automationId`, `model`, `kind`, `maxMode`, `requestsCosts`, `isTokenBasedCall`, `isChargeable`, `isHeadless`, `tokenUsage.{inputTokens,outputTokens,cacheReadTokens,cacheWriteTokens,totalCents}`, `chargedCents`, `cursorTokenFee`, `product` |
+| Cloud Agents API (optional) | `GET https://api.cursor.com/v0/agents/{id}` | yes | `name`, `source.repository`, `createdAt` (labels only) |
+| Billing items | `GET /v2/teams/billing-items` | no agent id | not used |
+
+Mapping: `inputTokens` → input, `outputTokens` → output, `cacheReadTokens` → cache_read, `cacheWriteTokens` → the shared cache-write bucket (`cache_5m`; `cache_1h` stays 0 because the Admin API does not expose a cache TTL). This matches Codex (`cache_write_input_tokens`) and the Cursor IDE adapter (`cacheWriteTokens`). It is a cache write, not a claim that the write used a 5-minute TTL. Cost per model is the sum of `chargedCents` / 100, which carries through `session_cost`, `history` (all `--by` modes), `top_consumers`, `insights`, `dashboard` and `export` in place of the pricing-table estimate. A row without `chargedCents` falls back to `tokenUsage.totalCents`; a row with neither marks the session `partial`.
+
+Keys: `CURSOR_ADMIN_API_KEY` must be a **Team Admin API key** (Basic auth, `read:*` scope or higher), created by a team admin in the Cursor dashboard. A user API key returns `401 Invalid Team API Key` on this endpoint. `CURSOR_API_KEY` (a user key) is optional and only adds names and repositories. Neither key is written to disk or logged.
+
+Rate limits: the endpoint allows 60 requests per minute per team and aggregates hourly. Automatic syncs run at most every 15 minutes and fetch up to 1000 rows per page in windows of at most 30 days.
+
