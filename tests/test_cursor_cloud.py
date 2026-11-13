@@ -315,10 +315,10 @@ def test_concurrent_autosync_does_not_clobber_high_water(tu, cloud_dir, monkeypa
             path = cloud_dir / ".sync-state.json"
             if path.is_file():
                 before = json.loads(path.read_text()).get("high_water_ms")
-            real_save(state, warnings)
+            result = real_save(state, warnings)
             after = json.loads(path.read_text()).get("high_water_ms")
             observed.append((before, after))
-            return
+            return result
         return real_save(state, warnings)
 
     monkeypatch.setattr(tu, "_cursor_cloud_save_state", save)
