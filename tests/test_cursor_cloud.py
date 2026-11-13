@@ -353,3 +353,24 @@ def test_concurrent_autosync_does_not_clobber_high_water(tu, cloud_dir, monkeypa
     assert state["high_water_ms"] >= seeded
     assert "last_attempt_ms" in state
 
+
+def test_cache_write_tokens_use_shared_write_buckets(tu, cloud_dir):
+    # Admin API cacheWriteTokens have no TTL. Other runtimes put the same
+    # kind of counter in cache_5m (Codex cache_write_input_tokens, Cursor
+    # IDE cacheWriteTokens); cache_1h is only used when a 1-hour TTL is known.
+    cloud_dir.mkdir(parents=True)
+    row = {"type": "usage", "timestamp": "1794592800000", "cloudAgentId": AGENT_A,
+           "conversationId": "c", "model": "claude-4.5-sonnet",
+           "tokenUsage": {"inputTokens": 7, "outputTokens": 10,
+                          "cacheWriteTokens": 39331, "cacheReadTokens": 147695},
+           "chargedCents": 21.68}
+    (cloud_dir / f"{AGENT_A}.jsonl").write_text(json.dumps(row) + "\n")
+    parsed = tu.get_runtime_adapter("cursor-cloud").parse(cloud_dir / f"{AGENT_A}.jsonl")
+    usage = tu.aggregate(parsed["segments"], {})["total"]["usage"]
+    assert usage["input"] == 7
+    assert usage["output"] == 10
+    assert usage["cache_read"] == 147695
+    assert usage["cache_5m"] == 39331
+    assert usage["cache_1h"] == 0
+    assert tu.aggregate(parsed["segments"], {})["total"]["cost_usd"] == pytest.approx(0.2168)
+

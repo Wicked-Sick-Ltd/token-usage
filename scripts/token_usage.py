@@ -4801,6 +4801,15 @@ def _cursor_cloud_maybe_autosync(warnings=None):
 
 
 def _cursor_cloud_flat(token_usage):
+    """Flatten Admin API tokenUsage to the shared report buckets.
+
+    cacheWriteTokens is a TTL-less cache write, the same kind of counter
+    Codex stores as cache_write_input_tokens and the Cursor IDE adapter
+    reads as cacheWriteTokens. Those adapters both put undifferentiated
+    writes in cache_5m (cache_1h is only used when a 1-hour TTL is known).
+    The Admin API does not expose a TTL, so the write lands in cache_5m.
+    Cost for this runtime still comes from chargedCents, not the 5m rate.
+    """
     if not isinstance(token_usage, dict):
         return None
     vals = {}
