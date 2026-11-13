@@ -19,7 +19,7 @@ python3 scripts/token_usage.py <command> [options]
 `report`, `json`, `history`, `insights`, `top_consumers`, `dashboard`, `live` and `export` all take:
 
 ```text
---runtime {claude,cursor,codex,gemini,copilot,auto}
+--runtime {claude,cursor,codex,gemini,copilot,cursor-cloud,auto}
 ```
 
 The default is the value of `TOKEN_USAGE_RUNTIME`, or `claude` when that variable is unset. `auto` selects one runtime only when the choice is unambiguous, and one call never mixes runtimes. A Codex, Cursor, Gemini or Copilot plugin sets `TOKEN_USAGE_RUNTIME` for its MCP server. Pass `--runtime` yourself when you run the script by hand.
@@ -133,6 +133,18 @@ JSONL aggregates for another local tool. Schema `token-usage.aggregate.v1`. Metr
 | `--runtime` | see above | Which host to read. |
 
 History scope rejects a positional recording. Session scope rejects `--by`, `--since` and `--project`. Session scope writes one `total` row and one row per activity label. History rows include `measurement_counts`, the scan's per-session tally. `gen_ai.estimated_cost.usd` is JSON `null` when the amount is unpriced or unmeasured. Redact lines before sharing them: they contain project slugs, command labels and model IDs.
+
+### `cursor-cloud-sync`
+
+Pulls Cursor Cloud Agent usage events from the Cursor Admin API (`POST /teams/filtered-usage-events`) into per-agent ledgers under `TOKEN_USAGE_CURSOR_CLOUD_DIR` (default `~/.cache/token-usage/cursor-cloud/`). Requires `CURSOR_ADMIN_API_KEY`. Afterwards every reporting command and MCP tool reads them with `--runtime cursor-cloud`.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--since` | incremental from the last sync (three-hour overlap), else the last 30 days | Window start, `Nd` or `YYYY-MM-DD`. Every ledger event inside the fetched window is replaced by what the API returns. |
+| `--agent` | all cloud agents | Sync one run by its `bc-…` id. |
+| `--json` | off | Print `{agents, events, window, warnings}` as JSON. |
+
+Exits non-zero with a message when the key is missing or the API rejects it. The key is never printed or stored.
 
 ### Hook commands
 

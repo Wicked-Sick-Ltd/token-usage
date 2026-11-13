@@ -378,7 +378,7 @@ def pick_session_auto(path=None, session_id=None, project_dir=None, warnings=Non
     transcript_arg = path.strip() if path else None
     if session_id and not transcript_arg:
         native = [(a, a.locate(session_id=session_id.strip()))
-                  for name, a in tu._RUNTIME_ADAPTERS.items() if name not in ("claude", "cursor")]
+                  for name, a in tu._RUNTIME_ADAPTERS.items() if name not in tu._AUTO_SKIP]
         native = [(a, source) for a, source in native if source is not None]
         claude_t, _ = tu.locate_transcript_with_source(session_id=session_id.strip(),
                                                        project_dir=project_dir)

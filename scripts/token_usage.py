@@ -17,6 +17,7 @@ Subcommands:
     json   [TRANSCRIPT]   Same data as JSON
     hook                  Read Claude Code hook JSON on stdin, update the session ledger
     cursor-hook           Read Cursor hook JSON on stdin, append to the Cursor hook ledger
+    cursor-cloud-sync     Pull Cursor Cloud Agent usage (Admin API) into local ledgers
     history               Cross-session rollup by project/day/command/model
     insights              Rule-based findings for one session or a window
     top_consumers         Costliest sessions or commands in a window
@@ -268,10 +269,22 @@ def cache_savings_usd(by_model, pricing):
     return total if priced else None
 
 
-def unpriced_models(by_model, pricing):
+def billed_cost(by_model, pricing, charged=None):
+    """cost_usd(), unless the runtime reported what was actually charged.
+
+    `charged` maps model -> USD billed by the vendor (Cursor cloud agents carry
+    `chargedCents` per call). When present it is the cost: a pricing-table
+    estimate of the same tokens would disagree with the invoice."""
+    if charged is not None:
+        return sum(charged.get(m, 0.0) for m in by_model)
+    return cost_usd(by_model, pricing)
+
+
+def unpriced_models(by_model, pricing, charged=None):
     """Model IDs with recorded usage but no resolvable rates (costs understated)."""
+    charged = charged or {}
     return sorted(m for m, b in by_model.items()
-                  if rates_for(m, pricing) is None
+                  if m not in charged and rates_for(m, pricing) is None
                   and any(b[k] for k in ("input", "output", "cache_read", "cache_5m", "cache_1h")))
 
 
@@ -695,47 +708,67 @@ def agents_by_type(subagents, pricing):
     return sorted(out, key=lambda g: -(g["cost_usd"] or g["usage"]["output"] / 1e6))
 
 
-def models_breakdown(by_model, pricing):
+def models_breakdown(by_model, pricing, charged=None):
     """Per-model rows (subsets of the containing total) with summed usage and cost."""
     out = [{"model": m, "usage": dict(bucket),
-            "cost_usd": cost_usd({m: bucket}, pricing)}
+            "cost_usd": billed_cost({m: bucket}, pricing, charged)}
            for m, bucket in by_model.items()]
     return sorted(out, key=lambda r: -(r["cost_usd"] or r["usage"]["output"] / 1e6))
 
 
+def merge_charged(dest, src):
+    """Sum vendor-charged USD per model; None (unknown) is contagious."""
+    if dest is None or src is None:
+        return None
+    for model, usd in src.items():
+        dest[model] = dest.get(model, 0.0) + usd
+    return dest
+
+
 def aggregate(segments, pricing):
     by_label, total_by_model = {}, {}
+    # Charged USD only stands in for the estimate when every segment has it.
+    total_charged = {} if segments and all(
+        "charged_by_model" in s for s in segments) else None
     for seg in segments:
         agg = by_label.setdefault(seg["label"], {
-            "by_model": {}, "invocations": 0, "subagents": 0,
+            "by_model": {}, "invocations": 0, "subagents": 0, "_charged": {},
         })
         agg["invocations"] += 1
         agg["subagents"] += len(seg["subagents"])
         merge_by_model(agg["by_model"], seg["by_model"])
         merge_by_model(total_by_model, seg["by_model"])
+        agg["_charged"] = merge_charged(agg["_charged"], seg.get("charged_by_model"))
+        total_charged = merge_charged(total_charged, seg.get("charged_by_model"))
         agg.setdefault("_subagents", []).extend(seg["subagents"])
     for agg in by_label.values():
+        charged = agg.pop("_charged")
         agg["usage"] = sum_buckets(agg["by_model"])
-        agg["cost_usd"] = cost_usd(agg["by_model"], pricing)
+        agg["cost_usd"] = billed_cost(agg["by_model"], pricing, charged)
         agg["agents"] = agents_by_type(agg.pop("_subagents", []), pricing)
-        agg["models"] = models_breakdown(agg["by_model"], pricing)
+        agg["models"] = models_breakdown(agg["by_model"], pricing, charged)
+        if charged is not None:
+            agg["charged_by_model"] = charged
+    total = {
+        "usage": sum_buckets(total_by_model),
+        "cost_usd": billed_cost(total_by_model, pricing, total_charged),
+        "cache_savings_usd": cache_savings_usd(total_by_model, pricing),
+        "models": sorted(total_by_model),
+        "by_model": total_by_model,
+        "unpriced_models": unpriced_models(total_by_model, pricing, total_charged),
+    }
+    if total_charged is not None:
+        total["charged_by_model"] = total_charged
     return {
         "by_label": by_label,
-        "total": {
-            "usage": sum_buckets(total_by_model),
-            "cost_usd": cost_usd(total_by_model, pricing),
-            "cache_savings_usd": cache_savings_usd(total_by_model, pricing),
-            "models": sorted(total_by_model),
-            "by_model": total_by_model,
-            "unpriced_models": unpriced_models(total_by_model, pricing),
-        },
+        "total": total,
         "segments": [
             {**{k: s[k] for k in ("label", "start_ts", "prompt")},
              "subagents": [{k: v for k, v in a.items() if k != "by_model"}
                            for a in s["subagents"]],
              "agents": agents_by_type(s["subagents"], pricing),
              "usage": sum_buckets(s["by_model"]),
-             "cost_usd": cost_usd(s["by_model"], pricing)}
+             "cost_usd": billed_cost(s["by_model"], pricing, s.get("charged_by_model"))}
             for s in segments
         ],
     }
@@ -960,9 +993,12 @@ def summarize_transcript(path, pricing, st=None):
         # per-session cost is not enough to spot mixing inside one label).
         "by_label": {label: {"usage": agg["usage"], "cost_usd": agg["cost_usd"],
                              "invocations": agg["invocations"],
-                             "unpriced": bool(unpriced_models(agg["by_model"], pricing))}
+                             "unpriced": bool(unpriced_models(
+                                 agg["by_model"], pricing, agg.get("charged_by_model")))}
                      for label, agg in data["by_label"].items()},
         "by_model": data["total"]["by_model"],
+        **({"charged_by_model": data["total"]["charged_by_model"]}
+           if "charged_by_model" in data["total"] else {}),
         "total": {"usage": data["total"]["usage"],
                   "cost_usd": data["total"]["cost_usd"]},
         "by_day": {day: {"usage": sum_buckets(models),
@@ -1169,7 +1205,8 @@ def _run_history_core(by="project", since=None, project=None, warnings=None, run
         r["calls"] += calls
 
     for s in summary_iter:
-        unpriced.update(unpriced_models(s.get("by_model", {}), pricing))
+        unpriced.update(unpriced_models(s.get("by_model", {}), pricing,
+                                        s.get("charged_by_model")))
         _count_measurement(measurements, s)
         if by == "project":
             add_row(s["project"], s["total"]["usage"], s["total"]["cost_usd"], 1)
@@ -1180,7 +1217,8 @@ def _run_history_core(by="project", since=None, project=None, warnings=None, run
                 add_row(day, b["usage"], b["cost_usd"], 1)
         elif by == "model":
             for model, bucket in s.get("by_model", {}).items():
-                add_row(model, bucket, cost_usd({model: bucket}, pricing),
+                add_row(model, bucket,
+                        billed_cost({model: bucket}, pricing, s.get("charged_by_model")),
                         bucket.get("requests", 0))
         else:  # command
             for label, agg in s["by_label"].items():
@@ -1438,7 +1476,7 @@ def _enrich_dashboard_partials(data, scan, warnings):
     project_partial = {}
     command_partial = {}
     for s in summary_iter:
-        if unpriced_models(s.get("by_model", {}), pricing):
+        if unpriced_models(s.get("by_model", {}), pricing, s.get("charged_by_model")):
             project_partial[s["project"]] = True
         for label, agg in s["by_label"].items():
             if agg["cost_usd"] is None or agg.get("unpriced"):
@@ -1946,7 +1984,8 @@ def run_top_consumers(by="session", since="30d", project=None, limit=10, warning
     measurements = {}
     sessions, commands = [], {}
     for s in summary_iter:
-        session_unpriced = unpriced_models(s.get("by_model", {}), pricing)
+        session_unpriced = unpriced_models(s.get("by_model", {}), pricing,
+                                           s.get("charged_by_model"))
         unpriced.update(session_unpriced)
         _count_measurement(measurements, s)
         if by == "session":
@@ -2264,7 +2303,8 @@ def window_insights(summaries, cutoff, pricing, now=None, halves=None):
 
     # 9: unpriced models anywhere in the window
     up = sorted({m for s in summaries
-                 for m in unpriced_models(s.get("by_model", {}), pricing)})
+                 for m in unpriced_models(s.get("by_model", {}), pricing,
+                                          s.get("charged_by_model"))})
     if up:
         out.append(finding("unpriced-models", "warn",
             f"{', '.join(up)} unpriced — add rates to {user_pricing_path()} "
@@ -4463,11 +4503,376 @@ def parse_copilot_records(records):
             "measurement": ("partial" if partial else "exact") if measured else "activity_only"}
 
 
+# ---------------------------------------------------------------------------
+# Cursor Cloud Agents (bc-… runs): usage from the Cursor Admin API.
+#
+# Cloud agents write nothing to the local IDE database, so the `cursor`
+# runtime cannot see them. Cursor's Admin API does: POST
+# /teams/filtered-usage-events returns one row per billed model call with
+# `cloudAgentId`, `conversationId`, `model`, `tokenUsage` and `chargedCents`.
+# `sync_cursor_cloud` pulls those rows into one local JSONL ledger per agent
+# (no emails, no keys), and CursorCloudAdapter reads the ledgers offline like
+# any other runtime. Cost is Cursor's own `chargedCents`, not a pricing-table
+# estimate, so it reconciles with the team's usage dashboard.
+# ---------------------------------------------------------------------------
+
+CURSOR_API_BASE = "https://api.cursor.com"
+CURSOR_CLOUD_KEY_ENV = "CURSOR_ADMIN_API_KEY"
+CURSOR_CLOUD_USER_KEY_ENV = "CURSOR_API_KEY"
+CURSOR_CLOUD_LABEL = "(cloud agent)"
+CURSOR_CLOUD_DEFAULT_SINCE_DAYS = 30
+CURSOR_CLOUD_OVERLAP_MS = 3 * 3600 * 1000   # events are aggregated hourly upstream
+CURSOR_CLOUD_WINDOW_MS = 30 * 86400 * 1000  # stay inside the API's 30-day range
+CURSOR_CLOUD_SYNC_INTERVAL_S = 900
+_CURSOR_CLOUD_ID_RE = re.compile(r"bc-[A-Za-z0-9-]{8,80}")
+# Fields kept from each usage event. userEmail is deliberately dropped: the
+# ledger only needs to attribute spend to an agent run, not to a person.
+_CURSOR_CLOUD_EVENT_FIELDS = (
+    "timestamp", "cloudAgentId", "conversationId", "automationId", "model",
+    "kind", "maxMode", "requestsCosts", "isTokenBasedCall", "isChargeable",
+    "isHeadless", "tokenUsage", "chargedCents", "cursorTokenFee", "product",
+)
+
+
+def cursor_cloud_dir():
+    return Path(os.environ.get("TOKEN_USAGE_CURSOR_CLOUD_DIR")
+                or ledger_dir() / "cursor-cloud").expanduser()
+
+
+def _cursor_cloud_ledger(agent_id):
+    if not _CURSOR_CLOUD_ID_RE.fullmatch(str(agent_id or "")):
+        raise ValueError(f"not a Cursor cloud agent id: {agent_id!r}")
+    return cursor_cloud_dir() / f"{agent_id}.jsonl"
+
+
+def _cursor_cloud_ms_to_iso(ms):
+    from datetime import datetime, timezone
+    try:
+        value = int(str(ms))
+    except (TypeError, ValueError):
+        return None
+    return (datetime.fromtimestamp(value / 1000, tz=timezone.utc)
+            .strftime("%Y-%m-%dT%H:%M:%S.") + f"{value % 1000:03d}Z")
+
+
+def _cursor_cloud_request(method, path, api_key, body=None, timeout=60):
+    """One Basic-auth call to the Cursor API. The key never leaves this frame."""
+    import base64
+    import urllib.error
+    import urllib.request
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(CURSOR_API_BASE + path, data=data, method=method)
+    token = base64.b64encode(f"{api_key}:".encode()).decode()
+    req.add_header("Authorization", f"Basic {token}")
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # fixed https host
+            return json.load(resp)
+    except urllib.error.HTTPError as exc:
+        detail = exc.read()[:200].decode("utf-8", "replace")
+        raise RuntimeError(f"Cursor API {path} returned HTTP {exc.code}: {detail}") from None
+
+
+def _cursor_cloud_clean_event(ev):
+    if not isinstance(ev, dict):
+        return None
+    agent = ev.get("cloudAgentId")
+    if not isinstance(agent, str) or not _CURSOR_CLOUD_ID_RE.fullmatch(agent):
+        return None
+    out = {k: ev[k] for k in _CURSOR_CLOUD_EVENT_FIELDS if k in ev}
+    out["type"] = "usage"
+    return out
+
+
+def _cursor_cloud_read_ledger(path):
+    meta, events = None, []
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except FileNotFoundError:
+        return meta, events
+    for line in lines:
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(rec, dict):
+            continue
+        if rec.get("type") == "agent":
+            meta = rec
+        elif rec.get("type") == "usage":
+            events.append(rec)
+    return meta, events
+
+
+def _cursor_cloud_ts(ev):
+    try:
+        return int(str(ev.get("timestamp")))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _cursor_cloud_write_ledger(path, meta, events):
+    events = sorted(events, key=_cursor_cloud_ts)
+    lines = ([json.dumps(meta, sort_keys=True)] if meta else []) + [
+        json.dumps(e, sort_keys=True) for e in events]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(path, "\n".join(lines) + ("\n" if lines else ""))
+
+
+def _cursor_cloud_agent_meta(agent_id, user_key, request):
+    """Name/repo/createdAt from the Cloud Agents API, when a user key is set."""
+    try:
+        a = request("GET", f"/v0/agents/{agent_id}", user_key)
+    except (RuntimeError, OSError, ValueError):
+        return None
+    if not isinstance(a, dict):
+        return None
+    source = a.get("source") if isinstance(a.get("source"), dict) else {}
+    return {"type": "agent", "id": agent_id, "name": a.get("name"),
+            "repository": source.get("repository"), "createdAt": a.get("createdAt")}
+
+
+def _cursor_cloud_state_path():
+    return cursor_cloud_dir() / ".sync-state.json"
+
+
+def _cursor_cloud_state():
+    try:
+        s = json.loads(_cursor_cloud_state_path().read_text(encoding="utf-8"))
+        return s if isinstance(s, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def sync_cursor_cloud(since=None, agent_id=None, api_key=None, user_key=None,
+                      warnings=None, request=None, now_ms=None):
+    """Pull Cloud Agent usage events into the local ledgers. Returns a summary.
+
+    The API is the source of truth for the window it returns: every ledger
+    event inside a fetched window is replaced by what the API now says, so a
+    re-sync never double-counts and late hourly aggregation is picked up."""
+    api_key = api_key or os.environ.get(CURSOR_CLOUD_KEY_ENV)
+    if not api_key:
+        raise RuntimeError(f"set {CURSOR_CLOUD_KEY_ENV} to a Cursor Team Admin API key "
+                           "(read scope) to sync Cloud Agent usage")
+    user_key = user_key if user_key is not None else os.environ.get(CURSOR_CLOUD_USER_KEY_ENV)
+    request = request or _cursor_cloud_request
+    now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
+    state = _cursor_cloud_state()
+    if since:
+        from datetime import datetime
+        cutoff = since_cutoff(since)
+        start = int(datetime.fromisoformat(
+            (cutoff if "T" in cutoff else cutoff + "T00:00:00+00:00").replace("Z", "+00:00"))
+            .timestamp() * 1000)
+    elif agent_id is None and isinstance(state.get("high_water_ms"), int):
+        start = state["high_water_ms"] - CURSOR_CLOUD_OVERLAP_MS
+    else:
+        start = now_ms - CURSOR_CLOUD_DEFAULT_SINCE_DAYS * 86400 * 1000
+    fetched = {}
+    windows = []
+    lo = start
+    while lo <= now_ms:
+        hi = min(lo + CURSOR_CLOUD_WINDOW_MS - 1, now_ms)
+        windows.append((lo, hi))
+        page = 1
+        while True:
+            body = {"startDate": lo, "endDate": hi, "page": page, "pageSize": 1000,
+                    "cloudAgentId": agent_id or "*"}
+            resp = request("POST", "/teams/filtered-usage-events", api_key, body)
+            for ev in (resp or {}).get("usageEvents") or []:
+                clean = _cursor_cloud_clean_event(ev)
+                if clean is not None:
+                    fetched.setdefault(clean["cloudAgentId"], []).append(clean)
+            pagination = (resp or {}).get("pagination") or {}
+            if not pagination.get("hasNextPage"):
+                break
+            page += 1
+        lo = hi + 1
+
+    def in_window(ev):
+        ts = _cursor_cloud_ts(ev)
+        return any(a <= ts <= b for a, b in windows)
+
+    root = cursor_cloud_dir()
+    existing = {p.stem for p in root.glob("bc-*.jsonl")} if root.is_dir() else set()
+    targets = set(fetched) | ({agent_id} if agent_id else existing)
+    written = 0
+    for aid in sorted(targets):
+        path = _cursor_cloud_ledger(aid)
+        meta, events = _cursor_cloud_read_ledger(path)
+        kept = [e for e in events if not in_window(e)]
+        new = fetched.get(aid, [])
+        if not new and len(kept) == len(events):
+            continue
+        if meta is None and user_key:
+            meta = _cursor_cloud_agent_meta(aid, user_key, request)
+        _cursor_cloud_write_ledger(path, meta, kept + new)
+        written += len(new)
+    if agent_id is None:
+        state.update({"high_water_ms": now_ms, "last_sync_ms": now_ms})
+    else:
+        state["last_sync_ms"] = now_ms
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(_cursor_cloud_state_path(), json.dumps(state))
+    except OSError as exc:
+        warn(f"cannot write Cursor cloud sync state: {exc}", warnings)
+    return {"agents": sorted(fetched), "events": written,
+            "window": [_cursor_cloud_ms_to_iso(start), _cursor_cloud_ms_to_iso(now_ms)]}
+
+
+def _cursor_cloud_maybe_autosync(warnings=None):
+    """Refresh ledgers before a scan when a key is configured and the last
+    sync is stale. Offline (no key, or TOKEN_USAGE_CURSOR_CLOUD_AUTOSYNC=0) the
+    adapter just reads whatever ledgers exist."""
+    if not os.environ.get(CURSOR_CLOUD_KEY_ENV):
+        return
+    if os.environ.get("TOKEN_USAGE_CURSOR_CLOUD_AUTOSYNC", "1") in ("0", "false", "no"):
+        return
+    try:
+        interval = float(os.environ.get("TOKEN_USAGE_CURSOR_CLOUD_SYNC_INTERVAL",
+                                        CURSOR_CLOUD_SYNC_INTERVAL_S))
+    except ValueError:
+        interval = CURSOR_CLOUD_SYNC_INTERVAL_S
+    last = _cursor_cloud_state().get("last_sync_ms")
+    if isinstance(last, int) and time.time() * 1000 - last < interval * 1000:
+        return
+    try:
+        sync_cursor_cloud(warnings=warnings)
+    except (RuntimeError, OSError, ValueError) as exc:
+        warn(f"Cursor cloud usage sync failed; reading cached ledgers: {exc}", warnings)
+
+
+def _cursor_cloud_flat(token_usage):
+    if not isinstance(token_usage, dict):
+        return None
+    vals = {}
+    for src, dst in (("inputTokens", "input"), ("outputTokens", "output"),
+                     ("cacheReadTokens", "cache_read"), ("cacheWriteTokens", "cache_5m")):
+        v = token_usage.get(src, 0)
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0:
+            return None
+        vals[dst] = int(v)
+    vals["cache_1h"] = 0
+    return vals
+
+
+def parse_cursor_cloud_ledger(path):
+    """Segments (one per conversation) with tokens and Cursor-charged USD."""
+    meta, events = _cursor_cloud_read_ledger(Path(path))
+    warnings, segments, by_conv = [], [], {}
+    partial = False
+    name = (meta or {}).get("name") or ""
+    for ev in sorted(events, key=_cursor_cloud_ts):
+        conv = ev.get("conversationId") or "(no conversation)"
+        seg = by_conv.get(conv)
+        if seg is None:
+            label = (f"automation:{ev['automationId']}" if ev.get("automationId")
+                     else CURSOR_CLOUD_LABEL)
+            seg = {"label": label, "start_ts": _cursor_cloud_ms_to_iso(ev.get("timestamp")),
+                   "prompt": str(name)[:120], "by_model": {}, "subagents": [],
+                   "charged_by_model": {}}
+            by_conv[conv] = seg
+            segments.append(seg)
+        model = str(ev.get("model") or "unknown")
+        bucket = seg["by_model"].setdefault(model, empty_usage())
+        flat = _cursor_cloud_flat(ev.get("tokenUsage"))
+        if flat is None:
+            partial = True
+            bucket["requests"] += 1
+        else:
+            add_flat(bucket, flat)
+        cents = ev.get("chargedCents")
+        if isinstance(cents, bool) or not isinstance(cents, (int, float)):
+            # Fall back to the model cost Cursor reported, else count it as unknown.
+            cents = (ev.get("tokenUsage") or {}).get("totalCents")
+            if isinstance(cents, bool) or not isinstance(cents, (int, float)):
+                partial = True
+                cents = 0
+        charged = seg["charged_by_model"]
+        charged[model] = charged.get(model, 0.0) + cents / 100.0
+    if partial:
+        warnings.append("Some Cursor cloud usage events carried no token counts or charge; "
+                        "totals for those calls are incomplete.")
+    if any(e.get("kind") == "Credit" for e in events):
+        warnings.append("Some Cursor cloud usage was paid from a credit grant "
+                        "(chargedCents 0); cost shows what was billed, not list price.")
+    if not events:
+        warnings.append("No usage events recorded for this cloud agent yet "
+                        "(the Admin API aggregates hourly; sync again later).")
+    return {"segments": segments, "warnings": warnings,
+            "measurement": "partial" if partial else "exact", "meta": meta}
+
+
+class CursorCloudAdapter(RuntimeAdapter):
+    """Cursor Cloud Agent runs, from ledgers synced off the Cursor Admin API."""
+
+    name = "cursor-cloud"
+
+    def iter_sessions(self, project_dir=None, warnings=None):
+        _cursor_cloud_maybe_autosync(warnings)
+        root = cursor_cloud_dir()
+        if not root.is_dir():
+            return
+        yield from sorted(root.glob("bc-*.jsonl"))
+
+    def locate(self, arg=None, session_id=None, project_dir=None):
+        wanted = (str(session_id).strip() if session_id else
+                  str(arg).strip() if arg else None)
+        if wanted:
+            path = Path(wanted).expanduser()
+            if path.suffix == ".jsonl" and path.is_file():
+                return path
+            match = _CURSOR_CLOUD_ID_RE.search(wanted)
+            if not match:
+                return None
+            path = _cursor_cloud_ledger(match.group(0))
+            if not path.is_file() and os.environ.get(CURSOR_CLOUD_KEY_ENV):
+                try:
+                    sync_cursor_cloud(agent_id=match.group(0))
+                except (RuntimeError, OSError, ValueError) as exc:
+                    warn(f"Cursor cloud usage sync failed: {exc}")
+            return path if path.is_file() else None
+        paths = list(self.iter_sessions())
+        return max(paths, key=lambda p: p.stat().st_mtime_ns) if paths else None
+
+    def parse(self, source):
+        return parse_cursor_cloud_ledger(source)
+
+    def session_id(self, source):
+        return Path(source).stem
+
+    def project(self, source):
+        meta, _ = _cursor_cloud_read_ledger(Path(source))
+        repo = (meta or {}).get("repository")
+        if isinstance(repo, str) and repo:
+            return re.sub(r"^(https?://)?(www\.)?github\.com/", "", repo).rstrip("/")
+        return "cursor-cloud"
+
+    def describe(self, source):
+        return Path(source).name
+
+
+def check_cursor_cloud_root(warnings=None):
+    root = cursor_cloud_dir()
+    if root.is_dir() and any(root.glob("bc-*.jsonl")):
+        return None
+    hint = ("" if os.environ.get(CURSOR_CLOUD_KEY_ENV) else
+            f"; set {CURSOR_CLOUD_KEY_ENV} (Cursor Team Admin API key) and run "
+            "`token_usage.py cursor-cloud-sync`")
+    warn(f"no Cursor cloud agent ledgers under {root}{hint}", warnings)
+    return str(root)
+
+
 def check_adapter_root(adapter, warnings=None):
     if adapter.name == "cursor":
         return check_cursor_root(warnings)
     if adapter.name == "codex":
         return check_codex_root(warnings)
+    if adapter.name == "cursor-cloud":
+        return check_cursor_cloud_root(warnings)
     if adapter.name == "gemini":
         home = gemini_home()
         if (home / "tmp").is_dir() or any(p.is_dir() for p in home.glob("antigravity*/brain")):
@@ -4493,7 +4898,12 @@ _RUNTIME_ADAPTERS = {
     "codex": CodexAdapter(),
     "gemini": GeminiAdapter(),
     "copilot": CopilotAdapter(),
+    "cursor-cloud": CursorCloudAdapter(),
 }
+
+# Runtimes `auto` never picks: cursor-cloud reads a remote billing API, so it
+# must be asked for by name rather than chosen (and synced) implicitly.
+_AUTO_SKIP = ("claude", "cursor", "cursor-cloud")
 
 
 def get_runtime_adapter(name):
@@ -4580,14 +4990,16 @@ def _adapter_source_stat(adapter, source):
 
 
 def _segments_by_day(segments, pricing, measurement):
-    by_day = {}
+    by_day, charged_by_day = {}, {}
     for seg in segments:
         day = _local_day(seg.get("start_ts"))
         models = seg["by_model"]
         merge_by_model(by_day.setdefault(day, {}), models)
+        charged_by_day[day] = merge_charged(charged_by_day.get(day, {}),
+                                            seg.get("charged_by_model"))
     out = {}
     for day, models in by_day.items():
-        cost = cost_usd(models, pricing)
+        cost = billed_cost(models, pricing, charged_by_day.get(day))
         if measurement == "activity_only":
             cost = None
         out[day] = {"usage": sum_buckets(models), "cost_usd": cost}
@@ -4623,9 +5035,12 @@ def summarize_adapter_source(adapter, source, pricing, warnings=None):
         "first_ts": next((s["start_ts"] for s in segments if s.get("start_ts")), None),
         "by_label": {label: {"usage": agg["usage"], "cost_usd": agg["cost_usd"],
                              "invocations": agg["invocations"],
-                             "unpriced": bool(unpriced_models(agg["by_model"], pricing))}
+                             "unpriced": bool(unpriced_models(
+                                 agg["by_model"], pricing, agg.get("charged_by_model")))}
                      for label, agg in data["by_label"].items()},
         "by_model": data["total"]["by_model"],
+        **({"charged_by_model": data["total"]["charged_by_model"]}
+           if "charged_by_model" in data["total"] else {}),
         "total": {"usage": data["total"]["usage"],
                   "cost_usd": data["total"]["cost_usd"]},
         "by_day": _segments_by_day(segments, pricing, measurement),
@@ -4773,7 +5188,7 @@ def resolve_runtime(name, transcript_arg=None, project_dir=None, warnings=None):
             claude = locate_transcript(transcript_arg, project_dir=project_dir)
             cursor = locate_cursor()
         native = ([a for a in _RUNTIME_ADAPTERS.values()
-                   if a.name not in ("claude", "cursor") and a.locate(project_dir=project_dir)]
+                   if a.name not in _AUTO_SKIP and a.locate(project_dir=project_dir)]
                   if not transcript_arg else [])
         if native and len(native) + bool(claude) + bool(cursor) > 1:
             sys.exit("token-usage: --runtime auto is ambiguous; pass an explicit --runtime")
@@ -4798,7 +5213,7 @@ def resolve_runtime_corpus(name, project_dir=None, warnings=None):
     has_claude = _corpus_has_claude_sessions()
     has_cursor = _corpus_has_cursor_sessions(project_dir=project_dir,
                                              warnings=warnings)
-    native = [a for a in _RUNTIME_ADAPTERS.values() if a.name not in ("claude", "cursor")
+    native = [a for a in _RUNTIME_ADAPTERS.values() if a.name not in _AUTO_SKIP
               and next(a.iter_sessions(project_dir), None) is not None]
     if native and len(native) + has_claude + has_cursor > 1:
         sys.exit("token-usage: --runtime auto is ambiguous; pass an explicit --runtime")
@@ -5142,6 +5557,11 @@ def main():
     sub.add_parser("hook")
     sub.add_parser("cursor-hook")
     sub.add_parser("codex-hook")
+    ccs = sub.add_parser("cursor-cloud-sync",
+                         help="pull Cursor Cloud Agent usage from the Admin API")
+    ccs.add_argument("--since", default=None)
+    ccs.add_argument("--agent", default=None)
+    ccs.add_argument("--json", action="store_true", dest="as_json")
     h = sub.add_parser("history")
     h.add_argument("--by", choices=("project", "day", "command", "model"), default="project")
     h.add_argument("--since", default=None)
@@ -5192,6 +5612,21 @@ def main():
         sys.exit(run_hook(runtime="codex"))
     if args.cmd == "cursor-hook":
         sys.exit(run_cursor_hook())
+    if args.cmd == "cursor-cloud-sync":
+        warnings = []
+        try:
+            result = sync_cursor_cloud(since=args.since, agent_id=args.agent,
+                                       warnings=warnings)
+        except (RuntimeError, OSError, ValueError) as exc:
+            sys.exit(f"token-usage: {exc}")
+        result["warnings"] = warnings
+        if args.as_json:
+            print(json.dumps(result, indent=1))
+        else:
+            print(f"Synced {result['events']} Cursor cloud usage event(s) for "
+                  f"{len(result['agents'])} agent(s) into {cursor_cloud_dir()} "
+                  f"({result['window'][0]} to {result['window'][1]}).")
+        return
     if args.cmd == "history":
         if args.as_json and args.as_csv:
             sys.exit("token-usage: --json and --csv cannot be combined")

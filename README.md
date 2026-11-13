@@ -21,7 +21,7 @@ It runs locally, calls no model, and sends nothing off the machine. Figures are 
 | VS Code agent plugins | the Claude-format and Copilot packages via a marketplace | VS Code Copilot Chat's own usage |
 | Any MCP client | stdio `scripts/mcp_server.py` | Hosts with no runtime adapter |
 
-📖 **Documentation:** this README and [`docs/`](docs/README.md). Per-flag detail is in the [CLI and MCP reference](docs/reference.md). Also: [use cases](docs/use-cases.md), [architecture](docs/architecture.md), [marketplaces](docs/marketplaces.md), and the [Codex](docs/codex-adapter.md), [Cursor](docs/cursor-adapter.md) and [Gemini/Copilot](docs/gemini-copilot.md) notes.
+📖 **Documentation:** this README and [`docs/`](docs/README.md). Per-flag detail is in the [CLI and MCP reference](docs/reference.md). Also: [use cases](docs/use-cases.md), [architecture](docs/architecture.md), [marketplaces](docs/marketplaces.md), and the [Codex](docs/codex-adapter.md), [Cursor](docs/cursor-adapter.md) (including [Cursor Cloud Agents](docs/cursor-adapter.md#cursor-cloud-agents-runtime-cursor-cloud)) and [Gemini/Copilot](docs/gemini-copilot.md) notes.
 
 ```
 | Activity                      | Calls | Output | Input | Cache read | Cache write | Est. cost |
@@ -70,7 +70,7 @@ token-usage reads usage the agent host has already recorded on this machine and 
 | Grok Build | Loads the Claude-format package | MCP tools and the report skill analyse the runtimes above. Grok's own sessions are not attributed. The `Stop` hook exits 0 and writes nothing when the payload has no `transcript_path`. |
 | VS Code agent plugins / any MCP client | The bundled stdio MCP server | The five reporting tools for the `runtime` you name. No hooks. |
 
-All five native runtimes (`claude`, `codex`, `cursor`, `gemini`, `copilot`) support report, history, insights, comparison, live, dashboard and export. Unknown prices stay unknown. `auto` picks one runtime when the choice is unambiguous and never mixes hosts in one call.
+All five native runtimes (`claude`, `codex`, `cursor`, `gemini`, `copilot`) support report, history, insights, comparison, live, dashboard and export. A sixth, opt-in runtime, `cursor-cloud`, attributes tokens and Cursor-charged cost to each Cursor Cloud Agent run (`bc-…`) from the Cursor Admin API; see [Cursor Cloud Agents](#cursor-cloud-agents-cursor-cloud). Unknown prices stay unknown. `auto` picks one runtime when the choice is unambiguous and never mixes hosts in one call.
 
 ## Features
 
@@ -97,7 +97,7 @@ Per-flag detail is in the [reference](docs/reference.md).
 
 token-usage's analyser runs on your machine. It uses only the Python standard library. Reports, history, insights, the dashboard, live view, export and the stdio MCP server make **no network calls**: there is no update check and no third-party analytics service. Reports returned through MCP enter the host conversation and follow that host's data policy. Copilot also runs a small JavaScript collector using its bundled SDK and Node standard library.
 
-The optional [activity stream bridge](#activity-stream-bridge-opt-in) is the one exception. It stays off until `WIZZO_COORD_URL`, `WIZZO_TWIN_API_URL`, or `~/.config/wizzo/activity-bridge.env` names a destination. When it is on, it sends turn text (the prompt, a tool-call summary, and the assistant response) to those operator endpoints. Set `WIZZO_ACTIVITY_BRIDGE=0` to force it off. The analyser never opens a connection on its own.
+The optional [activity stream bridge](#activity-stream-bridge-opt-in) is the one exception. It stays off until `WIZZO_COORD_URL`, `WIZZO_TWIN_API_URL`, or `~/.config/wizzo/activity-bridge.env` names a destination. When it is on, it sends turn text (the prompt, a tool-call summary, and the assistant response) to those operator endpoints. Set `WIZZO_ACTIVITY_BRIDGE=0` to force it off. The opt-in `cursor-cloud` runtime is the other exception. It calls the Cursor Admin API (`api.cursor.com`) only when you ask for `--runtime cursor-cloud` (or run `cursor-cloud-sync`) **and** `CURSOR_ADMIN_API_KEY` is set. It reads the key from the environment, never stores it, and writes usage rows without user emails. Otherwise the analyser never opens a connection on its own.
 
 **What it reads** (read-only, and only for the runtime you ask about):
 
@@ -109,15 +109,17 @@ The optional [activity stream bridge](#activity-stream-bridge-opt-in) is the one
 | Codex | rollout JSONL under `$CODEX_HOME/sessions` and `archived_sessions` (default `~/.codex`) | `TOKEN_USAGE_CODEX_HOME` |
 | Google Antigravity / Gemini CLI | `~/.gemini/antigravity*/brain/*/.system_generated/logs/transcript.jsonl` and `~/.gemini/tmp/*/chats/` JSON/JSONL recordings (or `$GEMINI_CLI_HOME/.gemini`) | `TOKEN_USAGE_GEMINI_HOME` |
 | Copilot CLI | `~/.copilot/session-state/*/events.jsonl` and `~/.copilot/token-usage/*.jsonl` | `TOKEN_USAGE_COPILOT_HOME`, else `COPILOT_HOME` |
+| Cursor Cloud Agents (`cursor-cloud`) | per-agent ledgers `~/.cache/token-usage/cursor-cloud/bc-*.jsonl`, refreshed from `POST /teams/filtered-usage-events` when `CURSOR_ADMIN_API_KEY` is set | `TOKEN_USAGE_CURSOR_CLOUD_DIR` |
 | All | the bundled `data/pricing.json` and your optional overlay `~/.config/token-usage/pricing.json` (honours `XDG_CONFIG_HOME`) | — |
 
-Transcripts contain your prompts and code. token-usage reads them only to count tokens and label activities. It reads no credentials or auth files. It does not call Cursor, Codex, Gemini, Copilot or Claude cloud APIs. The activity bridge, when configured, also reads the JSONL file a hook payload names and the directories passed to `sync`. It asks git for the origin slug and the current branch. It does not read git credentials or vendor auth files.
+Transcripts contain your prompts and code. token-usage reads them only to count tokens and label activities. It reads no credentials or auth files. It does not call Cursor, Codex, Gemini, Copilot or Claude cloud APIs, except the opt-in `cursor-cloud` runtime described above, which uses only the key you put in `CURSOR_ADMIN_API_KEY`. The activity bridge, when configured, also reads the JSONL file a hook payload names and the directories passed to `sync`. It asks git for the origin slug and the current branch. It does not read git credentials or vendor auth files.
 
 **What it writes.** Summary caches and hook ledgers go under `~/.cache/token-usage/` (override with `TOKEN_USAGE_LEDGER_DIR`):
 
 - `<session-id>.json` (Claude Code), `codex-<session-id>.json` (Codex) and `gemini-<session-id>.json` (Antigravity `Stop`): the session aggregate the hook keeps current. It holds token counts, cost estimates, activity labels, the transcript path, segment timestamps, and **the first 120 characters of the prompt that opened each segment**.
 - `latest.json`: a best-effort symlink to the most recently written Claude Code session aggregate (the statusline fallback). Codex and Gemini ledgers never repoint it.
 - `index/`: the summary cache used by `history`, `insights`, `top_consumers`, `dashboard` and `export`. It holds transcript paths, project names, activity labels and token/cost totals. Claude Code and Cursor reuse an entry when the recording's mtime, size and pricing fingerprint still match. Codex, Antigravity, Gemini CLI and Copilot rewrite the entry on every scan and do not reuse it.
+- `cursor-cloud/<bc-id>.jsonl` (opt-in `cursor-cloud` runtime): one line per billed model call of a Cloud Agent run: timestamp, agent/conversation/automation ids, model, billing kind, token counts and `chargedCents`, plus an optional header with the agent's name and repository. No user emails, prompts or keys. `cursor-cloud/.sync-state.json` holds the last sync time.
 - `cursor/<hash>.jsonl`: the append-only Cursor hook ledger. It holds the conversation id, UTC timestamps, workspace roots, the hook's raw token fields, and **the first 120 characters of each prompt and subagent task**. The directory is created owner-only (`0700`) where the filesystem supports it.
 
 Copilot additionally writes `~/.copilot/token-usage/<session-id>.jsonl` under `COPILOT_HOME`: event IDs, timestamps, counters, command/skill labels, agent IDs and a session/project header. It stores no prompts or tool output. See the [collector and retention details](docs/gemini-copilot.md#github-copilot-cli).
@@ -229,6 +231,26 @@ If the VM has the plugin installed, or the repository under analysis contains a 
 
 Ask the agent, once the MCP server is on that VM, to call `session_cost` with `runtime: "cursor"` and to include `measurement` and `warnings` in the write-up. Activity-only output is a count of turns, not a token bill.
 
+### Cursor Cloud Agents (`cursor-cloud`)
+
+Cloud Agent runs (`bc-…` ids) leave nothing in the local Cursor database and their transcripts carry no token counts, so the `cursor` runtime cannot cost them. Cursor's Admin API can: [`POST /teams/filtered-usage-events`](https://cursor.com/docs/account/teams/admin-api) returns one row per billed model call with `cloudAgentId`, `conversationId`, `model`, `tokenUsage` (`inputTokens`, `outputTokens`, `cacheReadTokens`, `cacheWriteTokens`, `totalCents`) and `chargedCents`.
+
+```bash
+export CURSOR_ADMIN_API_KEY=…            # Team Admin API key (read scope); Cursor dashboard > Settings > API keys
+export CURSOR_API_KEY=…                  # optional user key: adds each agent's name and repository
+python3 scripts/token_usage.py cursor-cloud-sync --since 7d
+python3 scripts/token_usage.py top_consumers --runtime cursor-cloud --since 7d
+python3 scripts/token_usage.py report --runtime cursor-cloud bc-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+python3 scripts/token_usage.py history --runtime cursor-cloud --by model
+```
+
+- One session per agent run, one activity segment per conversation. The project is the agent's repository when `CURSOR_API_KEY` is set, else `cursor-cloud`.
+- Cost is Cursor's own `chargedCents` (model cost plus any Cursor Token Rate), not a pricing-table estimate, so it reconciles with the team usage dashboard. Usage paid from a credit grant shows `0`.
+- `measurement` is `exact` when every call carried token counts and `partial` when some were request-billed without tokens.
+- With the key set, scans refresh the ledgers at most every 15 minutes (`TOKEN_USAGE_CURSOR_CLOUD_SYNC_INTERVAL`); set `TOKEN_USAGE_CURSOR_CLOUD_AUTOSYNC=0` to read cached ledgers only. Without a key the runtime is read-only over existing ledgers and makes no network call.
+- Cursor aggregates usage events hourly, so a run's latest calls can take up to an hour to appear. Each sync re-reads a three-hour overlap and replaces it, so nothing is counted twice.
+- `auto` never selects `cursor-cloud`; ask for it by name.
+
 ### Codex
 
 ```bash
@@ -298,7 +320,7 @@ The server is a stdlib stdio process, so any MCP client can launch it:
 }
 ```
 
-Set `TOKEN_USAGE_RUNTIME` to the runtime you want by default (`claude`, `codex`, `cursor`, `gemini`, `copilot` or `auto`), or pass `runtime` per call.
+Set `TOKEN_USAGE_RUNTIME` to the runtime you want by default (`claude`, `codex`, `cursor`, `gemini`, `copilot`, `cursor-cloud` or `auto`), or pass `runtime` per call.
 
 ## Troubleshooting
 
@@ -347,7 +369,7 @@ python3 scripts/token_usage.py live --runtime cursor --interval 2
 python3 scripts/token_usage.py export --scope history --since 30d --output usage.jsonl
 ```
 
-`--runtime` accepts `claude` (the default, or whatever `TOKEN_USAGE_RUNTIME` names), `cursor`, `codex`, `gemini`, `copilot`, or `auto`.
+`--runtime` accepts `claude` (the default, or whatever `TOKEN_USAGE_RUNTIME` names), `cursor`, `codex`, `gemini`, `copilot`, `cursor-cloud`, or `auto`.
 
 With no argument on the Claude runtime, `report` and `json` pick the most recent session for the current directory's project; failing that, the Cowork sandbox mount; failing that, the newest transcript under any project on the machine. Pass an explicit path when the session matters. Other runtimes use their own discovery and do not fall through into Claude transcripts.
 
@@ -383,7 +405,7 @@ When a host plugin is enabled it starts `scripts/mcp_server.py`. Tool name prefi
 | `diff` | Per-activity cost and output deltas between two sessions. |
 | `top_consumers` | Costliest sessions or command labels in a window. |
 
-Every tool takes `runtime` (`claude`, `cursor`, `codex`, `gemini`, `copilot` or `auto`). The default is the server's `TOKEN_USAGE_RUNTIME`, which each host manifest sets to itself, or `claude` when unset. Every tool takes `format`: `json` (default) or `markdown`. Failures come back as tool results with `isError`. An unknown method, or `arguments` that is present but not an object, is a JSON-RPC error (`-32602`).
+Every tool takes `runtime` (`claude`, `cursor`, `codex`, `gemini`, `copilot`, `cursor-cloud` or `auto`). The default is the server's `TOKEN_USAGE_RUNTIME`, which each host manifest sets to itself, or `claude` when unset. Every tool takes `format`: `json` (default) or `markdown`. Failures come back as tool results with `isError`. An unknown method, or `arguments` that is present but not an object, is a JSON-RPC error (`-32602`).
 
 **"Current session"** resolves in this order: explicit `transcript` path → `session_id` → `TOKEN_USAGE_TRANSCRIPT` → auto-discovery.
 
@@ -436,6 +458,11 @@ Settings are the environment variables below, plus the optional pricing overlay.
 | `TOKEN_USAGE_CODEX_HOME` | unset | Codex home holding `sessions/` and `archived_sessions/`. When unset, `CODEX_HOME` is used. |
 | `CODEX_HOME` | `~/.codex` | Codex home. Used only when `TOKEN_USAGE_CODEX_HOME` is unset. Codex sets this. |
 | `CODEX_THREAD_ID` | set by Codex | Current Codex thread, used for current-session discovery. |
+| `CURSOR_ADMIN_API_KEY` | unset | `cursor-cloud` only: Cursor Team Admin API key (read scope) used to sync Cloud Agent usage. Read at runtime, never written to disk. Unset means no network calls. |
+| `CURSOR_API_KEY` | unset | `cursor-cloud` only, optional: Cursor user API key used to add each Cloud Agent's name and repository to its ledger. |
+| `TOKEN_USAGE_CURSOR_CLOUD_DIR` | `$TOKEN_USAGE_LEDGER_DIR/cursor-cloud` | Where `cursor-cloud` keeps its per-agent ledgers and sync state. |
+| `TOKEN_USAGE_CURSOR_CLOUD_AUTOSYNC` | `1` | Set to `0` so `cursor-cloud` scans read cached ledgers only, even with a key set. |
+| `TOKEN_USAGE_CURSOR_CLOUD_SYNC_INTERVAL` | `900` | Seconds between automatic `cursor-cloud` syncs. |
 | `XDG_CONFIG_HOME` | `~/.config` | Parent of the user pricing overlay `token-usage/pricing.json` and of `wizzo/activity-bridge.env`. |
 | `XDG_CACHE_HOME` | `~/.cache` | Used only when `WIZZO_ACTIVITY_STATE_DIR` and `TOKEN_USAGE_LEDGER_DIR` are both unset, as the parent of `token-usage/activity-bridge/`. |
 
@@ -573,7 +600,7 @@ Costs are **API-price estimates** from `data/pricing.json` (rates as of Septembe
 
 **Can (when data exists):** per-activity breakdowns from hook ledgers, read-only Desktop SQLite, or an explicit Cloud Agent export; cross-session history, insights and top consumers with `measurement` and `warnings`; API-price estimates.
 
-**Cannot:** Cursor plan credits or invoice totals; guaranteed per-bubble `tokenCount` in SQLite; exact usage from before hooks were enabled; marginal token cost of individual `@` attachments; token totals the Cloud export did not contain.
+**Cannot (with the `cursor` runtime):** Cursor plan credits or invoice totals (use `cursor-cloud` for Cloud Agent runs, which reads Cursor's charged cents); guaranteed per-bubble `tokenCount` in SQLite; exact usage from before hooks were enabled; marginal token cost of individual `@` attachments; token totals the Cloud export did not contain.
 
 Details: [docs/cursor-adapter.md](docs/cursor-adapter.md).
 

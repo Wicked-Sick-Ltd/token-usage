@@ -6,6 +6,10 @@ token-usage is a local AI agent plugin. It reads usage the assistant has already
 recorded on the developer machine and writes derived ledgers under a cache
 directory. The analyser makes **no network calls**, bundles **no credentials**,
 and does not call Claude, Cursor, Codex, Gemini, Copilot or any other vendor API.
+The one opt-in exception is the `cursor-cloud` runtime, which calls the Cursor
+Admin API with the key in `CURSOR_ADMIN_API_KEY` only when that variable is set
+and the runtime is requested by name; the key is read from the environment and
+never stored.
 Reports returned by MCP become part of the host conversation and follow that
 host's data policy.
 

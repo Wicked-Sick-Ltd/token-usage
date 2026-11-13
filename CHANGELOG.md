@@ -8,6 +8,13 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **`cursor-cloud` runtime for Cursor Cloud Agents** — attributes tokens and
+  Cursor-charged cost to each Cloud Agent run (`bc-…`). `cursor-cloud-sync`
+  pulls `POST /teams/filtered-usage-events` (Cursor Admin API, key from
+  `CURSOR_ADMIN_API_KEY`) into per-agent ledgers without user emails; every
+  report, history, top-consumers, insights, dashboard, export and MCP tool then
+  reads them with `runtime: "cursor-cloud"`. Cost uses Cursor's `chargedCents`
+  instead of the pricing table. Opt-in: no key, no network; `auto` never picks it.
 - **Opt-in llm1 activity stream bridge** — `scripts/activity_bridge.py` and
   `bin/token-usage-activity-sync`. Cursor (`beforeSubmitPrompt`, `stop`,
   `subagentStop`), Claude Code and Codex hooks forward a turn when
