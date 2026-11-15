@@ -575,6 +575,8 @@ def _resolve_agent_ts(path, ts=None, meta=None):
                             return datetime.fromtimestamp(v, tz=timezone.utc).isoformat()
                         return str(v)
         except (ValueError, OSError, RecursionError):
+            # Malformed, unreadable, or too-deep meta is optional.
+            # Fall through to journal.jsonl.
             pass
     journal_path = path.parent / "journal.jsonl"
     if journal_path.is_file():
