@@ -3233,3 +3233,282 @@ def test_sync_without_counters_preserves_hooked_totals(tmp_path):
     assert summaries
     assert all(body["input_tokens"] == 80 and body["output_tokens"] == 8 for body in summaries)
     assert summaries[-1]["turns"] == 1
+
+
+def _nested_json(depth, opener="{", closer="}", fill='"a":'):
+    """A JSON value nested `depth` times. The caller supplies the brackets."""
+    return (opener + fill) * depth + "1" + closer * depth
+
+
+def _json_recursion_depth():
+    """Smallest doubled depth at which stdlib json.loads raises RecursionError.
+
+    CPython's scanner enters a recursive call per object or array. On 3.12 that
+    limit sits near ten times sys.getrecursionlimit(), so a few hundred levels
+    still parse. The returned depth is one the line parser's ValueError handler
+    does not cover.
+    """
+    cached = getattr(_json_recursion_depth, "value", None)
+    if cached is not None:
+        return cached
+    depth = 128
+    while depth < 200000:
+        try:
+            json.loads(_nested_json(depth))
+        except RecursionError:
+            _json_recursion_depth.value = depth
+            return depth
+        depth *= 2
+    raise AssertionError("json.loads did not raise RecursionError")
+
+
+def _ingest_text(poster):
+    return "\n".join(
+        call["body"].get("content") or ""
+        for call in poster.calls
+        if call["url"].endswith("/v1/ingest")
+    )
+
+
+def _bracketed_turn(path, marker, bad_record):
+    """A finished turn, then one bad assistant record, then another finished turn."""
+    write_jsonl(path, [
+        {"role": "user", "content": f"prompt-{marker}"},
+        {"role": "assistant", "content": f"kept-{marker}"},
+        bad_record,
+        {"role": "user", "content": f"next-{marker}"},
+        {"role": "assistant", "content": f"after-{marker}"},
+    ])
+    return path
+
+
+def test_nested_tool_argument_does_not_abort_later_transcripts(tmp_path):
+    """One deeply nested tool-argument string must not stop the sync walk.
+
+    The outer JSONL line stays shallow. The tool-call normalizer parses the
+    argument string again. RecursionError from that parse has to be handled
+    like a bad line: turns after it in the same file, and files after it, are
+    still delivered. Each file exercises a call site that re-parses a string.
+    """
+    nested = _nested_json(_json_recursion_depth())
+    array = _nested_json(_json_recursion_depth(), opener="[", closer="]", fill="")
+    root = tmp_path / "transcripts"
+    write_jsonl(root / "a-first.jsonl", [
+        {"role": "user", "content": "prompt-first"},
+        {"role": "assistant", "content": "kept-first"},
+    ])
+    _bracketed_turn(root / "b-tool-use.jsonl", "tool-use", {
+        "role": "assistant",
+        "content": [{
+            "type": "tool_use",
+            "id": "tool-use-1",
+            "name": "Read",
+            "input": nested,
+        }],
+    })
+    _bracketed_turn(root / "c-arguments.jsonl", "arguments", {
+        "role": "assistant",
+        "content": [{
+            "type": "tool_use",
+            "id": "arguments-1",
+            "name": "Read",
+            "arguments": nested,
+        }],
+    })
+    _bracketed_turn(root / "d-tool-calls.jsonl", "tool-calls", {
+        "role": "assistant",
+        "tool_calls": [{
+            "id": "calls-1",
+            "type": "function",
+            "function": {"name": "shell", "arguments": nested},
+        }],
+    })
+    _bracketed_turn(root / "e-array.jsonl", "array", {
+        "role": "assistant",
+        "content": [{
+            "type": "tool_use",
+            "id": "array-1",
+            "name": "Read",
+            "input": array,
+        }],
+    })
+    write_jsonl(root / "f-codex.jsonl", [
+        _codex_event("response_item", {"type": "message", "role": "user", "content": [
+            {"type": "input_text", "text": "prompt-codex"},
+        ]}),
+        _codex_event("response_item", {"type": "message", "role": "assistant", "content": [
+            {"type": "output_text", "text": "kept-codex"},
+        ]}, 1),
+        _codex_event("response_item", {
+            "type": "function_call",
+            "name": "shell",
+            "call_id": "call-nested",
+            "arguments": nested,
+        }, 2),
+        _codex_event("response_item", {"type": "message", "role": "user", "content": [
+            {"type": "input_text", "text": "next-codex"},
+        ]}, 3),
+        _codex_event("response_item", {"type": "message", "role": "assistant", "content": [
+            {"type": "output_text", "text": "after-codex"},
+        ]}, 4),
+    ])
+    # The line itself is deeper than json.loads will accept. The per-line
+    # handler only catches ValueError, so this has to be skipped like any
+    # other bad line and the records under it still sync.
+    deep = root / "g-deep-line.jsonl"
+    deep.parent.mkdir(parents=True, exist_ok=True)
+    deep.write_text(
+        _nested_json(_json_recursion_depth()) + "\n"
+        + json.dumps({"role": "user", "content": "prompt-deep-line"}) + "\n"
+        + json.dumps({"role": "assistant", "content": "after-deep-line"}) + "\n",
+        encoding="utf-8",
+    )
+    write_jsonl(root / "h-later.jsonl", [
+        {"role": "user", "content": "prompt-later"},
+        {"role": "assistant", "content": "kept-later"},
+    ])
+    poster = FakePoster()
+    bridge.sync_tree(root, cfg(tmp_path), poster=poster, vendor="cursor")
+    text = _ingest_text(poster)
+    for marker in (
+        "kept-first",
+        "kept-tool-use",
+        "after-tool-use",
+        "kept-arguments",
+        "after-arguments",
+        "kept-tool-calls",
+        "after-tool-calls",
+        "kept-array",
+        "after-array",
+        "kept-codex",
+        "after-codex",
+        "after-deep-line",
+        "kept-later",
+    ):
+        assert marker in text, marker
+
+
+def test_hook_transcript_nested_tool_argument_still_publishes(tmp_path):
+    nested = _nested_json(_json_recursion_depth())
+    path = write_jsonl(tmp_path / "hook-sess.jsonl", [
+        {"role": "user", "content": "prompt-hook-file"},
+        {"role": "assistant", "content": [{
+            "type": "tool_use",
+            "id": "hook-tool",
+            "name": "Read",
+            "input": nested,
+        }]},
+        {"role": "user", "content": "next-hook-file"},
+        {"role": "assistant", "content": "after-hook-file"},
+    ])
+    poster = FakePoster()
+    bridge.process_hook({
+        "hook_event_name": "stop",
+        "conversation_id": "hook-sess",
+        "generation_id": "g-file",
+        "transcript_path": str(path),
+        "model": "m",
+        "output": "payload-output-is-not-the-transcript",
+    }, cfg(tmp_path), poster, runtime="cursor")
+    assert "after-hook-file" in _ingest_text(poster)
+
+
+def test_hook_payload_nested_tool_argument_still_publishes(tmp_path):
+    nested = _nested_json(_json_recursion_depth())
+    array = _nested_json(_json_recursion_depth(), opener="[", closer="]", fill="")
+    poster = FakePoster()
+    bridge.process_hook({
+        "hook_event_name": "stop",
+        "conversation_id": "hook-payload",
+        "generation_id": "g-payload",
+        "prompt": "prompt-hook-payload",
+        "output": "after-hook-payload",
+        "model": "m",
+        "tool_calls": [
+            {"name": "shell", "arguments": nested},
+            {"name": "Read", "input": array},
+        ],
+    }, cfg(tmp_path), poster, runtime="cursor")
+    assert "after-hook-payload" in _ingest_text(poster)
+
+
+def test_sync_cli_continues_after_nested_tool_argument(tmp_path):
+    """The sync command walks every directory. One bad file must not exit it."""
+    nested = _nested_json(_json_recursion_depth())
+    first = tmp_path / "dir-a"
+    second = tmp_path / "dir-b"
+    write_jsonl(first / "a-nested.jsonl", [
+        {"role": "user", "content": "prompt-cli"},
+        {"role": "assistant", "content": "kept-cli"},
+        {"role": "assistant", "content": [{
+            "type": "tool_use",
+            "id": "cli-tool",
+            "name": "Read",
+            "input": nested,
+        }]},
+        {"role": "user", "content": "next-cli"},
+        {"role": "assistant", "content": "after-cli"},
+    ])
+    write_jsonl(first / "b-same-dir.jsonl", [
+        {"role": "user", "content": "prompt-same-dir"},
+        {"role": "assistant", "content": "kept-same-dir"},
+    ])
+    write_jsonl(second / "c-next-dir.jsonl", [
+        {"role": "user", "content": "prompt-next-dir"},
+        {"role": "assistant", "content": "kept-next-dir"},
+    ])
+    seen = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            raw = self.rfile.read(length)
+            seen.append((self.path, json.loads(raw.decode("utf-8"))))
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, fmt, *args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    env = os.environ.copy()
+    for name in list(env):
+        if name.startswith("WIZZO_") or name == "TOKEN_USAGE_LEDGER_DIR":
+            env.pop(name)
+    env.update({
+        "WIZZO_COORD_URL": f"http://127.0.0.1:{port}",
+        "WIZZO_TWIN_API_URL": f"http://127.0.0.1:{port}",
+        "WIZZO_ACTIVITY_STATE_DIR": str(tmp_path / "state"),
+        "WIZZO_REPO": "Wicked-Sick-Ltd/token-usage",
+        "WIZZO_BRANCH": "main",
+        "WIZZO_ACTIVITY_HTTP_TIMEOUT": "2",
+        "XDG_CONFIG_HOME": str(tmp_path / "xdg"),
+        "XDG_CACHE_HOME": str(tmp_path / "cache"),
+    })
+    try:
+        result = subprocess.run(
+            [
+                sys.executable, str(BRIDGE_PATH), "sync",
+                "--sync-dir", str(first),
+                "--sync-dir", str(second),
+                "--vendor", "cursor",
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
+            check=False,
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert result.returncode == 0, result.stderr
+    bodies = "\n".join(
+        body.get("content") or ""
+        for path, body in seen
+        if path == "/v1/ingest"
+    )
+    for marker in ("kept-cli", "after-cli", "kept-same-dir", "kept-next-dir"):
+        assert marker in bodies, marker
