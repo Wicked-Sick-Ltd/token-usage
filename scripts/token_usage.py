@@ -2518,6 +2518,15 @@ def project_slug(path_str):
     return re.sub(r"[^A-Za-z0-9]", "-", path_str)
 
 
+def _meta_text(value):
+    """A session-metadata field as a non-empty string, else None.
+
+    Names, paths and ids read from runtime session files become grouping
+    keys, sort keys and substring-filter targets. A list, object or number
+    there would raise in the middle of a corpus scan and abort it."""
+    return value if isinstance(value, str) and value else None
+
+
 def _newest(paths):
     paths = list(paths)
     return max(paths, key=lambda p: p.stat().st_mtime) if paths else None
@@ -3686,11 +3695,11 @@ class CodexAdapter(RuntimeAdapter):
                 except (OSError, ValueError) as exc:
                     warn(f"skipping unreadable Codex rollout {path}: {exc}", warnings)
                     continue
-                sid = meta.get("id") or meta.get("session_id")
+                sid = _meta_text(meta.get("id")) or _meta_text(meta.get("session_id"))
                 if not sid or sid in seen:
                     continue
-                if target is not None and (
-                        not meta.get("cwd") or Path(meta["cwd"]).resolve() != target):
+                cwd = _meta_text(meta.get("cwd"))
+                if target is not None and (not cwd or Path(cwd).resolve() != target):
                     continue
                 seen.add(sid)
                 yield path
@@ -3719,10 +3728,10 @@ class CodexAdapter(RuntimeAdapter):
 
     def session_id(self, source):
         meta = codex_metadata(source)
-        return meta.get("id") or meta.get("session_id") or Path(source).stem
+        return _meta_text(meta.get("id")) or _meta_text(meta.get("session_id")) or Path(source).stem
 
     def project(self, source):
-        return project_slug(codex_metadata(source).get("cwd") or "codex:unknown")
+        return project_slug(_meta_text(codex_metadata(source).get("cwd")) or "codex:unknown")
 
     def describe(self, source):
         return str(source)
@@ -3771,8 +3780,8 @@ def codex_parent(meta):
         if isinstance(subagent, dict):
             spawn = subagent.get("thread_spawn")
             if isinstance(spawn, dict):
-                return spawn.get("parent_thread_id")
-    return meta.get("parent_thread_id")
+                return _meta_text(spawn.get("parent_thread_id"))
+    return _meta_text(meta.get("parent_thread_id"))
 
 
 def _codex_flat(usage):
@@ -4081,7 +4090,8 @@ class GeminiAdapter(RuntimeAdapter):
 
     def project(self, source):
         meta = gemini_metadata(source)
-        return meta.get("project") or meta.get("projectHash") or "gemini:unknown"
+        return (_meta_text(meta.get("project")) or _meta_text(meta.get("projectHash"))
+                or "gemini:unknown")
 
     def describe(self, source):
         return str(source)
@@ -4333,6 +4343,11 @@ def copilot_metadata(path):
     return {}
 
 
+def copilot_cwd(meta):
+    context = meta.get("context")
+    return _meta_text(context.get("cwd")) if isinstance(context, dict) else None
+
+
 def is_copilot_transcript(path):
     try:
         return bool(copilot_metadata(path))
@@ -4354,7 +4369,7 @@ class CopilotAdapter(RuntimeAdapter):
                 if not sid or sid in seen:
                     continue
                 seen.add(sid)
-                cwd = (meta.get("context") or {}).get("cwd")
+                cwd = copilot_cwd(meta)
                 if project_dir and (not cwd or Path(cwd).resolve() != Path(project_dir).resolve()):
                     continue
                 yield path
@@ -4377,7 +4392,7 @@ class CopilotAdapter(RuntimeAdapter):
         return copilot_metadata(source).get("sessionId") or Path(source).stem
 
     def project(self, source):
-        return (copilot_metadata(source).get("context") or {}).get("cwd") or "copilot:unknown"
+        return copilot_cwd(copilot_metadata(source)) or "copilot:unknown"
 
     def describe(self, source):
         return str(source)
@@ -5095,6 +5110,10 @@ def summarize_adapter_source(adapter, source, pricing, warnings=None):
     st = _adapter_source_stat(adapter, source)
     path = adapter.describe(source)
     sid = adapter.session_id(source) if hasattr(adapter, "session_id") else path
+    project = adapter.project(source)
+    if not isinstance(project, str):
+        # Corpus scans group, sort and substring-filter on this name.
+        raise UnreadableTranscript("project name is not a string")
     return {
         "version": INDEX_VERSION,
         "path": path,
@@ -5104,7 +5123,7 @@ def summarize_adapter_source(adapter, source, pricing, warnings=None):
         "pricing": pricing_fingerprint(pricing),
         "runtime": adapter.name,
         "measurement": measurement,
-        "project": adapter.project(source),
+        "project": project,
         "first_ts": next((s["start_ts"] for s in segments if s.get("start_ts")), None),
         "by_label": {label: {"usage": agg["usage"], "cost_usd": agg["cost_usd"],
                              "invocations": agg["invocations"],
@@ -5171,7 +5190,7 @@ def iter_adapter_summaries(adapter, pricing, cutoff=None, project=None, exclude=
         saw_any = True
         try:
             s, hit = cached_adapter_summary(adapter, source, pricing, warnings)
-        except (OSError, ValueError, AttributeError) as e:
+        except (OSError, ValueError, AttributeError, TypeError) as e:
             desc = adapter.describe(source)
             warn(f"skipping unreadable {adapter.name} session {desc}: {e}")
             if skipped is not None:
