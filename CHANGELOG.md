@@ -47,6 +47,11 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Deeply nested JSON no longer stops a scan.** The activity bridge parses
+  transcript lines, tool-argument strings and hook stdin with a 256-level
+  nesting limit and treats anything deeper as malformed. `sync` skips a file
+  that still fails and goes on to the next one. The analyser and MCP server
+  skip a line or file too deep for `json` instead of crashing.
 - **Activity bridge usage accounting.** A trailing prompt no longer marks a
   generation included when the transcript has no counters for that turn. Turn
   allocation holds the high-water read, insert, and update in one immediate
