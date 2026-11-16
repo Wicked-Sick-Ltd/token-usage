@@ -47,6 +47,14 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Deeply nested JSON no longer kills the MCP server, hooks or sync.** A
+  stdin line nested a few hundred levels deep made `json.loads` raise
+  `RecursionError`, which the `ValueError` guards did not catch, so one line
+  ended the stdio MCP server, the `hook` / `cursor-hook` commands and
+  `activity_bridge.py sync`. Every reader now treats JSON nested deeper than
+  256 levels as malformed: the MCP server answers `-32700` and reads on, and
+  hooks and transcript readers skip the line. A reply the server cannot
+  encode becomes `-32603` with a null id instead of an exception.
 - **Activity bridge usage accounting.** A trailing prompt no longer marks a
   generation included when the transcript has no counters for that turn. Turn
   allocation holds the high-water read, insert, and update in one immediate
