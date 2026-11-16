@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import socket
@@ -1501,6 +1502,17 @@ def _content(rec):
     return ""
 
 
+def _type_name(obj):
+    """`type` of a record or block: the string, None when absent, "" for any other JSON value.
+
+    Arrays and objects are unhashable, so they must not reach a set lookup.
+    """
+    typ = obj.get("type")
+    if typ is None or isinstance(typ, str):
+        return typ
+    return ""
+
+
 def _text_from_content(content):
     if content is None:
         return ""
@@ -1524,7 +1536,7 @@ def _text_from_content(content):
                 continue
             if not isinstance(block, dict):
                 continue
-            kind = block.get("type")
+            kind = _type_name(block)
             if kind in {"tool_result", "tool_result_error", "tool_use", "tool_call"}:
                 continue
             if isinstance(block.get("text"), str) and block["text"].strip():
@@ -1540,8 +1552,8 @@ def _text_from_content(content):
 
 
 def _role(rec):
-    typ = rec.get("type")
-    if isinstance(typ, str) and typ in _SKIP_TYPES:
+    typ = _type_name(rec)
+    if typ in _SKIP_TYPES:
         return ""
     if typ in {"tool_result", "tool"}:
         return "tool"
@@ -1584,6 +1596,8 @@ def _timestamp(rec):
 def _num(usage, *keys):
     for key in keys:
         val = usage.get(key)
+        if isinstance(val, float) and not math.isfinite(val):
+            continue
         if isinstance(val, (int, float)) and not isinstance(val, bool):
             return int(val)
     return 0
@@ -1606,6 +1620,8 @@ def _codex_counter(usage, key):
     """Codex counters are non-negative numbers. A bad value fails open as None."""
     value = usage.get(key, 0)
     if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        return None
+    if isinstance(value, float) and not math.isfinite(value):
         return None
     return int(value)
 
@@ -1722,7 +1738,7 @@ def _usage(rec):
             "cache_write_input_tokens", "cache_write",
         )
     else:
-        cache_write = int(five_m or 0) + int(one_h or 0)
+        cache_write = _num(creation, "ephemeral_5m_input_tokens") + _num(creation, "ephemeral_1h_input_tokens")
     input_tokens = _num(usage, "input_tokens", "input")
     output_tokens = _num(usage, "output_tokens", "output")
     cache_read = _num(
@@ -1811,7 +1827,7 @@ def _tool_calls(rec, content):
     for block in list(blocks) + extras:
         if not isinstance(block, dict):
             continue
-        kind = block.get("type")
+        kind = _type_name(block)
         if kind not in {None, "tool_use", "tool_call", "function"} and "name" not in block and "function" not in block:
             continue
         fn = block.get("function") if isinstance(block.get("function"), dict) else {}
@@ -1837,7 +1853,7 @@ def _tool_results(content):
     for block in content:
         if not isinstance(block, dict):
             continue
-        if block.get("type") not in {"tool_result", "tool_result_error"}:
+        if _type_name(block) not in {"tool_result", "tool_result_error"}:
             continue
         results.append({
             "id": str(block.get("tool_use_id") or block.get("id") or ""),
@@ -1854,7 +1870,7 @@ def _tool_only(content):
     for block in content:
         if not isinstance(block, dict):
             return False
-        if block.get("type") not in {"tool_result", "tool_result_error"}:
+        if _type_name(block) not in {"tool_result", "tool_result_error"}:
             return False
         saw = True
     return saw
@@ -1933,7 +1949,7 @@ def _normalize_record(rec):
     """Lift Codex payload records so role, content, usage, and model are top-level."""
     if not isinstance(rec, dict) or rec.get("_codex_norm"):
         return rec
-    typ = rec.get("type")
+    typ = _type_name(rec)
     payload = rec.get("payload")
     if typ in {"function_call", "function_call_output"} and not isinstance(payload, dict):
         shaped = dict(rec)
@@ -1948,7 +1964,7 @@ def _normalize_record(rec):
     merged["_codex_norm"] = True
     if typ == "response_item":
         merged.setdefault("type", payload.get("type") or "message")
-        if merged.get("type") in {"function_call", "function_call_output"}:
+        if _type_name(merged) in {"function_call", "function_call_output"}:
             return _shape_codex_tool(merged)
     else:
         merged["type"] = typ
@@ -2270,7 +2286,7 @@ def _identity_state(path):
 def _observe_identity(path, state, rec):
     path = Path(path)
     rec = _normalize_record(rec)
-    if rec.get("type") in {"session_meta", "session"}:
+    if _type_name(rec) in {"session_meta", "session"}:
         for key in ("session_id", "id", "conversation_id"):
             if (
                 isinstance(rec.get(key), str)
@@ -2934,7 +2950,10 @@ def sync_tree(root, config, poster=None, vendor="", surface="", flush_limit=50):
     try:
         bridge.flush(flush_limit)
         for path in iter_jsonl(root):
-            sync_file(bridge, path, config, vendor=vendor, surface=surface)
+            try:
+                sync_file(bridge, path, config, vendor=vendor, surface=surface)
+            except Exception as exc:  # noqa: BLE001 — one transcript must not end the walk or a watch loop
+                _warn(f"activity-bridge: skipped {path}: {type(exc).__name__}: {exc}")
         return bridge.delivered, bridge.spooled
     finally:
         bridge.close()
