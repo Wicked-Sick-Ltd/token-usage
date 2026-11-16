@@ -3948,6 +3948,43 @@ def _is_antigravity_record(record):
             and isinstance(record.get("source"), str))
 
 
+def _antigravity_user_request(content):
+    open_tag, close_tag = "<USER_REQUEST>", "</USER_REQUEST>"
+    start = content.find(open_tag)
+    if start < 0:
+        return None
+    start += len(open_tag)
+    end = content.find(close_tag, start)
+    if end < 0:
+        return None
+    return content[start:end].strip()
+
+
+_ANTIGRAVITY_MODEL_LEAD_RE = re.compile(
+    r"<USER_SETTINGS_CHANGE>\s*The user changed setting `Model Selection` from ")
+_ANTIGRAVITY_MODEL_NAME_RE = re.compile(r"[A-Za-z0-9][^.\n<]+")
+
+
+def _antigravity_model_change(content):
+    # A failed lead rules out every later lead on the same line, so skipping to
+    # the line end keeps repeated leads linear instead of rescanning the line.
+    pos = 0
+    while True:
+        lead = _ANTIGRAVITY_MODEL_LEAD_RE.search(content, pos)
+        if not lead:
+            return None
+        eol = content.find("\n", lead.end())
+        if eol < 0:
+            eol = len(content)
+        at = content.find(" to ", lead.end(), eol)
+        while at >= 0:
+            name = _ANTIGRAVITY_MODEL_NAME_RE.match(content, at + 4)
+            if name:
+                return name.group(0)
+            at = content.find(" to ", at + 1, eol)
+        pos = eol
+
+
 def _unquote_arg(val):
     if isinstance(val, str) and len(val) >= 2 and val.startswith('"') and val.endswith('"'):
         try:
@@ -4161,25 +4198,22 @@ def _parse_antigravity_session(records):
         ts = record.get("created_at") if isinstance(record.get("created_at"), str) else None
         content = record.get("content") if isinstance(record.get("content"), str) else ""
         if kind == "USER_INPUT" and "<USER_SETTINGS_CHANGE>" in content and "<CONTEXT_SUMMARY>" not in content:
-            m_model = re.search(
-                r"<USER_SETTINGS_CHANGE>\s*The user changed setting `Model Selection` from .*? to ([A-Za-z0-9][^.\n<]+)",
-                content,
-            )
-            if m_model and m_model.group(1).strip():
-                current_model = m_model.group(1).strip()
+            model = (_antigravity_model_change(content) or "").strip()
+            if model:
+                current_model = model
         if kind == "USER_INPUT":
             if sid in users:
                 continue
             users.add(sid)
             if "<CONTEXT_SUMMARY>" in content and "<USER_REQUEST>" not in content:
                 continue
-            m_req = re.search(r"<USER_REQUEST>\s*(.*?)\s*</USER_REQUEST>", content, re.DOTALL)
-            prompt = m_req.group(1) if m_req else content
+            request = _antigravity_user_request(content)
+            prompt = request if request is not None else content
             match = re.match(r"\s*([$\/][A-Za-z0-9][A-Za-z0-9_:-]*)\b", prompt)
             active = {
                 "label": match.group(1) if match else OTHER_LABEL,
                 "start_ts": ts,
-                "prompt": prompt.strip()[:120],
+                "prompt": prompt.lstrip()[:120],
                 "by_model": {},
                 "subagents": [],
             }
