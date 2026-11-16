@@ -197,8 +197,8 @@ def plugin_version():
     stop the handshake, but it must not pass unmentioned either."""
     manifest = plugin_manifest_path()
     try:
-        return str(json.loads(manifest.read_text(encoding="utf-8",
-                                                 errors="replace")).get("version", "0"))
+        return str(tu.json_loads(manifest.read_text(encoding="utf-8",
+                                                    errors="replace")).get("version", "0"))
     except (OSError, ValueError, AttributeError) as e:  # missing, malformed, or not an object
         print(f"token-usage: cannot read plugin manifest {manifest}: {e}", file=sys.stderr)
         return "0"
@@ -283,8 +283,8 @@ def serve(stdin=None, stdout=None):
         if not line:
             continue
         try:
-            msg = json.loads(line)
-        except ValueError:
+            msg = tu.json_loads(line)
+        except (ValueError, MemoryError):  # malformed, or nested too deep to decode
             reply = _error(None, -32700, "parse error")
         else:
             try:
@@ -293,7 +293,14 @@ def serve(stdin=None, stdout=None):
                 reply = _error(msg.get("id") if isinstance(msg, dict) else None,
                                -32603, f"internal error: {type(e).__name__}: {e}")
         if reply is not None:
-            stdout.write(json.dumps(reply) + "\n")
+            try:
+                out = json.dumps(reply)
+            except (ValueError, TypeError, RecursionError, MemoryError) as e:
+                # The reply echoes the client's id; if it cannot be encoded,
+                # answer with a null id rather than leave the loop.
+                out = json.dumps(_error(None, -32603,
+                                        f"internal error: unencodable reply: {type(e).__name__}"))
+            stdout.write(out + "\n")
             stdout.flush()
 
 
