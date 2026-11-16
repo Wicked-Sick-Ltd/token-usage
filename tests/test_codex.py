@@ -73,6 +73,16 @@ def test_discovery_is_authoritative_and_archives_deduplicate(tu, tmp_path, monke
     assert adapter.locate() == p
 
 
+@pytest.mark.parametrize("bad_cwd", ["/tmp/nul\x00cwd", 7])
+def test_unresolvable_cwd_does_not_abort_project_discovery(tu, tmp_path, monkeypatch, bad_cwd):
+    p = make_rollout(tmp_path, monkeypatch)
+    write_jsonl(tu.codex_home() / "sessions/2026/10/02/rollout-bad.jsonl",
+                [event("session_meta", {"id": "thread-bad", "cwd": bad_cwd})])
+    adapter = tu.get_runtime_adapter("codex")
+    assert list(adapter.all_sessions(project_dir=tmp_path / "project")) == [p]
+    assert adapter.locate(project_dir=tmp_path / "project") == p
+
+
 def test_auto_detects_content_not_jsonl_suffix(tu, tmp_path, monkeypatch):
     p = make_rollout(tmp_path, monkeypatch)
     assert tu.resolve_runtime("auto", str(p))[1] == "codex"
