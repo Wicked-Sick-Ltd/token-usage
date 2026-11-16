@@ -47,6 +47,14 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Non-string session metadata no longer aborts corpus scans.** A Gemini
+  `project`, Codex `cwd`, id or parent id, or Copilot `context`/`cwd` that is
+  a list, object or number is ignored: the project falls back to Gemini's
+  `projectHash` or `<runtime>:unknown`, and a Codex session id to the rollout
+  file name. History, dashboard,
+  export, top consumers, insights and the MCP tools then finish and report the
+  other sessions. A session that still yields a non-string project, or raises
+  `TypeError` while being summarized, is skipped with a warning.
 - **Activity bridge usage accounting.** A trailing prompt no longer marks a
   generation included when the transcript has no counters for that turn. Turn
   allocation holds the high-water read, insert, and update in one immediate
