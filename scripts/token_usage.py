@@ -138,7 +138,7 @@ def _merge_pricing_file(pricing, path, warnings):
     """Merge one JSON pricing file into `pricing`. Returns False if the file
     itself is unusable (malformed / not a dict); invalid entries are skipped."""
     try:
-        data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+        data = json.loads(read_capped_text(path))
     except (ValueError, OSError):
         warn(f"ignoring malformed pricing file {path}", warnings)
         return False
@@ -436,6 +436,104 @@ class UnreadableTranscript(ValueError):
 
 
 _UNDECODABLE_WARNED = set()
+_OVERSIZE_WARNED = set()
+
+# Recordings come from directories other processes can write to, so no single
+# read may be sized by the file: a JSONL line longer than MAX_JSONL_LINE_BYTES
+# (newline included) is dropped without ever being held whole, and a ledger or
+# one-document recording is read no further than MAX_RECORDING_BYTES.
+MAX_JSONL_LINE_BYTES = 1 << 20
+MAX_RECORDING_BYTES = 8 << 20
+_SKIP_CHUNK_BYTES = 64 << 10
+
+
+class RecordingTooLarge(ValueError):
+    """A one-document recording past MAX_RECORDING_BYTES. A ValueError so the
+    per-session skip-and-disclose paths treat it as an unreadable session."""
+
+
+def _line_stats():
+    return {"oversize": 0, "truncated": False}
+
+
+def _bounded_lines(fh, stats, budget=None):
+    """Yield the raw lines of binary `fh` that fit MAX_JSONL_LINE_BYTES.
+
+    A longer line is consumed in bounded chunks and dropped, never assembled,
+    and counted in stats["oversize"]. With a `budget`, only lines that end
+    within the first `budget` bytes are yielded and nothing past it is read
+    beyond one probe byte; stats["truncated"] records that the file had more."""
+    consumed = 0
+    skipping = False
+    while True:
+        room = _SKIP_CHUNK_BYTES if skipping else MAX_JSONL_LINE_BYTES + 1
+        if budget is not None:
+            if consumed >= budget:
+                if fh.read(1):
+                    stats["truncated"] = True
+                return
+            room = min(room, budget - consumed)
+        raw = fh.readline(room)
+        if not raw:
+            return
+        consumed += len(raw)
+        # readline(n) stops short of n only at a newline or end of file.
+        ended = raw.endswith(b"\n") or len(raw) < room
+        if skipping:
+            skipping = not ended
+            continue
+        if len(raw) > MAX_JSONL_LINE_BYTES:
+            stats["oversize"] += 1
+            skipping = not ended
+            continue
+        if ended:
+            yield raw
+            continue
+        # Cut off by the budget mid-line: whole only if the file ends here.
+        if fh.read(1):
+            stats["truncated"] = True
+            return
+        yield raw
+        return
+
+
+def _warn_oversize_lines(path, stats, warnings=None):
+    """Disclose dropped lines: on stderr once per file, in `warnings` always."""
+    if not stats["oversize"]:
+        return
+    message = (f"{path}: skipped {stats['oversize']} line(s) longer than "
+               f"{MAX_JSONL_LINE_BYTES} bytes")
+    if str(path) not in _OVERSIZE_WARNED:
+        _OVERSIZE_WARNED.add(str(path))
+        warn(message)
+    if warnings is not None:
+        warnings.append(message)
+
+
+def _iter_ledger_lines(path, stats):
+    """Stripped, non-empty text lines of an append-only ledger, from no more
+    than its first MAX_RECORDING_BYTES."""
+    with open(path, "rb") as fh:
+        for raw in _bounded_lines(fh, stats, MAX_RECORDING_BYTES):
+            line = raw.decode("utf-8", errors="replace").strip()
+            if line:
+                yield line
+
+
+def read_capped_bytes(path, limit=MAX_RECORDING_BYTES):
+    """The whole of a one-document file, refusing one longer than `limit`.
+
+    Bounded by the read itself rather than a prior stat, so a file that grows
+    between the two is still never read past limit + 1 bytes."""
+    with open(path, "rb") as fh:
+        data = fh.read(limit + 1)
+    if len(data) > limit:
+        raise RecordingTooLarge(f"{path} is larger than {limit} bytes")
+    return data
+
+
+def read_capped_text(path, limit=MAX_RECORDING_BYTES, errors="replace"):
+    return read_capped_bytes(path, limit).decode("utf-8", errors=errors)
 
 
 def iter_jsonl(path):
@@ -447,10 +545,12 @@ def iter_jsonl(path):
     every reader — report, the hook, the corpus scan — into a
     UnicodeDecodeError traceback. Lines lost that way are counted and warned
     about once per file, because a silently vanished turn is a silently wrong
-    number."""
+    number. Lines past MAX_JSONL_LINE_BYTES are skipped and disclosed the
+    same way."""
     undecodable = 0
+    stats = _line_stats()
     with open(path, "rb") as fh:
-        for raw in fh:
+        for raw in _bounded_lines(fh, stats):
             try:
                 line = raw.decode("utf-8").strip()
             except UnicodeDecodeError:
@@ -467,6 +567,7 @@ def iter_jsonl(path):
     if undecodable and str(path) not in _UNDECODABLE_WARNED:
         _UNDECODABLE_WARNED.add(str(path))
         warn(f"{path}: {undecodable} line(s) had undecodable bytes")
+    _warn_oversize_lines(path, stats)
 
 
 def _has_entries(path):
@@ -563,7 +664,7 @@ def _resolve_agent_ts(path, ts=None, meta=None):
     meta_path = path.parent / (path.stem + ".meta.json")
     if meta_path.is_file():
         try:
-            m = json.loads(meta_path.read_text(encoding="utf-8", errors="replace"))
+            m = json.loads(read_capped_text(meta_path))
             if isinstance(m, dict):
                 for k in ts_keys:
                     v = m.get(k)
@@ -668,8 +769,7 @@ def parse_session(transcript_path):
             meta_path = agent_file.parent / (agent_file.stem + ".meta.json")
             if meta_path.exists():
                 try:
-                    meta = json.loads(meta_path.read_text(encoding="utf-8",
-                                                          errors="replace"))
+                    meta = json.loads(read_capped_text(meta_path))
                 except (ValueError, OSError):   # ValueError: malformed JSON
                     pass
             a_ts = _resolve_agent_ts(agent_file, a_ts, meta)
@@ -1017,7 +1117,7 @@ def cached_summary(path, pricing, warnings=None):
     st = path.stat()
     if cache_file.exists():
         try:
-            c = json.loads(cache_file.read_text(encoding="utf-8", errors="replace"))
+            c = json.loads(read_capped_text(cache_file))
             # Valid JSON that isn't an object would blow up on .get() — a
             # corrupt entry must re-parse, never crash the whole scan.
             if (isinstance(c, dict) and c.get("version") == INDEX_VERSION
@@ -1137,10 +1237,11 @@ def iter_summaries(pricing, cutoff=None, project=None, exclude=None, progress=Fa
     for f in sorted(projects_dir().glob("*/*.jsonl")):
         try:
             s, hit = cached_summary(f, pricing, warnings)
-        except (OSError, ValueError, AttributeError) as e:
+        except (OSError, ValueError, AttributeError, MemoryError) as e:
             # OSError: unreadable/a directory. ValueError: UnreadableTranscript
             # (a transcript that parsed to nothing) and a corrupt cache entry's
             # own json.loads. AttributeError: a cache entry of the wrong shape.
+            # MemoryError: one recording must not end the whole corpus scan.
             warn(f"skipping unreadable transcript {f}: {e}")
             if skipped is not None:
                 skipped.append(str(f))
@@ -2783,7 +2884,7 @@ def _cursor_folder_for_workspace(cursor_root, workspace_id):
     if not ws_json.is_file():
         return None
     try:
-        data = json.loads(ws_json.read_text(encoding="utf-8", errors="replace"))
+        data = json.loads(read_capped_text(ws_json))
     except (OSError, ValueError):
         return None
     folder = data.get("folder") or data.get("configuration", {}).get("folder")
@@ -2825,7 +2926,7 @@ def _cursor_workspace_ids_for_project(cursor_root, project_dir):
         return matched
     for ws_json in ws_root.glob("*/workspace.json"):
         try:
-            data = json.loads(ws_json.read_text(encoding="utf-8", errors="replace"))
+            data = json.loads(read_capped_text(ws_json))
         except (OSError, ValueError):
             continue
         folder = data.get("folder") or data.get("configuration", {}).get("folder")
@@ -2951,27 +3052,23 @@ def _cursor_ledger_meta(path):
     back to the hashed filename stem — the only identity such a file has."""
     conversation_id, roots, first_ts = None, [], None
     try:
-        with open(path, encoding="utf-8", errors="replace") as handle:
-            for line in handle:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    ev = json.loads(line)
-                except ValueError:
-                    continue
-                if not isinstance(ev, dict):
-                    continue
-                cid = ev.get("conversation_id")
-                if conversation_id is None and isinstance(cid, str) and cid:
-                    conversation_id = cid
-                if not roots and isinstance(ev.get("workspace_roots"), list):
-                    roots = [r for r in ev["workspace_roots"] if isinstance(r, str) and r]
-                ts = ev.get("ts")
-                if first_ts is None and isinstance(ts, str) and ts:
-                    first_ts = ts
-                if conversation_id and roots and first_ts:
-                    break
+        for line in _iter_ledger_lines(path, _line_stats()):
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(ev, dict):
+                continue
+            cid = ev.get("conversation_id")
+            if conversation_id is None and isinstance(cid, str) and cid:
+                conversation_id = cid
+            if not roots and isinstance(ev.get("workspace_roots"), list):
+                roots = [r for r in ev["workspace_roots"] if isinstance(r, str) and r]
+            ts = ev.get("ts")
+            if first_ts is None and isinstance(ts, str) and ts:
+                first_ts = ts
+            if conversation_id and roots and first_ts:
+                break
     except OSError:
         # Missing or unreadable ledgers are expected (fresh install, vanished
         # mid-scan). Fall through with filename-derived identity and whatever
@@ -3219,21 +3316,24 @@ def _cursor_parse_hook_ledger(session, warnings):
         return segments, "activity_only"
 
     events = []
+    stats = _line_stats()
     try:
-        text = path.read_text(encoding="utf-8", errors="replace")
+        for line in _iter_ledger_lines(path, stats):
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(ev, dict) and ev.get("generation_id"):
+                events.append(ev)
     except OSError as exc:
         warn(f"cannot read Cursor hook ledger: {exc}", warnings)
         return segments, "activity_only"
-    for line in text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            ev = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(ev, dict) and ev.get("generation_id"):
-            events.append(ev)
+    _warn_oversize_lines(path, stats, warnings)
+    if stats["truncated"]:
+        trusted = False
+        warn(f"Cursor hook ledger {path} is larger than {MAX_RECORDING_BYTES} "
+             "bytes; only its first part was read and this session is partial",
+             warnings)
 
     gen_order = []
     gen_meta = {}
@@ -3463,8 +3563,7 @@ def _cursor_parse_cloud_export(session, warnings):
     segments = []
     saw_tokens = False
     try:
-        data = json.loads(session.export_path.read_text(encoding="utf-8",
-                                                        errors="replace"))
+        data = json.loads(read_capped_text(session.export_path))
     except (OSError, ValueError) as exc:
         warn(f"cannot read Cursor cloud export: {exc}", warnings)
         return segments, saw_tokens
@@ -3528,8 +3627,9 @@ class CursorAdapter(RuntimeAdapter):
                     f"not {path.suffix!r} ({path})"
                 )
             try:
-                data = json.loads(path.read_text(encoding="utf-8",
-                                                 errors="replace"))
+                data = json.loads(read_capped_text(path))
+            except RecordingTooLarge as exc:
+                _cursor_fail_explicit_selector(f"Cursor export is too large: {exc}")
             except (OSError, ValueError):
                 _cursor_fail_explicit_selector(
                     f"Cursor export is not readable JSON: {path}"
@@ -3930,7 +4030,7 @@ def gemini_home():
 def gemini_records(path):
     if Path(path).suffix.lower() == ".json":
         # ponytail: legacy snapshots need one JSON load; JSONL recordings stream.
-        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        data = json.loads(read_capped_text(path, errors="strict"))
         if isinstance(data, dict):
             yield {k: v for k, v in data.items() if k != "messages"}
             for message in data.get("messages", []):
@@ -4585,23 +4685,25 @@ def _cursor_cloud_clean_event(ev):
     return out
 
 
-def _cursor_cloud_read_ledger(path):
+def _cursor_cloud_read_ledger(path, stats=None):
+    """(meta, events) from the first MAX_RECORDING_BYTES of a ledger; `stats`
+    says whether lines were dropped or the file went on past that."""
     meta, events = None, []
+    stats = stats if stats is not None else _line_stats()
     try:
-        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        for line in _iter_ledger_lines(path, stats):
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(rec, dict):
+                continue
+            if rec.get("type") == "agent":
+                meta = rec
+            elif rec.get("type") == "usage":
+                events.append(rec)
     except FileNotFoundError:
         return meta, events
-    for line in lines:
-        try:
-            rec = json.loads(line)
-        except ValueError:
-            continue
-        if not isinstance(rec, dict):
-            continue
-        if rec.get("type") == "agent":
-            meta = rec
-        elif rec.get("type") == "usage":
-            events.append(rec)
     return meta, events
 
 
@@ -4639,7 +4741,7 @@ def _cursor_cloud_state_path():
 
 def _cursor_cloud_state():
     try:
-        s = json.loads(_cursor_cloud_state_path().read_text(encoding="utf-8"))
+        s = json.loads(read_capped_text(_cursor_cloud_state_path(), errors="strict"))
         return s if isinstance(s, dict) else {}
     except (OSError, ValueError):
         return {}
@@ -4743,7 +4845,13 @@ def _sync_cursor_cloud_locked(since, agent_id, api_key, user_key, warnings,
     # empty or truncated answer must never erase usage already on disk.
     for aid in sorted(set(fetched) | existing):
         path = _cursor_cloud_ledger(aid)
-        meta, events = _cursor_cloud_read_ledger(path)
+        stats = _line_stats()
+        meta, events = _cursor_cloud_read_ledger(path, stats)
+        if stats["truncated"]:
+            # Rewriting from a partial read would erase the unread events.
+            warn(f"not updating Cursor cloud ledger {path}: it is larger than "
+                 f"{MAX_RECORDING_BYTES} bytes", warnings)
+            continue
         new = fetched.get(aid)
         if meta is None and user_key:
             meta = _cursor_cloud_agent_meta(aid, user_key, request)
@@ -4825,9 +4933,14 @@ def _cursor_cloud_flat(token_usage):
 
 def parse_cursor_cloud_ledger(path):
     """Segments (one per conversation) with tokens and Cursor-charged USD."""
-    meta, events = _cursor_cloud_read_ledger(Path(path))
+    stats = _line_stats()
+    meta, events = _cursor_cloud_read_ledger(Path(path), stats)
     warnings, segments, by_conv = [], [], {}
     partial = False
+    _warn_oversize_lines(path, stats, warnings)
+    if stats["truncated"]:
+        warn(f"Cursor cloud ledger {path} is larger than {MAX_RECORDING_BYTES} "
+             "bytes; only its first part was read", warnings)
     name = (meta or {}).get("name") or ""
     for ev in sorted(events, key=_cursor_cloud_ts):
         iso = _cursor_cloud_ms_to_iso(ev.get("timestamp"))
@@ -4870,7 +4983,8 @@ def parse_cursor_cloud_ledger(path):
         warnings.append("No usage events recorded for this cloud agent yet "
                         "(the Admin API aggregates hourly; sync again later).")
     return {"segments": segments, "warnings": warnings,
-            "measurement": "partial" if partial else "exact", "meta": meta}
+            "measurement": "partial" if partial or stats["truncated"] else "exact",
+            "meta": meta}
 
 
 class CursorCloudAdapter(RuntimeAdapter):
@@ -5131,7 +5245,7 @@ def cached_adapter_summary(adapter, source, pricing, warnings=None):
     # parent-only stat cannot validate that cache; recompute the family.
     if cache_file.exists() and adapter.name not in ("codex", "gemini", "copilot", "cursor-cloud"):
         try:
-            c = json.loads(cache_file.read_text(encoding="utf-8", errors="replace"))
+            c = json.loads(read_capped_text(cache_file))
             if (isinstance(c, dict) and c.get("version") == INDEX_VERSION
                     and c.get("mtime_ns") == st.st_mtime_ns
                     and c.get("size") == st.st_size
@@ -5171,7 +5285,7 @@ def iter_adapter_summaries(adapter, pricing, cutoff=None, project=None, exclude=
         saw_any = True
         try:
             s, hit = cached_adapter_summary(adapter, source, pricing, warnings)
-        except (OSError, ValueError, AttributeError) as e:
+        except (OSError, ValueError, AttributeError, MemoryError) as e:
             desc = adapter.describe(source)
             warn(f"skipping unreadable {adapter.name} session {desc}: {e}")
             if skipped is not None:
@@ -5378,7 +5492,7 @@ def _prior_budget_multiple(ledger):
     if not ledger.exists():
         return 0
     try:
-        prior = json.loads(ledger.read_text(encoding="utf-8", errors="replace"))
+        prior = json.loads(read_capped_text(ledger))
     except (ValueError, OSError):
         return 0
     if not isinstance(prior, dict):

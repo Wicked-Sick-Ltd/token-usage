@@ -40,6 +40,10 @@ END_EVENTS = {"sessionEnd", "SessionEnd"}
 # Live snapshots. A newer delivered turn must win over an older spooled one.
 MUTABLE_ENDPOINTS = {"heartbeat", "turn", "ai_sessions"}
 _CODEX_PAYLOAD_TYPES = {"response_item", "session_meta", "turn_context", "token_usage_record"}
+# Same bound as token_usage.MAX_JSONL_LINE_BYTES: a transcript line is never
+# held whole past this many bytes, so a planted line cannot exhaust memory.
+MAX_JSONL_LINE_BYTES = 1 << 20
+_SKIP_CHUNK_BYTES = 64 << 10
 ENDPOINTS = {
     "register": ("coord", "/session/register"),
     "heartbeat": ("coord", "/session/heartbeat"),
@@ -2227,11 +2231,27 @@ def extract_turns(records):
     return list(iter_turns(records))
 
 
+def _capped_lines(handle):
+    """Raw lines of binary `handle` up to MAX_JSONL_LINE_BYTES, newline
+    included. A longer line is read through in bounded chunks and dropped."""
+    skipping = False
+    while True:
+        room = _SKIP_CHUNK_BYTES if skipping else MAX_JSONL_LINE_BYTES + 1
+        raw = handle.readline(room)
+        if not raw:
+            return
+        ended = raw.endswith(b"\n") or len(raw) < room
+        if skipping or len(raw) > MAX_JSONL_LINE_BYTES:
+            skipping = not ended
+            continue
+        yield raw
+
+
 def _iter_records(path):
     try:
-        with Path(path).open(encoding="utf-8", errors="replace") as handle:
-            for line in handle:
-                line = line.strip()
+        with Path(path).open("rb") as handle:
+            for raw in _capped_lines(handle):
+                line = raw.decode("utf-8", errors="replace").strip()
                 if not line:
                     continue
                 try:
