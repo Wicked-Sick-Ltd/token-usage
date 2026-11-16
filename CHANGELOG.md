@@ -47,6 +47,13 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **An unresolvable recorded path no longer aborts a corpus scan.** A Cursor
+  hook-ledger workspace root or `workspace.json` folder with an embedded NUL
+  byte (or an unknown `~user`) made pathlib raise `ValueError`/`RuntimeError`
+  instead of `OSError`, stopping every Cursor report, history, insights and
+  dashboard run. Such paths are now skipped, the hook no longer records NUL
+  roots, and the Codex project filter and Antigravity project hash get the
+  same treatment.
 - **Activity bridge usage accounting.** A trailing prompt no longer marks a
   generation included when the transcript has no counters for that turn. Turn
   allocation holds the high-water read, insert, and update in one immediate

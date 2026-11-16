@@ -31,7 +31,9 @@ exceeds its input can be reported as `partial` instead of silently clamped.
 Ledger records also carry the workspace roots, which give a hook-captured
 session its project identity (`history --by project`, `--project`, and
 `project_dir` discovery); a session whose payloads carried none falls back to
-the `cursor-hooks` project.
+the `cursor-hooks` project. The hook drops a root that contains a NUL byte, and
+discovery skips any recorded root or workspace folder that cannot be resolved
+(NUL byte, unknown `~user`), so one bad ledger line cannot abort a scan.
 
 The hook command is **fail-open**: it appends to a local ledger and never blocks
 the agent. Prompt text in the ledger is truncated to the same 120-character
