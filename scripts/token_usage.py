@@ -3664,6 +3664,18 @@ def codex_metadata(path):
     return {}
 
 
+def codex_cwd_path(meta):
+    """Resolved rollout cwd, or None when the rollout's cwd is unusable."""
+    cwd = meta.get("cwd")
+    if not isinstance(cwd, str) or not cwd or "\x00" in cwd:
+        return None
+    try:
+        return Path(cwd).resolve()
+    except (OSError, ValueError, RuntimeError):
+        # RuntimeError is how Python < 3.13 reports a symlink loop.
+        return None
+
+
 def is_codex_transcript(path):
     try:
         return bool(codex_metadata(path))
@@ -3689,8 +3701,7 @@ class CodexAdapter(RuntimeAdapter):
                 sid = meta.get("id") or meta.get("session_id")
                 if not sid or sid in seen:
                     continue
-                if target is not None and (
-                        not meta.get("cwd") or Path(meta["cwd"]).resolve() != target):
+                if target is not None and codex_cwd_path(meta) != target:
                     continue
                 seen.add(sid)
                 yield path
@@ -3722,7 +3733,8 @@ class CodexAdapter(RuntimeAdapter):
         return meta.get("id") or meta.get("session_id") or Path(source).stem
 
     def project(self, source):
-        return project_slug(codex_metadata(source).get("cwd") or "codex:unknown")
+        cwd = codex_metadata(source).get("cwd")
+        return project_slug(cwd if isinstance(cwd, str) and cwd else "codex:unknown")
 
     def describe(self, source):
         return str(source)
