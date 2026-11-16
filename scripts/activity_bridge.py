@@ -67,6 +67,10 @@ ENV_NAMES = (
     "TOKEN_USAGE_LEDGER_DIR",
 )
 FIELD_LIMIT = 20000
+# Same bound as token_usage.MAX_JSON_DEPTH: far deeper than any hook payload or
+# transcript record, far short of the recursion budget str() and json.dumps()
+# share with json.loads.
+MAX_JSON_DEPTH = 256
 _GIT_CACHE = {}
 _DISABLED = {"0", "off", "false", "no"}
 _TRANSCRIPT_GENERATION = "__transcript__"
@@ -282,6 +286,34 @@ def load_config(environ=None):
         vendor=_text(merged.get("WIZZO_VENDOR")),
         sync_dirs=_split_dirs(merged.get("WIZZO_ACTIVITY_SYNC_DIRS")),
     )
+
+
+def _nesting_exceeds(value, limit):
+    level = [value]
+    for _ in range(limit):
+        level = [child for node in level
+                 for child in (node.values() if isinstance(node, dict) else node)
+                 if isinstance(child, (dict, list))]
+        if not level:
+            return False
+    return True
+
+
+def _json_loads(text):
+    """json.loads, where JSON nested past MAX_JSON_DEPTH is malformed (ValueError).
+
+    Deep nesting makes json.loads raise RecursionError, which is not a
+    ValueError, and a value just short of that raises it later in str() or
+    json.dumps() of the payload that carries it."""
+    try:
+        value = json.loads(text)
+    except RecursionError:
+        raise ValueError("JSON nested too deeply") from None
+    if (isinstance(value, (dict, list))
+            and text.count("[") + text.count("{") > MAX_JSON_DEPTH
+            and _nesting_exceeds(value, MAX_JSON_DEPTH)):
+        raise ValueError(f"JSON nested deeper than {MAX_JSON_DEPTH} levels")
+    return value
 
 
 def clip(text, limit=FIELD_LIMIT):
@@ -1478,7 +1510,7 @@ class Bridge:
             token = self.config.coord_token if target == "coord" else self.config.twin_token
             try:
                 self.poster(base + path, json.loads(body), token, self.config.timeout)
-            except (DeliveryError, TimeoutError, OSError, ValueError) as exc:
+            except (DeliveryError, TimeoutError, OSError, ValueError, RecursionError) as exc:
                 self.offline = True
                 self.store.note_failure(source_id, endpoint, content_hash, str(exc))
             else:
@@ -1789,7 +1821,7 @@ def _coerce_input(value):
         stripped = value.strip()
         if stripped[:1] in "{[":
             try:
-                return json.loads(stripped)
+                return _json_loads(stripped)
             except ValueError:
                 return value
         return value
@@ -2235,7 +2267,7 @@ def _iter_records(path):
                 if not line:
                     continue
                 try:
-                    rec = json.loads(line)
+                    rec = _json_loads(line)
                 except ValueError:
                     continue
                 if isinstance(rec, dict):
@@ -3065,7 +3097,7 @@ def _read_payload():
     if not raw:
         return None
     try:
-        payload = json.loads(raw.decode("utf-8", "replace"))
+        payload = _json_loads(raw.decode("utf-8", "replace"))
     except ValueError:
         return None
     return payload if isinstance(payload, dict) else None

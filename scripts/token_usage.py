@@ -134,11 +134,47 @@ def deduped_warnings():
         _WARNED_IN_SCOPE = None
 
 
+# Far deeper than any transcript, manifest or JSON-RPC message, and far short
+# of the recursion budgets that str(), repr() and json.dumps() share with
+# json.loads (Python's 1000 frames before 3.12, a C budget after).
+MAX_JSON_DEPTH = 256
+
+
+def _nesting_exceeds(value, limit):
+    level = [value]
+    for _ in range(limit):
+        level = [child for node in level
+                 for child in (node.values() if isinstance(node, dict) else node)
+                 if isinstance(child, (dict, list))]
+        if not level:
+            return False
+    return True
+
+
+def json_loads(text):
+    """json.loads, where JSON nested past MAX_JSON_DEPTH is malformed (ValueError).
+
+    json.loads raises RecursionError, not ValueError, on deep enough nesting,
+    and a value just short of that still raises it later in whatever prints,
+    copies or re-serializes it. Every reader here treats ValueError as a bad
+    line, so a deep one is skipped or reported like any other."""
+    try:
+        value = json.loads(text)
+    except RecursionError:
+        raise ValueError("JSON nested too deeply") from None
+    if isinstance(value, (dict, list)):
+        opens = (text.count(b"[") + text.count(b"{") if isinstance(text, (bytes, bytearray))
+                 else text.count("[") + text.count("{"))
+        if opens > MAX_JSON_DEPTH and _nesting_exceeds(value, MAX_JSON_DEPTH):
+            raise ValueError(f"JSON nested deeper than {MAX_JSON_DEPTH} levels")
+    return value
+
+
 def _merge_pricing_file(pricing, path, warnings):
     """Merge one JSON pricing file into `pricing`. Returns False if the file
     itself is unusable (malformed / not a dict); invalid entries are skipped."""
     try:
-        data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+        data = json_loads(path.read_text(encoding="utf-8", errors="replace"))
     except (ValueError, OSError):
         warn(f"ignoring malformed pricing file {path}", warnings)
         return False
@@ -459,8 +495,8 @@ def iter_jsonl(path):
             if not line:
                 continue
             try:
-                yield json.loads(line)
-            except json.JSONDecodeError:
+                yield json_loads(line)
+            except ValueError:
                 continue
     # Once per file: summarize_transcript alone makes two passes, and a
     # long-lived MCP server re-reads the same transcript on every query.
@@ -563,7 +599,7 @@ def _resolve_agent_ts(path, ts=None, meta=None):
     meta_path = path.parent / (path.stem + ".meta.json")
     if meta_path.is_file():
         try:
-            m = json.loads(meta_path.read_text(encoding="utf-8", errors="replace"))
+            m = json_loads(meta_path.read_text(encoding="utf-8", errors="replace"))
             if isinstance(m, dict):
                 for k in ts_keys:
                     v = m.get(k)
@@ -668,7 +704,7 @@ def parse_session(transcript_path):
             meta_path = agent_file.parent / (agent_file.stem + ".meta.json")
             if meta_path.exists():
                 try:
-                    meta = json.loads(meta_path.read_text(encoding="utf-8",
+                    meta = json_loads(meta_path.read_text(encoding="utf-8",
                                                           errors="replace"))
                 except (ValueError, OSError):   # ValueError: malformed JSON
                     pass
@@ -1017,7 +1053,7 @@ def cached_summary(path, pricing, warnings=None):
     st = path.stat()
     if cache_file.exists():
         try:
-            c = json.loads(cache_file.read_text(encoding="utf-8", errors="replace"))
+            c = json_loads(cache_file.read_text(encoding="utf-8", errors="replace"))
             # Valid JSON that isn't an object would blow up on .get() — a
             # corrupt entry must re-parse, never crash the whole scan.
             if (isinstance(c, dict) and c.get("version") == INDEX_VERSION
@@ -2714,7 +2750,7 @@ def _cursor_decode_kv(raw):
         raw = raw.tobytes()
     text = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else str(raw)
     try:
-        return json.loads(text)
+        return json_loads(text)
     except ValueError:
         return None
 
@@ -2783,7 +2819,7 @@ def _cursor_folder_for_workspace(cursor_root, workspace_id):
     if not ws_json.is_file():
         return None
     try:
-        data = json.loads(ws_json.read_text(encoding="utf-8", errors="replace"))
+        data = json_loads(ws_json.read_text(encoding="utf-8", errors="replace"))
     except (OSError, ValueError):
         return None
     folder = data.get("folder") or data.get("configuration", {}).get("folder")
@@ -2825,7 +2861,7 @@ def _cursor_workspace_ids_for_project(cursor_root, project_dir):
         return matched
     for ws_json in ws_root.glob("*/workspace.json"):
         try:
-            data = json.loads(ws_json.read_text(encoding="utf-8", errors="replace"))
+            data = json_loads(ws_json.read_text(encoding="utf-8", errors="replace"))
         except (OSError, ValueError):
             continue
         folder = data.get("folder") or data.get("configuration", {}).get("folder")
@@ -2957,7 +2993,7 @@ def _cursor_ledger_meta(path):
                 if not line:
                     continue
                 try:
-                    ev = json.loads(line)
+                    ev = json_loads(line)
                 except ValueError:
                     continue
                 if not isinstance(ev, dict):
@@ -3229,7 +3265,7 @@ def _cursor_parse_hook_ledger(session, warnings):
         if not line:
             continue
         try:
-            ev = json.loads(line)
+            ev = json_loads(line)
         except ValueError:
             continue
         if isinstance(ev, dict) and ev.get("generation_id"):
@@ -3463,7 +3499,7 @@ def _cursor_parse_cloud_export(session, warnings):
     segments = []
     saw_tokens = False
     try:
-        data = json.loads(session.export_path.read_text(encoding="utf-8",
+        data = json_loads(session.export_path.read_text(encoding="utf-8",
                                                         errors="replace"))
     except (OSError, ValueError) as exc:
         warn(f"cannot read Cursor cloud export: {exc}", warnings)
@@ -3528,7 +3564,7 @@ class CursorAdapter(RuntimeAdapter):
                     f"not {path.suffix!r} ({path})"
                 )
             try:
-                data = json.loads(path.read_text(encoding="utf-8",
+                data = json_loads(path.read_text(encoding="utf-8",
                                                  errors="replace"))
             except (OSError, ValueError):
                 _cursor_fail_explicit_selector(
@@ -3930,7 +3966,7 @@ def gemini_home():
 def gemini_records(path):
     if Path(path).suffix.lower() == ".json":
         # ponytail: legacy snapshots need one JSON load; JSONL recordings stream.
-        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        data = json_loads(Path(path).read_text(encoding="utf-8"))
         if isinstance(data, dict):
             yield {k: v for k, v in data.items() if k != "messages"}
             for message in data.get("messages", []):
@@ -3951,7 +3987,7 @@ def _is_antigravity_record(record):
 def _unquote_arg(val):
     if isinstance(val, str) and len(val) >= 2 and val.startswith('"') and val.endswith('"'):
         try:
-            unquoted = json.loads(val)
+            unquoted = json_loads(val)
             if isinstance(unquoted, str):
                 return unquoted
         except ValueError:
@@ -3973,7 +4009,7 @@ def _antigravity_cwd_from_record(record):
         args = tc.get("args")
         if isinstance(args, str) and "Cwd" in args:
             try:
-                args = json.loads(args)
+                args = json_loads(args)
             except ValueError:
                 args = None
         if isinstance(args, dict) and isinstance(args.get("Cwd"), str):
@@ -4193,7 +4229,7 @@ def _parse_antigravity_session(records):
             args = tc.get("args")
             if isinstance(args, str) and "SKILL.md" in args:
                 try:
-                    args = json.loads(args)
+                    args = json_loads(args)
                 except ValueError:
                     args = {}
             if isinstance(args, dict):
@@ -4568,7 +4604,7 @@ def _cursor_cloud_request(method, path, api_key, body=None, timeout=60):
         req.add_header("Content-Type", "application/json")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:  # fixed https host
-            return json.load(resp)
+            return json_loads(resp.read())
     except urllib.error.HTTPError as exc:
         detail = exc.read()[:200].decode("utf-8", "replace")
         raise RuntimeError(f"Cursor API {path} returned HTTP {exc.code}: {detail}") from None
@@ -4593,7 +4629,7 @@ def _cursor_cloud_read_ledger(path):
         return meta, events
     for line in lines:
         try:
-            rec = json.loads(line)
+            rec = json_loads(line)
         except ValueError:
             continue
         if not isinstance(rec, dict):
@@ -4639,7 +4675,7 @@ def _cursor_cloud_state_path():
 
 def _cursor_cloud_state():
     try:
-        s = json.loads(_cursor_cloud_state_path().read_text(encoding="utf-8"))
+        s = json_loads(_cursor_cloud_state_path().read_text(encoding="utf-8"))
         return s if isinstance(s, dict) else {}
     except (OSError, ValueError):
         return {}
@@ -5131,7 +5167,7 @@ def cached_adapter_summary(adapter, source, pricing, warnings=None):
     # parent-only stat cannot validate that cache; recompute the family.
     if cache_file.exists() and adapter.name not in ("codex", "gemini", "copilot", "cursor-cloud"):
         try:
-            c = json.loads(cache_file.read_text(encoding="utf-8", errors="replace"))
+            c = json_loads(cache_file.read_text(encoding="utf-8", errors="replace"))
             if (isinstance(c, dict) and c.get("version") == INDEX_VERSION
                     and c.get("mtime_ns") == st.st_mtime_ns
                     and c.get("size") == st.st_size
@@ -5358,7 +5394,7 @@ def _hook_payload():
         except (ValueError, OSError):
             return None
     try:
-        payload = json.loads(raw.decode("utf-8", "replace"))
+        payload = json_loads(raw.decode("utf-8", "replace"))
     except ValueError:  # malformed JSON — never block Claude Code on it
         return None
     return payload if isinstance(payload, dict) else None
@@ -5378,7 +5414,7 @@ def _prior_budget_multiple(ledger):
     if not ledger.exists():
         return 0
     try:
-        prior = json.loads(ledger.read_text(encoding="utf-8", errors="replace"))
+        prior = json_loads(ledger.read_text(encoding="utf-8", errors="replace"))
     except (ValueError, OSError):
         return 0
     if not isinstance(prior, dict):
@@ -5795,7 +5831,7 @@ def main():
             sys.exit("token-usage: --diff cannot be combined with --agents or --models")
         if args.runtime != "claude":
             import mcp_server
-            d = json.loads(mcp_server.tool_diff({"old": args.diff[0], "new": args.diff[1],
+            d = json_loads(mcp_server.tool_diff({"old": args.diff[0], "new": args.diff[1],
                                                "runtime": args.runtime, "format": "json"}))
         else:
             d = diff_data(Path(args.diff[0]), Path(args.diff[1]), load_pricing())
