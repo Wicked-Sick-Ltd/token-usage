@@ -479,12 +479,29 @@ def _has_entries(path):
         gen.close()      # abandoned early: no partial undecodable-line count
 
 
+def _ts_str(value):
+    """`value` if it is a non-empty string, else None.
+
+    Session timestamps are ordered by string comparison against ISO cutoffs
+    and each other, so a JSON number or boolean read from a transcript must
+    count as "no timestamp" or that comparison raises TypeError."""
+    return value if isinstance(value, str) and value else None
+
+
+def _summary_ts_ok(summary):
+    """True when a summary's first_ts is an ISO string or None — anything
+    else (an entry cached before timestamps were checked, or hand-edited)
+    must be re-parsed rather than reach the cutoff comparison."""
+    ts = summary.get("first_ts", False)
+    return ts is None or isinstance(ts, str)
+
+
 def sum_transcript(path):
     """Sum usage in one transcript file, deduped by requestId. Returns (by_model, first_ts)."""
     by_model, pending, first_ts = {}, {}, None  # pending: requestId -> (model, flat maxima)
     for entry in iter_jsonl(path):
-        if first_ts is None and entry.get("timestamp"):
-            first_ts = entry["timestamp"]
+        if first_ts is None:
+            first_ts = _ts_str(entry.get("timestamp"))
         if entry.get("type") != "assistant":
             continue
         msg = entry.get("message") or {}
@@ -512,7 +529,7 @@ def sum_by_day(path):
     ('unknown' if the file has no timestamps at all)."""
     first_ts, by_day, pending = None, {}, {}  # pending: req -> (day|None, model, flat)
     for entry in iter_jsonl(path):
-        ts = entry.get("timestamp")
+        ts = _ts_str(entry.get("timestamp"))
         if first_ts is None and ts:
             first_ts = ts
         if entry.get("type") != "assistant":
@@ -598,7 +615,7 @@ def parse_session(transcript_path):
 
     def new_segment(label, ts, prompt=""):
         segments.append({
-            "label": label, "start_ts": ts, "by_model": {},
+            "label": label, "start_ts": _ts_str(ts), "by_model": {},
             "prompt": prompt.strip()[:120], "subagents": [],
         })
 
@@ -987,7 +1004,7 @@ def summarize_transcript(path, pricing, st=None):
         "mtime_ns": st.st_mtime_ns, "size": st.st_size,
         "pricing": pricing_fingerprint(pricing),
         "project": path.parent.name,
-        "first_ts": next((s["start_ts"] for s in segs if s["start_ts"]), None),
+        "first_ts": next((s["start_ts"] for s in segs if _ts_str(s["start_ts"])), None),
         # "unpriced": this label used at least one model with no rates, so
         # its cost_usd covers only part of its usage (v4 of the index; a
         # per-session cost is not enough to spot mixing inside one label).
@@ -1022,7 +1039,8 @@ def cached_summary(path, pricing, warnings=None):
             # corrupt entry must re-parse, never crash the whole scan.
             if (isinstance(c, dict) and c.get("version") == INDEX_VERSION
                     and c.get("mtime_ns") == st.st_mtime_ns and c.get("size") == st.st_size
-                    and c.get("pricing") == pricing_fingerprint(pricing)):
+                    and c.get("pricing") == pricing_fingerprint(pricing)
+                    and _summary_ts_ok(c)):
                 return c, True
         except (ValueError, OSError):
             pass
@@ -1137,10 +1155,11 @@ def iter_summaries(pricing, cutoff=None, project=None, exclude=None, progress=Fa
     for f in sorted(projects_dir().glob("*/*.jsonl")):
         try:
             s, hit = cached_summary(f, pricing, warnings)
-        except (OSError, ValueError, AttributeError) as e:
+        except (OSError, ValueError, AttributeError, TypeError) as e:
             # OSError: unreadable/a directory. ValueError: UnreadableTranscript
             # (a transcript that parsed to nothing) and a corrupt cache entry's
-            # own json.loads. AttributeError: a cache entry of the wrong shape.
+            # own json.loads. AttributeError/TypeError: a cache entry or
+            # transcript field of the wrong type.
             warn(f"skipping unreadable transcript {f}: {e}")
             if skipped is not None:
                 skipped.append(str(f))
@@ -3428,7 +3447,7 @@ def _cursor_parse_sqlite(session, warnings):
             btype = header.get("type")
             if btype is None:
                 btype = bubble.get("type")
-            ts = bubble.get("createdAt") or bubble.get("timestamp")
+            ts = _ts_str(bubble.get("createdAt")) or _ts_str(bubble.get("timestamp"))
             if btype == CURSOR_USER_BUBBLE:
                 prompt = _cursor_bubble_text(bubble)
                 label = _cursor_activity_label(
@@ -3474,7 +3493,7 @@ def _cursor_parse_cloud_export(session, warnings):
         if not isinstance(msg, dict):
             continue
         role = msg.get("role")
-        ts = msg.get("timestamp") or msg.get("createdAt")
+        ts = _ts_str(msg.get("timestamp")) or _ts_str(msg.get("createdAt"))
         text = msg.get("text") or msg.get("content") or ""
         if isinstance(text, list):
             text = text_of(text)
@@ -3818,7 +3837,7 @@ def parse_codex_session(source):
         p = e.get("payload")
         if not isinstance(p, dict):
             continue
-        ts = e.get("timestamp")
+        ts = _ts_str(e.get("timestamp"))
         kind = e.get("type")
         if kind == "turn_context":
             model = p.get("model") or model
@@ -4285,7 +4304,7 @@ def parse_gemini_session(source):
             ) if isinstance(content, list) else ""
             match = re.match(r"\s*([$\/][A-Za-z0-9][A-Za-z0-9_:-]*)\b", prompt)
             active = {"label": match.group(1) if match else OTHER_LABEL,
-                      "start_ts": record.get("timestamp"), "prompt": prompt.strip()[:120],
+                      "start_ts": _ts_str(record.get("timestamp")), "prompt": prompt.strip()[:120],
                       "by_model": {}, "subagents": []}
             segments.append(active)
         if kind == "user":
@@ -4420,7 +4439,7 @@ def parse_copilot_records(records):
     measured = partial = False
 
     def segment(record, label=OTHER_LABEL):
-        seg = {"label": label, "start_ts": record.get("timestamp"), "prompt": "",
+        seg = {"label": label, "start_ts": _ts_str(record.get("timestamp")), "prompt": "",
                "by_model": {}, "subagents": []}
         segments.append(seg)
         return seg
@@ -5105,7 +5124,7 @@ def summarize_adapter_source(adapter, source, pricing, warnings=None):
         "runtime": adapter.name,
         "measurement": measurement,
         "project": adapter.project(source),
-        "first_ts": next((s["start_ts"] for s in segments if s.get("start_ts")), None),
+        "first_ts": next((s["start_ts"] for s in segments if _ts_str(s.get("start_ts"))), None),
         "by_label": {label: {"usage": agg["usage"], "cost_usd": agg["cost_usd"],
                              "invocations": agg["invocations"],
                              "unpriced": bool(unpriced_models(
@@ -5135,7 +5154,8 @@ def cached_adapter_summary(adapter, source, pricing, warnings=None):
             if (isinstance(c, dict) and c.get("version") == INDEX_VERSION
                     and c.get("mtime_ns") == st.st_mtime_ns
                     and c.get("size") == st.st_size
-                    and c.get("pricing") == pricing_fingerprint(pricing)):
+                    and c.get("pricing") == pricing_fingerprint(pricing)
+                    and _summary_ts_ok(c)):
                 return c, True
         except (ValueError, OSError):
             # Unreadable or malformed cache is a miss: recompute the summary
@@ -5171,7 +5191,7 @@ def iter_adapter_summaries(adapter, pricing, cutoff=None, project=None, exclude=
         saw_any = True
         try:
             s, hit = cached_adapter_summary(adapter, source, pricing, warnings)
-        except (OSError, ValueError, AttributeError) as e:
+        except (OSError, ValueError, AttributeError, TypeError) as e:
             desc = adapter.describe(source)
             warn(f"skipping unreadable {adapter.name} session {desc}: {e}")
             if skipped is not None:
