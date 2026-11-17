@@ -4524,6 +4524,12 @@ CURSOR_CLOUD_DEFAULT_SINCE_DAYS = 30
 CURSOR_CLOUD_OVERLAP_MS = 3 * 3600 * 1000   # events are aggregated hourly upstream
 CURSOR_CLOUD_WINDOW_MS = 30 * 86400 * 1000  # stay inside the API's 30-day range
 CURSOR_CLOUD_SYNC_INTERVAL_S = 900
+# A sync runs inside the exclusive sync lock, so every way it can keep going
+# is bounded: requests per sync (1000 events each), wall time between them,
+# and the size and read time of each response body.
+CURSOR_CLOUD_MAX_PAGES = 500
+CURSOR_CLOUD_SYNC_DEADLINE_S = 600
+CURSOR_CLOUD_MAX_RESPONSE_BYTES = 32 << 20
 _CURSOR_CLOUD_ID_RE = re.compile(r"bc-[A-Za-z0-9-]{8,80}")
 # Fields kept from each usage event. userEmail is deliberately dropped: the
 # ledger only needs to attribute spend to an agent run, not to a person.
@@ -4566,12 +4572,30 @@ def _cursor_cloud_request(method, path, api_key, body=None, timeout=60):
     req.add_header("Authorization", f"Basic {token}")
     if data is not None:
         req.add_header("Content-Type", "application/json")
+    deadline = time.monotonic() + 2 * timeout
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:  # fixed https host
-            return json.load(resp)
+            return json.loads(_cursor_cloud_read_body(resp, path, deadline))
     except urllib.error.HTTPError as exc:
-        detail = exc.read()[:200].decode("utf-8", "replace")
+        detail = exc.read(200).decode("utf-8", "replace")
         raise RuntimeError(f"Cursor API {path} returned HTTP {exc.code}: {detail}") from None
+
+
+def _cursor_cloud_read_body(resp, path, deadline):
+    """The socket timeout restarts on every chunk, so a body trickled slowly
+    enough would never time out on its own; cap both its size and read time."""
+    chunks, size = [], 0
+    while True:
+        chunk = resp.read1(65536)
+        if not chunk:
+            return b"".join(chunks)
+        size += len(chunk)
+        if size > CURSOR_CLOUD_MAX_RESPONSE_BYTES:
+            raise RuntimeError(f"Cursor API {path} response is larger than "
+                               f"{CURSOR_CLOUD_MAX_RESPONSE_BYTES} bytes")
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"Cursor API {path} took too long to send its response")
+        chunks.append(chunk)
 
 
 def _cursor_cloud_clean_event(ev):
@@ -4713,22 +4737,44 @@ def _sync_cursor_cloud_locked(since, agent_id, api_key, user_key, warnings,
         start = now_ms - CURSOR_CLOUD_DEFAULT_SINCE_DAYS * 86400 * 1000
     fetched = {}
     windows = []
+    sent = 0
+    deadline = time.monotonic() + CURSOR_CLOUD_SYNC_DEADLINE_S
     lo = start
+    # Any abort below raises before a ledger is touched: a partial fetch would
+    # otherwise replace each agent's window with a truncated one.
     while lo <= now_ms:
         hi = min(lo + CURSOR_CLOUD_WINDOW_MS - 1, now_ms)
         windows.append((lo, hi))
-        page = 1
+        page, previous = 1, None
         while True:
+            if sent >= CURSOR_CLOUD_MAX_PAGES:
+                raise RuntimeError(
+                    f"Cursor API usage sync stopped after {sent} pages; "
+                    "use a narrower --since or --agent")
+            if sent and time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"Cursor API usage sync passed its {CURSOR_CLOUD_SYNC_DEADLINE_S}s "
+                    "deadline; use a narrower --since or --agent")
             body = {"startDate": lo, "endDate": hi, "page": page, "pageSize": 1000,
                     "cloudAgentId": agent_id or "*"}
             resp = request("POST", "/teams/filtered-usage-events", api_key, body)
-            for ev in (resp or {}).get("usageEvents") or []:
+            sent += 1
+            resp = resp if isinstance(resp, dict) else {}
+            events = resp.get("usageEvents")
+            events = events if isinstance(events, list) else []
+            for ev in events:
                 clean = _cursor_cloud_clean_event(ev)
                 if clean is not None and (agent_id is None or clean["cloudAgentId"] == agent_id):
                     fetched.setdefault(clean["cloudAgentId"], []).append(clean)
-            pagination = (resp or {}).get("pagination") or {}
-            if not pagination.get("hasNextPage"):
+            pagination = resp.get("pagination")
+            if (not isinstance(pagination, dict) or pagination.get("hasNextPage") is not True
+                    or not events):
                 break
+            if events == previous:
+                raise RuntimeError(
+                    f"Cursor API returned the same page twice (page {page}); "
+                    "not trusting its pagination")
+            previous = events
             page += 1
         lo = hi + 1
 
