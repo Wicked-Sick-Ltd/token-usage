@@ -120,6 +120,56 @@ class Turn:
         self.turn_id = ""
         # requestId -> per-field maxima, folded into usage when the turn closes.
         self.request_usage = {}
+        # Lookups over `tools`, kept incrementally so a long turn is not rescanned
+        # per record. Calls appended to `tools` directly are indexed on next use.
+        self._indexed = 0
+        self._tool_keys = set()
+        self._tool_ids = {}
+        self._open_by_name = {}
+
+    def _index_call(self, call, key):
+        self._indexed += 1
+        self._tool_keys.add(key)
+        call_id = call.get("id")
+        if call_id:
+            self._tool_ids.setdefault(call_id, call)
+        name = call.get("name")
+        if name:
+            self._open_by_name.setdefault(name, [0, []])[1].append(call)
+
+    def _index_tools(self):
+        while self._indexed < len(self.tools):
+            call = self.tools[self._indexed]
+            self._index_call(call, _tool_key(call))
+
+    def add_tool(self, call):
+        """Append `call` unless an identical one is already on the turn."""
+        self._index_tools()
+        key = _tool_key(call)
+        if key in self._tool_keys:
+            return False
+        self.tools.append(call)
+        self._index_call(call, key)
+        return True
+
+    def find_tool(self, call_id, name):
+        """First call with `call_id`, else the first call named `name` with no result."""
+        self._index_tools()
+        if call_id:
+            found = self._tool_ids.get(call_id)
+            if found is not None:
+                return found
+        if not name:
+            return None
+        pending = self._open_by_name.get(name)
+        if pending is None:
+            return None
+        # A result is never cleared once set, so calls before the cursor stay matched.
+        start, calls = pending
+        while start < len(calls) and calls[start].get("result"):
+            start += 1
+        pending[0] = start
+        return calls[start] if start < len(calls) else None
 
     @property
     def assistant(self):
@@ -1864,19 +1914,9 @@ def _attach_results(turn, results):
     for result in results:
         if not result:
             continue
-        matched = None
         rid = result.get("id") or ""
         name = result.get("name") or ""
-        if rid:
-            for call in turn.tools:
-                if call.get("id") == rid:
-                    matched = call
-                    break
-        if matched is None and name:
-            for call in turn.tools:
-                if call.get("name") == name and not call.get("result"):
-                    matched = call
-                    break
+        matched = turn.find_tool(rid, name)
         if matched is None:
             matched = {"id": rid, "name": name or "tool", "input": {}, "result": ""}
             turn.tools.append(matched)
@@ -2195,16 +2235,8 @@ def iter_turns(records, on_record=None, codex_usage=None, codex_owner=None):
             text = _text_from_content(content)
             if text:
                 current.assistant_parts.append(clip(text))
-            seen = {
-                (call.get("id"), call.get("name"), _input_text(call.get("input")))
-                for call in current.tools
-            }
             for call in _tool_calls(rec, content):
-                key = (call.get("id"), call.get("name"), _input_text(call.get("input")))
-                if key in seen:
-                    continue
-                seen.add(key)
-                current.tools.append(call)
+                current.add_tool(call)
             _apply_usage(current, rec)
             continue
         if role == "tool":
@@ -2314,6 +2346,10 @@ def session_identity(path, records):
     if not state["cwd"]:
         state["cwd"] = str(Path(path).parent)
     return state["session_id"], state["model"], state["started"], state["cwd"]
+
+
+def _tool_key(call):
+    return (call.get("id"), call.get("name"), _input_text(call.get("input")))
 
 
 def _input_text(value):
