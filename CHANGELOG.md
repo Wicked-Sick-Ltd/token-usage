@@ -15,6 +15,9 @@ adheres to [Semantic Versioning](https://semver.org/).
   report, history, top-consumers, insights, dashboard, export and MCP tool then
   reads them with `runtime: "cursor-cloud"`. Cost uses Cursor's `chargedCents`
   instead of the pricing table. Opt-in: no key, no network; `auto` never picks it.
+  A stray `bc-*.jsonl` entry (a name that is not an agent id, or a directory,
+  symlink or FIFO) is skipped with a warning instead of aborting every sync,
+  and one agent's unwritable ledger no longer stops the others.
 - **Opt-in llm1 activity stream bridge** — `scripts/activity_bridge.py` and
   `bin/token-usage-activity-sync`. Cursor (`beforeSubmitPrompt`, `stop`,
   `subagentStop`), Claude Code and Codex hooks forward a turn when
@@ -47,6 +50,7 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Cursor cloud session lookup.** A symlink or other non-regular file at a ledger path is reported as not found. Lookup no longer opens it and aborts.
 - **Activity bridge usage accounting.** A trailing prompt no longer marks a
   generation included when the transcript has no counters for that turn. Turn
   allocation holds the high-water read, insert, and update in one immediate

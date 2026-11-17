@@ -344,18 +344,17 @@ def test_cache_write_failure_leaves_no_temp_file_in_the_index(tu, tmp_path, monk
     # A cache write that dies part way through still hands back freshly parsed
     # rows and warns once — but the index directory is long-lived, so a
     # truncated temp file there would accumulate scan after scan.
-    import pathlib
     seed_projects(tmp_path, monkeypatch)
     monkeypatch.setattr(tu, "_CACHE_WRITE_WARNED", False)
-    original = pathlib.Path.write_text
+    original = tu._write_regular_file
 
-    def patched(self, data, *a, **kw):
-        if self.name.endswith(".tmp"):
-            original(self, data[:3], *a, **kw)
+    def patched(path, data):
+        if path.name.endswith(".tmp"):
+            original(path, data[:3])
             raise OSError("No space left on device")
-        return original(self, data, *a, **kw)
+        return original(path, data)
 
-    monkeypatch.setattr(pathlib.Path, "write_text", patched)
+    monkeypatch.setattr(tu, "_write_regular_file", patched)
     data = tu.run_history(by="project")
     assert len(data["rows"]) == 2                         # correctness is unaffected
     assert list(tu.index_dir().rglob("*.tmp")) == []

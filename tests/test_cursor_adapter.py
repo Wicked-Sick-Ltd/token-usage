@@ -193,22 +193,21 @@ def test_cursor_cache_write_failure_leaves_no_temp_file(tu, tmp_path, monkeypatc
     # The Cursor adapter warms its own summary cache through a second call
     # site; a truncated temp file there accumulates in the index just as it
     # would on the Claude side.
-    import pathlib
     cursor_root = tmp_path / "cursor-user"
     db_path = build_cursor_tree(cursor_root)
     monkeypatch.setenv("TOKEN_USAGE_CURSOR_DIR", str(cursor_root))
     monkeypatch.setattr(tu, "_CACHE_WRITE_WARNED", False)
     adapter = tu.get_runtime_adapter("cursor")
     source = tu.CursorSession("comp-usage-001", "sqlite", db_path)
-    original = pathlib.Path.write_text
+    original = tu._write_regular_file
 
-    def patched(self, data, *a, **kw):
-        if self.name.endswith(".tmp"):
-            original(self, data[:3], *a, **kw)
+    def patched(path, data):
+        if path.name.endswith(".tmp"):
+            original(path, data[:3])
             raise OSError("No space left on device")
-        return original(self, data, *a, **kw)
+        return original(path, data)
 
-    monkeypatch.setattr(pathlib.Path, "write_text", patched)
+    monkeypatch.setattr(tu, "_write_regular_file", patched)
     warnings = []
     summary, cached = tu.cached_adapter_summary(adapter, source, tu.load_pricing(),
                                                 warnings)
