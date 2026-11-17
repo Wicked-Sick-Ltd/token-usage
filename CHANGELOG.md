@@ -15,6 +15,8 @@ adheres to [Semantic Versioning](https://semver.org/).
   report, history, top-consumers, insights, dashboard, export and MCP tool then
   reads them with `runtime: "cursor-cloud"`. Cost uses Cursor's `chargedCents`
   instead of the pricing table. Opt-in: no key, no network; `auto` never picks it.
+  Both Cursor API calls refuse redirects, so a key never follows a `Location`
+  header off `api.cursor.com`.
 - **Opt-in llm1 activity stream bridge** — `scripts/activity_bridge.py` and
   `bin/token-usage-activity-sync`. Cursor (`beforeSubmitPrompt`, `stop`,
   `subagentStop`), Claude Code and Codex hooks forward a turn when

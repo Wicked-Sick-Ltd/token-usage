@@ -9,7 +9,9 @@ and does not call Claude, Cursor, Codex, Gemini, Copilot or any other vendor API
 The one opt-in exception is the `cursor-cloud` runtime, which calls the Cursor
 Admin API with the key in `CURSOR_ADMIN_API_KEY` only when that variable is set
 and the runtime is requested by name; the key is read from the environment and
-never stored.
+never stored. Those requests go only to `https://api.cursor.com`: a redirect is
+refused and reported as an error, so neither `CURSOR_ADMIN_API_KEY` nor
+`CURSOR_API_KEY` is sent to another URL.
 Reports returned by MCP become part of the host conversation and follow that
 host's data policy.
 
