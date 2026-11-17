@@ -146,6 +146,8 @@ Pulls Cursor Cloud Agent usage events from the Cursor Admin API (`POST /teams/fi
 
 Exits non-zero with a message when the key is missing or the API rejects it. The key is never printed or stored.
 
+A `bc-*.jsonl` entry whose name is not a Cloud Agent id, or that is not a regular file (a directory, symlink, FIFO or socket), is skipped with a warning naming it. An agent whose ledger cannot be read or written is skipped with a warning while every other agent still syncs. If that agent had new rows, the incremental cursor does not move, so the next sync fetches them again.
+
 ### Hook commands
 
 `hook`, `codex-hook` and `cursor-hook` are entry points for the host hook files. They read a hook payload on stdin, always exit 0, and are not a reporting interface.

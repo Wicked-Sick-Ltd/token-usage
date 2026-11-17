@@ -139,19 +139,17 @@ def test_ledger_write_failure_leaves_no_stray_tmp(tu, tmp_path, monkeypatch):
     # The hook swallows its own failures so Claude Code never stalls, which is
     # exactly why a failed ledger write must clean up after itself: nobody is
     # watching, and the ledger directory is written on every single stop.
-    import pathlib
-
     import pytest
     monkeypatch.setenv("TOKEN_USAGE_LEDGER_DIR", str(tmp_path / "ledger"))
-    original = pathlib.Path.write_text
+    original = tu._write_regular_file
 
-    def patched(self, data, *a, **kw):
-        if self.name.endswith(".tmp"):
-            original(self, data[:3], *a, **kw)
+    def patched(path, data):
+        if path.name.endswith(".tmp"):
+            original(path, data[:3])
             raise OSError("No space left on device")
-        return original(self, data, *a, **kw)
+        return original(path, data)
 
-    monkeypatch.setattr(pathlib.Path, "write_text", patched)
+    monkeypatch.setattr(tu, "_write_regular_file", patched)
     with pytest.raises(OSError):
         tu._write_ledger(tu.ledger_dir() / "sess-1.json", {"session_id": "sess-1"})
     assert list((tmp_path / "ledger").glob("*.tmp")) == []

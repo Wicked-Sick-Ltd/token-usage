@@ -367,15 +367,38 @@ def _dedupe_warnings_in_place(warnings):
     warnings[:] = out
 
 
+def _open_regular_fd(path, flags):
+    """os.open() that never blocks on a FIFO or follows a final symlink, and
+    refuses what it opened unless that is a regular file. The type is checked
+    on the descriptor, so nothing can be swapped in after the check."""
+    import stat
+    fd = os.open(path, flags | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
+                 | getattr(os, "O_NOFOLLOW", 0), 0o666)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(f"not a regular file: {path}")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _write_regular_file(path, text):
+    fd = _open_regular_fd(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+    with open(fd, "w", encoding="utf-8") as fh:
+        fh.write(text)
+
+
 def atomic_write_text(path, text):
     """Replace `path` with `text` in one step, leaving no temp file behind.
 
     The temp name carries the pid because concurrent writers — parallel
     SubagentStop hooks, two scans warming the same cache entry — must never
-    interleave through one shared temp file."""
+    interleave through one shared temp file. That name is predictable, so a
+    FIFO squatting on it must fail the write rather than hang it."""
     tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     try:
-        tmp.write_text(text, encoding="utf-8")
+        _write_regular_file(tmp, text)
         tmp.replace(path)
     except OSError:
         # The replace is what makes this atomic, so failing before it leaves
@@ -4545,6 +4568,29 @@ def _cursor_cloud_ledger(agent_id):
     return cursor_cloud_dir() / f"{agent_id}.jsonl"
 
 
+def _cursor_cloud_ledgers(warnings=None):
+    """Ledger files on disk, sorted. Anything else matching the glob is not a
+    sync output, so it is reported and skipped rather than trusted."""
+    import stat
+    root = cursor_cloud_dir()
+    if not root.is_dir():
+        return []
+    out = []
+    for path in sorted(root.glob("bc-*.jsonl")):
+        if not _CURSOR_CLOUD_ID_RE.fullmatch(path.stem):
+            warn(f"skipping {path.name!r} in {root}: not a Cursor cloud agent id", warnings)
+            continue
+        try:
+            regular = stat.S_ISREG(path.lstat().st_mode)
+        except OSError:
+            continue
+        if not regular:
+            warn(f"skipping {path.name!r} in {root}: not a regular file", warnings)
+            continue
+        out.append(path)
+    return out
+
+
 def _cursor_cloud_ms_to_iso(ms):
     from datetime import datetime, timezone
     try:
@@ -4586,11 +4632,14 @@ def _cursor_cloud_clean_event(ev):
 
 
 def _cursor_cloud_read_ledger(path):
+    """Raises OSError when `path` exists but is not a regular file."""
     meta, events = None, []
     try:
-        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        fd = _open_regular_fd(path, os.O_RDONLY)
     except FileNotFoundError:
         return meta, events
+    with open(fd, encoding="utf-8", errors="replace") as fh:
+        lines = fh.read().splitlines()
     for line in lines:
         try:
             rec = json.loads(line)
@@ -4736,28 +4785,35 @@ def _sync_cursor_cloud_locked(since, agent_id, api_key, user_key, warnings,
         ts = _cursor_cloud_ts(ev)
         return any(a <= ts <= b for a, b in windows)
 
-    root = cursor_cloud_dir()
-    existing = {p.stem for p in root.glob("bc-*.jsonl")} if root.is_dir() else set()
+    existing = {p.stem for p in _cursor_cloud_ledgers(warnings)}
     written = 0
+    failed = False
     # Only agents the API returned rows for have their window replaced: an
     # empty or truncated answer must never erase usage already on disk.
     for aid in sorted(set(fetched) | existing):
         path = _cursor_cloud_ledger(aid)
-        meta, events = _cursor_cloud_read_ledger(path)
         new = fetched.get(aid)
-        if meta is None and user_key:
-            meta = _cursor_cloud_agent_meta(aid, user_key, request)
-            if meta is not None and not new:
-                _cursor_cloud_write_ledger(path, meta, events)
-        if not new:
+        # One agent's unreadable or unwritable ledger must not stop the rest.
+        try:
+            meta, events = _cursor_cloud_read_ledger(path)
+            if meta is None and user_key:
+                meta = _cursor_cloud_agent_meta(aid, user_key, request)
+                if meta is not None and not new:
+                    _cursor_cloud_write_ledger(path, meta, events)
+            if not new:
+                continue
+            kept = [e for e in events if not in_window(e)]
+            _cursor_cloud_write_ledger(path, meta, kept + new)
+        except OSError as exc:
+            warn(f"skipping Cursor cloud ledger {path.name!r}: {exc}", warnings)
+            failed = failed or bool(new)
             continue
-        kept = [e for e in events if not in_window(e)]
-        _cursor_cloud_write_ledger(path, meta, kept + new)
         written += len(new)
     if agent_id is None:
         # The incremental cursor only moves when this fetch covered everything
-        # since the previous one; a narrower --since must not skip the gap.
-        if previous_hw is None or start <= previous_hw:
+        # since the previous one; a narrower --since must not skip the gap,
+        # and neither may an agent whose fetched events were not stored.
+        if not failed and (previous_hw is None or start <= previous_hw):
             state["high_water_ms"] = now_ms
         state["last_sync_ms"] = now_ms
     _cursor_cloud_save_state(state, warnings)
@@ -4880,10 +4936,7 @@ class CursorCloudAdapter(RuntimeAdapter):
 
     def iter_sessions(self, project_dir=None, warnings=None):
         _cursor_cloud_maybe_autosync(warnings)
-        root = cursor_cloud_dir()
-        if not root.is_dir():
-            return
-        yield from sorted(root.glob("bc-*.jsonl"))
+        yield from _cursor_cloud_ledgers(warnings)
 
     def locate(self, arg=None, session_id=None, project_dir=None):
         wanted = (str(session_id).strip() if session_id else
@@ -4930,7 +4983,7 @@ class CursorCloudAdapter(RuntimeAdapter):
 
 def check_cursor_cloud_root(warnings=None):
     root = cursor_cloud_dir()
-    if root.is_dir() and any(root.glob("bc-*.jsonl")):
+    if _cursor_cloud_ledgers(warnings):
         return None
     hint = ("" if os.environ.get(CURSOR_CLOUD_KEY_ENV) else
             f"; set {CURSOR_CLOUD_KEY_ENV} (Cursor Team Admin API key) and run "

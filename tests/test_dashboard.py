@@ -163,17 +163,16 @@ def test_write_text_output_removes_the_temp_file_when_the_write_fails(
     # A full disk fails part way through the write, so the temp file exists on
     # disk holding a truncated dashboard. The caller hears about the failure,
     # but that debris must not be left in the user's output directory.
-    import pathlib
     out = tmp_path / "dash.html"
-    original = pathlib.Path.write_text
+    original = tu._write_regular_file
 
-    def patched(self, data, *a, **kw):
-        if self.name.endswith(".tmp"):
-            original(self, data[:5], *a, **kw)
+    def patched(path, data):
+        if path.name.endswith(".tmp"):
+            original(path, data[:5])
             raise OSError("No space left on device")
-        return original(self, data, *a, **kw)
+        return original(path, data)
 
-    monkeypatch.setattr(pathlib.Path, "write_text", patched)
+    monkeypatch.setattr(tu, "_write_regular_file", patched)
     with pytest.raises(OSError, match="No space left on device"):
         tu.write_text_output("<html>ok</html>", out)
     assert not list(tmp_path.glob("*.tmp"))
