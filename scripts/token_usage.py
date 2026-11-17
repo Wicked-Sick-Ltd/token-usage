@@ -4555,8 +4555,21 @@ def _cursor_cloud_ms_to_iso(ms):
             .strftime("%Y-%m-%dT%H:%M:%S.") + f"{value % 1000:03d}Z")
 
 
+def _cursor_cloud_opener():
+    import urllib.request
+
+    class RefuseRedirects(urllib.request.HTTPRedirectHandler):
+        # urllib copies Authorization onto the redirected request, whatever
+        # its host. Declining makes every 3xx an HTTPError instead.
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None
+
+    return urllib.request.build_opener(RefuseRedirects)
+
+
 def _cursor_cloud_request(method, path, api_key, body=None, timeout=60):
-    """One Basic-auth call to the Cursor API. The key never leaves this frame."""
+    """One Basic-auth call to the Cursor API. The key never leaves this frame,
+    and the request never leaves CURSOR_API_BASE: redirects are refused."""
     import base64
     import urllib.error
     import urllib.request
@@ -4567,7 +4580,7 @@ def _cursor_cloud_request(method, path, api_key, body=None, timeout=60):
     if data is not None:
         req.add_header("Content-Type", "application/json")
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:  # fixed https host
+        with _cursor_cloud_opener().open(req, timeout=timeout) as resp:
             return json.load(resp)
     except urllib.error.HTTPError as exc:
         detail = exc.read()[:200].decode("utf-8", "replace")
