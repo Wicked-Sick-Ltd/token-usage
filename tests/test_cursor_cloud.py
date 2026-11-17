@@ -410,6 +410,14 @@ def _serve(handler):
         server.server_close()
 
 
+def _loopback_redirect_location(port, path):
+    """Location for the stand-in API.
+
+    The request target is copied into a response header. Drop CR and LF first
+    so that target cannot split the response."""
+    return f"http://localhost:{port}{path}".replace("\n", "").replace("\r", "")
+
+
 @contextlib.contextmanager
 def _redirecting_api(tu, monkeypatch, code, redirect_paths=None):
     """CURSOR_API_BASE pointed at a local stand-in whose answer is a `code`
@@ -426,7 +434,7 @@ def _redirecting_api(tu, monkeypatch, code, redirect_paths=None):
                     self.rfile.read(length)
                 if redirect_paths is None or self.path in redirect_paths:
                     self.send_response(code)
-                    self.send_header("Location", f"http://localhost:{other_port}{self.path}")
+                    self.send_header("Location", _loopback_redirect_location(other_port, self.path))
                     self.send_header("Content-Length", "0")
                     self.end_headers()
                     return
@@ -451,6 +459,14 @@ def _redirecting_api(tu, monkeypatch, code, redirect_paths=None):
 
 
 REDIRECT_CODES = (301, 302, 303, 307, 308)
+
+
+def test_redirect_location_cannot_split_the_response():
+    plain = _loopback_redirect_location(9, "/teams/filtered-usage-events")
+    assert plain == "http://localhost:9/teams/filtered-usage-events"
+    injected = _loopback_redirect_location(9, "/v0/agents/bc\r\nX-Injected: 1\n")
+    assert injected == "http://localhost:9/v0/agents/bcX-Injected: 1"
+    assert "\r" not in injected and "\n" not in injected
 
 
 @pytest.mark.parametrize("code", REDIRECT_CODES)
