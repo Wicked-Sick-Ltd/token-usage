@@ -250,6 +250,57 @@ def test_a_fifo_at_the_ledger_temp_name_does_not_hang_the_sync(tu, cloud_dir):
     assert (cloud_dir / f"{AGENT_A}.jsonl").is_file()
 
 
+def _open_fd_count():
+    return len(list(Path("/proc/self/fd").iterdir()))
+
+
+@pytest.mark.skipif(not Path("/proc/self/fd").is_dir(), reason="needs /proc/self/fd")
+def test_ledger_helpers_release_descriptors(tu, tmp_path, monkeypatch):
+    path = tmp_path / "ledger.jsonl"
+    before = _open_fd_count()
+    tu._write_regular_file(path, "alpha\n")
+    assert tu._cursor_cloud_read_ledger(path) == (None, [])
+    assert path.read_text(encoding="utf-8") == "alpha\n"
+    assert _open_fd_count() == before
+
+    def fdopen_fails(*_a, **_k):
+        raise OSError("fdopen failed")
+
+    monkeypatch.setattr(os, "fdopen", fdopen_fails)
+    with pytest.raises(OSError, match="fdopen failed"):
+        tu._write_regular_file(path, "beta\n")
+    with pytest.raises(OSError, match="fdopen failed"):
+        tu._cursor_cloud_read_ledger(path)
+    assert _open_fd_count() == before
+
+
+def test_symlink_ledger_lookup_reports_not_found(tu, mcp, cloud_dir, tmp_path):
+    cloud_dir.mkdir(parents=True)
+    target = tmp_path / "real.jsonl"
+    target.write_text(json.dumps({
+        "type": "usage", "timestamp": "1794592800000", "cloudAgentId": AGENT_A,
+        "model": "m", "chargedCents": 1,
+    }) + "\n")
+    link = cloud_dir / f"{AGENT_A}.jsonl"
+    link.symlink_to(target)
+    assert link.is_file()
+    adapter = tu.get_runtime_adapter("cursor-cloud")
+    assert adapter.locate(AGENT_A) is None
+    assert adapter.locate(str(link)) is None
+    with pytest.raises(mcp.ToolError, match="session found"):
+        mcp.tool_session_cost({"runtime": "cursor-cloud", "session_id": AGENT_A})
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPT), "json", "--runtime", "cursor-cloud", AGENT_A],
+        capture_output=True, text=True, env=dict(os.environ), check=False)
+    assert proc.returncode != 0
+    assert "Traceback" not in proc.stderr
+    assert "session found" in proc.stderr
+    # A real ledger at the same name is still found.
+    link.unlink()
+    target.replace(link)
+    assert adapter.locate(AGENT_A) == link
+
+
 def test_cli_sync_survives_an_odd_ledger_name(tu, cloud_dir, monkeypatch, capsys):
     cloud_dir.mkdir(parents=True)
     (cloud_dir / "bc-x.jsonl").write_text("")

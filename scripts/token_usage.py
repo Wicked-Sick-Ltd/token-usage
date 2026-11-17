@@ -385,8 +385,17 @@ def _open_regular_fd(path, flags):
 
 def _write_regular_file(path, text):
     fd = _open_regular_fd(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
-    with open(fd, "w", encoding="utf-8") as fh:
+    # os.fdopen takes the descriptor. If that handoff itself fails, close fd
+    # here; otherwise the file object owns it and must be closed on every path.
+    fh = None
+    try:
+        fh = os.fdopen(fd, "w", encoding="utf-8")
         fh.write(text)
+    finally:
+        if fh is None:
+            os.close(fd)
+        else:
+            fh.close()
 
 
 def atomic_write_text(path, text):
@@ -4568,6 +4577,20 @@ def _cursor_cloud_ledger(agent_id):
     return cursor_cloud_dir() / f"{agent_id}.jsonl"
 
 
+def _cursor_cloud_nonregular(path):
+    """The path is present and is not a regular file.
+
+    is_file() follows a symlink, so a link to a real file looks usable.
+    Ledger reads open with O_NOFOLLOW and raise; callers that would then
+    abort must treat the entry as absent instead."""
+    import stat
+    try:
+        mode = path.lstat().st_mode
+    except OSError:
+        return False
+    return not stat.S_ISREG(mode)
+
+
 def _cursor_cloud_ledgers(warnings=None):
     """Ledger files on disk, sorted. Anything else matching the glob is not a
     sync output, so it is reported and skipped rather than trusted."""
@@ -4638,8 +4661,15 @@ def _cursor_cloud_read_ledger(path):
         fd = _open_regular_fd(path, os.O_RDONLY)
     except FileNotFoundError:
         return meta, events
-    with open(fd, encoding="utf-8", errors="replace") as fh:
+    fh = None
+    try:
+        fh = os.fdopen(fd, "r", encoding="utf-8", errors="replace")
         lines = fh.read().splitlines()
+    finally:
+        if fh is None:
+            os.close(fd)
+        else:
+            fh.close()
     for line in lines:
         try:
             rec = json.loads(line)
@@ -4943,12 +4973,19 @@ class CursorCloudAdapter(RuntimeAdapter):
                   str(arg).strip() if arg else None)
         if wanted:
             path = Path(wanted).expanduser()
-            if path.suffix == ".jsonl" and path.is_file():
-                return path
+            if path.suffix == ".jsonl":
+                # A symlink, directory or FIFO must not be opened: the reader
+                # refuses to follow it and the command would abort on OSError.
+                if _cursor_cloud_nonregular(path):
+                    return None
+                if path.is_file():
+                    return path
             match = _CURSOR_CLOUD_ID_RE.search(wanted)
             if not match:
                 return None
             path = _cursor_cloud_ledger(match.group(0))
+            if _cursor_cloud_nonregular(path):
+                return None
             if _cursor_cloud_autosync_enabled():
                 if path.is_file():
                     _cursor_cloud_maybe_autosync()

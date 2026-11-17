@@ -50,6 +50,7 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Cursor cloud session lookup.** A symlink or other non-regular file at a ledger path is reported as not found. Lookup no longer opens it and aborts.
 - **Activity bridge usage accounting.** A trailing prompt no longer marks a
   generation included when the transcript has no counters for that turn. Turn
   allocation holds the high-water read, insert, and update in one immediate
