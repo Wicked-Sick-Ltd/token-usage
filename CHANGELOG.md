@@ -47,6 +47,12 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Activity bridge turns with many tool calls.** Grouping a transcript into
+  turns now keeps the open turn's tool-call dedupe keys and result lookups as
+  calls are added. Before, every assistant record re-serialized every stored
+  call and every tool result rescanned the list, so one JSONL file with many
+  small tool-call lines held `sync` (and the live hook) on CPU and later files
+  in the walk were never published.
 - **Activity bridge usage accounting.** A trailing prompt no longer marks a
   generation included when the transcript has no counters for that turn. Turn
   allocation holds the high-water read, insert, and update in one immediate

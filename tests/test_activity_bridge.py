@@ -986,6 +986,74 @@ def test_oversized_tool_results_are_clipped_at_extraction():
     assert len(block[0].tools[0]["result"]) < bridge.FIELD_LIMIT + 20
 
 
+def test_sync_serializes_each_tool_call_a_bounded_number_of_times(tmp_path, monkeypatch):
+    serialized = 0
+    real = bridge._input_text
+
+    def counted(value):
+        nonlocal serialized
+        serialized += 1
+        return real(value)
+
+    monkeypatch.setattr(bridge, "_input_text", counted)
+    unique = 1000
+    records = [{"role": "user", "content": "go", "ts": "2026-10-25T11:00:00Z"}]
+    for i in range(unique):
+        line = {"role": "assistant", "model": "grok-4", "content": [
+            {"type": "tool_use", "id": f"t{i}", "name": "Bash", "input": {"command": f"echo {i}"}},
+        ]}
+        records.extend([line, line])
+    root = tmp_path / "shared"
+    write_jsonl(root / "a-flood.jsonl", records)
+    write_jsonl(root / "b-next.jsonl", [
+        {"role": "user", "content": "one", "ts": "2026-10-25T12:00:00Z"},
+        {"role": "assistant", "content": "uno", "model": "grok-4", "ts": "2026-10-25T12:00:01Z"},
+    ])
+    poster = FakePoster()
+    bridge.sync_tree(root, cfg(tmp_path, vendor="grok"), poster=poster)
+    assert serialized <= 4 * unique
+    ingest = {
+        c["body"]["source_id"]: c["body"]["content"]
+        for c in poster.calls if c["url"].endswith("/v1/ingest")
+    }
+    assert set(ingest) == {"a-flood:turn-1", "b-next:turn-1"}
+    assert ingest["a-flood:turn-1"].count("- `Bash`") == unique
+    assert f"echo {unique - 1}" in ingest["a-flood:turn-1"]
+
+
+def test_tool_results_match_without_rescanning_the_turn(monkeypatch):
+    class CountingCall(dict):
+        reads = 0
+
+        def get(self, *args):
+            CountingCall.reads += 1
+            return super().get(*args)
+
+    real = bridge._tool_calls
+    monkeypatch.setattr(
+        bridge, "_tool_calls", lambda rec, content: [CountingCall(c) for c in real(rec, content)])
+    n = 600
+    calls = [{"id": f"t{i}", "name": "Bash", "input": {"n": i}} for i in range(n)]
+    calls += [{"name": "Grep", "input": {"n": i}} for i in range(n)]
+    records = [
+        {"role": "user", "content": "go"},
+        {"role": "assistant", "content": "a", "tool_calls": calls},
+    ]
+    records += [
+        {"role": "tool", "tool_call_id": f"t{i}", "content": f"bash {i}"} for i in reversed(range(n))
+    ]
+    records += [{"role": "tool", "name": "Grep", "content": f"grep {i}"} for i in range(n)]
+    records += [{"role": "tool", "tool_call_id": f"x{i}", "content": "orphan"} for i in range(n)]
+    turns = bridge.extract_turns(records)
+    assert CountingCall.reads <= 20 * n
+    tools = turns[0].tools
+    assert len(tools) == 3 * n
+    assert [t["result"] for t in tools[:n]] == [f"bash {i}" for i in range(n)]
+    assert [t["result"] for t in tools[n:2 * n]] == [f"grep {i}" for i in range(n)]
+    assert [t["id"] for t in tools[2 * n:]] == [f"x{i}" for i in range(n)]
+    assert all(t["result"] == "orphan" for t in tools[2 * n:])
+
+
 def test_store_migrates_prompts_to_include_the_agent_key(tmp_path):
     directory = tmp_path / "state"
     directory.mkdir()
