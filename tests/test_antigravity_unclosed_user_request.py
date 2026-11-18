@@ -9,6 +9,7 @@ import json
 import os
 import subprocess
 import sys
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from conftest import SCRIPT, write_jsonl
@@ -27,7 +28,9 @@ PARENT_OUTPUT = 5
 CHILD_OUTPUT = 13
 SIBLING_OUTPUT = 3
 FAMILY_OUTPUT = PARENT_OUTPUT + CHILD_OUTPUT + SIBLING_OUTPUT
-TS = "2026-11-14T12:00:00Z"
+# Inside every --since 30d window these scans use. A fixed calendar day falls
+# out of that window and the corpus looks empty even after the hang is gone.
+TS = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _content(closed=False):
@@ -124,6 +127,7 @@ def _run(args, env, timeout=LIMIT_S):
         )
     except subprocess.TimeoutExpired:
         pytest.fail(f"{args} did not finish within {timeout}s")
+        raise
 
 
 def _cli(args, env):
@@ -280,6 +284,7 @@ def _hook(env, payload):
         )
     except subprocess.TimeoutExpired:
         pytest.fail(f"hook did not finish within {LIMIT_S}s")
+        raise
 
 
 def test_stop_hook_returns_for_unclosed_transcript(tmp_path):
