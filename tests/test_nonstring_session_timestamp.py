@@ -67,7 +67,7 @@ def assert_timestamp_reusable(ts, cutoff):
         return
     assert isinstance(ts, str)
     assert ts[:10]
-    assert (ts < cutoff) or (ts >= cutoff)
+    assert isinstance(ts < cutoff, bool)
 
 
 @pytest.mark.parametrize("bad_timestamp", [1, True], ids=["int", "bool"])
@@ -152,6 +152,11 @@ def test_cli_windowed_commands_report_the_healthy_session(tmp_path, monkeypatch,
         assert proc.returncode == 0, proc.stderr
         if args[0] == "dashboard":
             assert HEALTHY in dash.read_text(encoding="utf-8")
+        elif args[:2] == ["insights", "--since"]:
+            # Window insights prose names findings, not project slugs. An empty
+            # window is the report that the healthy session was dropped.
+            assert "No sessions in window" not in proc.stdout
+            assert "Traceback" not in proc.stderr
         else:
             assert HEALTHY in proc.stdout
 
@@ -171,7 +176,7 @@ def test_mcp_windowed_tools_report_the_healthy_session(mcp, tmp_path, monkeypatc
     assert not err, text
     assert HEALTHY in text
 
-    text, err = call("top_consumers")
+    text, err = call("top_consumers", format="markdown")
     assert not err, text
     assert "healthy-proj" in text and "| ok |" in text
 
