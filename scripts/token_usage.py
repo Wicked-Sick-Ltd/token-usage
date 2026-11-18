@@ -4081,7 +4081,17 @@ class GeminiAdapter(RuntimeAdapter):
 
     def project(self, source):
         meta = gemini_metadata(source)
-        return meta.get("project") or meta.get("projectHash") or "gemini:unknown"
+        # Grouping and `project in name` both require a string. A legacy
+        # snapshot can store project as a list, object, or number; that value
+        # is not a name. Keep the session under its hash instead of aborting
+        # the corpus scan that groups or filters on the name.
+        name = meta.get("project")
+        if isinstance(name, str) and name:
+            return name
+        project_hash = meta.get("projectHash")
+        if isinstance(project_hash, str) and project_hash:
+            return project_hash
+        return "gemini:unknown"
 
     def describe(self, source):
         return str(source)

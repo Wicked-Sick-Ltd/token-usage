@@ -14,14 +14,26 @@ import json
 import os
 import subprocess
 import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 from conftest import SCRIPT
 
 GOOD_OUTPUT = 20
 BAD_OUTPUT = 9
-TS_USER = "2026-11-14T12:00:00Z"
-TS_MODEL = "2026-11-14T12:00:01Z"
+
+
+def _recent(seconds_ago):
+    moment = datetime.now(timezone.utc) - timedelta(days=1, seconds=seconds_ago)
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# Inside the 30-day window used by dashboard, day history, top consumers,
+# insights, and the CLI dashboard default. A fixed calendar day falls out of
+# that window and the ordinary chat disappears even after grouping is fixed.
+TS_USER = _recent(1)
+TS_MODEL = _recent(0)
 
 KINDS = {
     "array": ["p"],
@@ -98,7 +110,10 @@ def test_project_name_is_a_string_or_the_hash(tu, tmp_path, monkeypatch, kind, l
     bad_path, bad_hash = plant(tmp_path, monkeypatch, kind, legacy=legacy)
     adapter = tu.get_runtime_adapter("gemini")
     assert adapter.project(bad_path) == bad_hash
-    assert list(adapter.iter_sessions())  # discovery still accepts the snapshot
+    # The ordinary chat is planted too, so a non-empty list does not prove the
+    # crafted snapshot was discovered.
+    found = {Path(path).resolve() for path in adapter.iter_sessions()}
+    assert bad_path.resolve() in found
 
 
 @pytest.mark.parametrize("kind", list(KINDS))
