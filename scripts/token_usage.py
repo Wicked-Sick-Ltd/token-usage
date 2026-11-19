@@ -989,7 +989,7 @@ def summarize_transcript(path, pricing, st=None):
         "mtime_ns": st.st_mtime_ns, "size": st.st_size,
         "pricing": pricing_fingerprint(pricing),
         "project": path.parent.name,
-        "first_ts": next((s["start_ts"] for s in segs if s["start_ts"]), None),
+        "first_ts": _session_timestamp(next((s["start_ts"] for s in segs if s["start_ts"]), None)),
         # "unpriced": this label used at least one model with no rates, so
         # its cost_usd covers only part of its usage (v4 of the index; a
         # per-session cost is not enough to spot mixing inside one label).
@@ -1113,6 +1113,26 @@ def _local_day(ts):
         return ts[:10]
 
 
+def _session_timestamp(ts):
+    """An ISO timestamp, or None when the value cannot be ordered as one.
+
+    The opening user turn is stored as first_ts. A number or a boolean there
+    is not a start time: comparing it with an ISO cutoff raises TypeError
+    outside the per-file handler and aborts the corpus scan.
+    """
+    if isinstance(ts, str) and ts:
+        return ts
+    return None
+
+
+def _before_cutoff(ts, cutoff):
+    """True when a session starts before an ISO cutoff, or has no ISO start."""
+    start = _session_timestamp(ts)
+    if start is None:
+        return True
+    return start < cutoff
+
+
 def iter_summaries(pricing, cutoff=None, project=None, exclude=None, progress=False,
                    skipped=None, warnings=None):
     """Yield cached_summary() results for every transcript under projects_dir(),
@@ -1153,7 +1173,7 @@ def iter_summaries(pricing, cutoff=None, project=None, exclude=None, progress=Fa
                 print(f"token-usage: parsed {parsed} transcripts…", file=sys.stderr)
         if exclude and s["path"] == exclude:
             continue
-        if cutoff and (s["first_ts"] or "") < cutoff:
+        if cutoff and _before_cutoff(s["first_ts"], cutoff):
             continue
         if project and project not in s["project"]:
             continue
@@ -2045,7 +2065,8 @@ def render_top_consumers(data):
                  "|---|---|---|---:|---:|---:|---:|---:|"]
         for r in data["rows"]:
             u = r["usage"]
-            lines.append(f"| {r['session_id']} | {r['project']} | {(r['first_ts'] or '')[:10]} "
+            started = _session_timestamp(r.get("first_ts")) or ""
+            lines.append(f"| {r['session_id']} | {r['project']} | {started[:10]} "
                          + _usage_cells(u, r["cost_usd"], r.get("partial")))
     else:
         lines = ["| Command | Sessions | Calls | Output | Input | Cache read | Cache write | Est. cost |",
@@ -2249,7 +2270,7 @@ def window_halves(summaries, cutoff, now=None):
 
     now_dt = _dt(now) if now else datetime.now(timezone.utc)
     mid = (_dt(cutoff) + (now_dt - _dt(cutoff)) / 2).strftime("%Y-%m-%dT%H:%M:%SZ")
-    placed = [s for s in summaries if s["first_ts"]]
+    placed = [s for s in summaries if _session_timestamp(s.get("first_ts"))]
     return ([s for s in placed if s["first_ts"] < mid],
             [s for s in placed if s["first_ts"] >= mid])
 
@@ -5217,7 +5238,7 @@ def iter_adapter_summaries(adapter, pricing, cutoff=None, project=None, exclude=
                 print(f"token-usage: parsed {parsed} sessions…", file=sys.stderr)
         if exclude and s["path"] == exclude:
             continue
-        if cutoff and (s["first_ts"] or "") < cutoff:
+        if cutoff and _before_cutoff(s["first_ts"], cutoff):
             continue
         if project and project not in s["project"]:
             continue
