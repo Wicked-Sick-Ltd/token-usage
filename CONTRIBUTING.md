@@ -47,7 +47,9 @@ python3 scripts/token_usage.py json  path/to/session.jsonl
 ## Testing a change
 
 Run the suite on both supported interpreters, with warnings as errors. CI
-runs exactly these three commands on a 3.9 / 3.12 matrix (`ruff==0.16.6`):
+runs exactly these three commands on a 3.9 / 3.12 matrix (`ruff==0.16.6`).
+The test job uses ubuntu-24.04, because actions/setup-python has no Python
+3.9 build for the current ubuntu-latest image:
 
 ```bash
 python3.9  -m pytest tests/ -v -W error    # the floor: no 3.10+ syntax

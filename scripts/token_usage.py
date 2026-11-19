@@ -4147,6 +4147,28 @@ class GeminiAdapter(RuntimeAdapter):
         return parsed
 
 
+def _antigravity_user_prompt(content):
+    """Prompt text for one Antigravity USER_INPUT, and whether it may be stripped.
+
+    A closed USER_REQUEST contributes its inner text. An unclosed tag keeps the
+    raw record, including the spaces after the tag: stripping those would turn
+    the preview into the tag alone, and a regex with overlapping whitespace
+    quantifiers backtracks across that run and stalls every scan that shares
+    this parser. The close is a literal search, so a missing close cannot
+    invent one either.
+    """
+    open_tag = "<USER_REQUEST>"
+    close_tag = "</USER_REQUEST>"
+    start = content.find(open_tag)
+    if start < 0:
+        return content, True
+    body = start + len(open_tag)
+    end = content.find(close_tag, body)
+    if end < 0:
+        return content, False
+    return content[body:end], True
+
+
 def _parse_antigravity_session(records):
     segments, pending, users, warnings = [], {}, set(), []
     active = None
@@ -4173,13 +4195,13 @@ def _parse_antigravity_session(records):
             users.add(sid)
             if "<CONTEXT_SUMMARY>" in content and "<USER_REQUEST>" not in content:
                 continue
-            m_req = re.search(r"<USER_REQUEST>\s*(.*?)\s*</USER_REQUEST>", content, re.DOTALL)
-            prompt = m_req.group(1) if m_req else content
+            prompt, strip_prompt = _antigravity_user_prompt(content)
             match = re.match(r"\s*([$\/][A-Za-z0-9][A-Za-z0-9_:-]*)\b", prompt)
+            preview = prompt.strip()[:120] if strip_prompt else prompt[:120]
             active = {
                 "label": match.group(1) if match else OTHER_LABEL,
                 "start_ts": ts,
-                "prompt": prompt.strip()[:120],
+                "prompt": preview,
                 "by_model": {},
                 "subagents": [],
             }
