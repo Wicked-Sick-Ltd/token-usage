@@ -460,7 +460,7 @@ def iter_jsonl(path):
                 continue
             try:
                 yield json.loads(line)
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, RecursionError):
                 continue
     # Once per file: summarize_transcript alone makes two passes, and a
     # long-lived MCP server re-reads the same transcript on every query.
@@ -574,7 +574,9 @@ def _resolve_agent_ts(path, ts=None, meta=None):
                             from datetime import datetime, timezone
                             return datetime.fromtimestamp(v, tz=timezone.utc).isoformat()
                         return str(v)
-        except (ValueError, OSError):
+        except (ValueError, OSError, RecursionError):
+            # Malformed, unreadable, or too-deep meta is optional.
+            # Fall through to journal.jsonl.
             pass
     journal_path = path.parent / "journal.jsonl"
     if journal_path.is_file():
@@ -670,7 +672,7 @@ def parse_session(transcript_path):
                 try:
                     meta = json.loads(meta_path.read_text(encoding="utf-8",
                                                           errors="replace"))
-                except (ValueError, OSError):   # ValueError: malformed JSON
+                except (ValueError, OSError, RecursionError):   # ValueError: malformed JSON
                     pass
             a_ts = _resolve_agent_ts(agent_file, a_ts, meta)
             idx = None
@@ -1137,7 +1139,7 @@ def iter_summaries(pricing, cutoff=None, project=None, exclude=None, progress=Fa
     for f in sorted(projects_dir().glob("*/*.jsonl")):
         try:
             s, hit = cached_summary(f, pricing, warnings)
-        except (OSError, ValueError, AttributeError) as e:
+        except (OSError, ValueError, AttributeError, RecursionError) as e:
             # OSError: unreadable/a directory. ValueError: UnreadableTranscript
             # (a transcript that parsed to nothing) and a corrupt cache entry's
             # own json.loads. AttributeError: a cache entry of the wrong shape.
@@ -2715,7 +2717,7 @@ def _cursor_decode_kv(raw):
     text = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else str(raw)
     try:
         return json.loads(text)
-    except ValueError:
+    except (ValueError, RecursionError):
         return None
 
 
@@ -2784,7 +2786,7 @@ def _cursor_folder_for_workspace(cursor_root, workspace_id):
         return None
     try:
         data = json.loads(ws_json.read_text(encoding="utf-8", errors="replace"))
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         return None
     folder = data.get("folder") or data.get("configuration", {}).get("folder")
     return _cursor_folder_uri_to_path(folder)
@@ -2826,7 +2828,7 @@ def _cursor_workspace_ids_for_project(cursor_root, project_dir):
     for ws_json in ws_root.glob("*/workspace.json"):
         try:
             data = json.loads(ws_json.read_text(encoding="utf-8", errors="replace"))
-        except (OSError, ValueError):
+        except (OSError, ValueError, RecursionError):
             continue
         folder = data.get("folder") or data.get("configuration", {}).get("folder")
         ws_path = _cursor_folder_uri_to_path(folder)
@@ -2958,7 +2960,7 @@ def _cursor_ledger_meta(path):
                     continue
                 try:
                     ev = json.loads(line)
-                except ValueError:
+                except (ValueError, RecursionError):
                     continue
                 if not isinstance(ev, dict):
                     continue
@@ -3230,7 +3232,7 @@ def _cursor_parse_hook_ledger(session, warnings):
             continue
         try:
             ev = json.loads(line)
-        except ValueError:
+        except (ValueError, RecursionError):
             continue
         if isinstance(ev, dict) and ev.get("generation_id"):
             events.append(ev)
@@ -3465,7 +3467,7 @@ def _cursor_parse_cloud_export(session, warnings):
     try:
         data = json.loads(session.export_path.read_text(encoding="utf-8",
                                                         errors="replace"))
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, RecursionError) as exc:
         warn(f"cannot read Cursor cloud export: {exc}", warnings)
         return segments, saw_tokens
     title = data.get("title") or data.get("name") or ""
@@ -3530,7 +3532,7 @@ class CursorAdapter(RuntimeAdapter):
             try:
                 data = json.loads(path.read_text(encoding="utf-8",
                                                  errors="replace"))
-            except (OSError, ValueError):
+            except (OSError, ValueError, RecursionError):
                 _cursor_fail_explicit_selector(
                     f"Cursor export is not readable JSON: {path}"
                 )
@@ -3974,7 +3976,7 @@ def _antigravity_cwd_from_record(record):
         if isinstance(args, str) and "Cwd" in args:
             try:
                 args = json.loads(args)
-            except ValueError:
+            except (ValueError, RecursionError):
                 args = None
         if isinstance(args, dict) and isinstance(args.get("Cwd"), str):
             cwd = _unquote_arg(args["Cwd"]).strip()
@@ -4226,7 +4228,7 @@ def _parse_antigravity_session(records):
             if isinstance(args, str) and "SKILL.md" in args:
                 try:
                     args = json.loads(args)
-                except ValueError:
+                except (ValueError, RecursionError):
                     args = {}
             if isinstance(args, dict):
                 for raw_val in args.values():
@@ -4626,7 +4628,7 @@ def _cursor_cloud_read_ledger(path):
     for line in lines:
         try:
             rec = json.loads(line)
-        except ValueError:
+        except (ValueError, RecursionError):
             continue
         if not isinstance(rec, dict):
             continue
@@ -5203,7 +5205,7 @@ def iter_adapter_summaries(adapter, pricing, cutoff=None, project=None, exclude=
         saw_any = True
         try:
             s, hit = cached_adapter_summary(adapter, source, pricing, warnings)
-        except (OSError, ValueError, AttributeError) as e:
+        except (OSError, ValueError, AttributeError, RecursionError) as e:
             desc = adapter.describe(source)
             warn(f"skipping unreadable {adapter.name} session {desc}: {e}")
             if skipped is not None:
@@ -5391,7 +5393,7 @@ def _hook_payload():
             return None
     try:
         payload = json.loads(raw.decode("utf-8", "replace"))
-    except ValueError:  # malformed JSON — never block Claude Code on it
+    except (ValueError, RecursionError):  # malformed JSON — never block Claude Code on it
         return None
     return payload if isinstance(payload, dict) else None
 
