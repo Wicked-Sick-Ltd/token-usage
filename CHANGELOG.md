@@ -6,6 +6,14 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`cursor-cloud-sync` can no longer page forever** — a usage response that
+  keeps `hasNextPage` set used to keep the sync, and its exclusive lock, going
+  indefinitely. Paging now needs a boolean `true` and a non-empty page. A
+  repeated page, more than 500 pages, a 10-minute sync, or an oversized or
+  trickled response body aborts the sync before any ledger is rewritten.
+
 ### Added
 
 - **`cursor-cloud` runtime for Cursor Cloud Agents** — attributes tokens and
