@@ -23,6 +23,8 @@ adheres to [Semantic Versioning](https://semver.org/).
   report, history, top-consumers, insights, dashboard, export and MCP tool then
   reads them with `runtime: "cursor-cloud"`. Cost uses Cursor's `chargedCents`
   instead of the pricing table. Opt-in: no key, no network; `auto` never picks it.
+  Both Cursor API calls refuse redirects, so a key never follows a `Location`
+  header off `api.cursor.com`.
   A stray `bc-*.jsonl` entry (a name that is not an agent id, or a directory,
   symlink or FIFO) is skipped with a warning instead of aborting every sync,
   and one agent's unwritable ledger no longer stops the others.
@@ -58,6 +60,30 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **One bad Codex rollout no longer breaks Codex discovery.** A `session_meta`
+  `cwd` that is not a string, contains a NUL byte, or points at a symlink loop
+  made the default project-scoped `report`, `json`, `live`, `export` and MCP
+  `session_cost` lookup exit with a traceback. A non-string `cwd` did the same
+  to `history`. Such a rollout is now left out of project matches, and a
+  non-string `cwd` is reported under `codex:unknown`.
+- **Text files check out as LF.** `.gitattributes` sets `eol=lf`. A Windows
+  checkout was adding a CR per line, which pushed `scripts/token_usage.py`
+  over the directory's 256 KiB review hold even though the committed blob
+  is under it.
+- **An unresolvable recorded path no longer aborts a corpus scan.** A Cursor
+  hook-ledger workspace root or `workspace.json` folder with an embedded NUL
+  byte (or an unknown `~user`) made pathlib raise `ValueError`/`RuntimeError`
+  instead of `OSError`, stopping every Cursor report, history, insights and
+  dashboard run. Such paths are now skipped, the hook no longer records NUL
+  roots, and the Codex project filter and Antigravity project hash get the
+  same treatment. The Codex filter resolves through that helper, so `~/` paths
+  match and a symlink-loop `cwd` is still skipped.
+- **Activity bridge turns with many tool calls.** Grouping a transcript into
+  turns now keeps the open turn's tool-call dedupe keys and result lookups as
+  calls are added. Before, every assistant record re-serialized every stored
+  call and every tool result rescanned the list, so one JSONL file with many
+  small tool-call lines held `sync` (and the live hook) on CPU and later files
+  in the walk were never published.
 - **Cursor cloud session lookup.** A symlink or other non-regular file at a
   ledger path is reported as not found. Lookup no longer opens it and aborts.
 - **Deeply nested JSON no longer stops a scan.** The activity bridge parses

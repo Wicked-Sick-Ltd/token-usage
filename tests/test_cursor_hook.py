@@ -143,6 +143,17 @@ def test_records_carry_workspace_roots(tmp_path):
     assert record["workspace_roots"] == ["/tmp/project"]
 
 
+def test_records_drop_workspace_roots_with_a_nul_byte(tmp_path):
+    r = run_cursor_hook(
+        base_payload(prompt="hi", hook_event_name="beforeSubmitPrompt",
+                     workspace_roots=["/tmp/nul\x00root", "/tmp/project"]),
+        tmp_path,
+    )
+    assert r.returncode == 0
+    record = read_ledger_lines(ledger_path(tmp_path, "conv-abc"))[0]
+    assert record["workspace_roots"] == ["/tmp/project"]
+
+
 def test_ledger_directory_is_private(tmp_path):
     r = run_cursor_hook(
         base_payload(prompt="hi", hook_event_name="beforeSubmitPrompt"),

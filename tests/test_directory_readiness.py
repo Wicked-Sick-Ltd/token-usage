@@ -150,6 +150,22 @@ def test_gitattributes_do_not_rewrite_archives():
             assert word not in text, f"{rel(p)} uses {word}, which stops directory validation"
 
 
+def test_text_files_check_out_as_lf():
+    """A CRLF checkout must not inflate a blob that is under the size hold.
+
+    Git for Windows sets core.autocrlf. Without eol=lf, stat() on
+    scripts/token_usage.py counts one extra byte per line and the Windows
+    native-copilot job holds the file for review.
+    """
+    attrs = PLUGIN_ROOT / ".gitattributes"
+    assert attrs.is_file()
+    assert "* text=auto eol=lf" in attrs.read_text(encoding="utf-8")
+    script = PLUGIN_ROOT / "scripts" / "token_usage.py"
+    blob = script.read_bytes()
+    assert b"\r" not in blob
+    assert script.stat().st_size == len(blob) < MAX_FILE_BYTES
+
+
 def _prose_words(markdown):
     prose = re.sub(r"```.*?```", " ", markdown, flags=re.DOTALL)
     return re.findall(r"[A-Za-z0-9][\w'’-]*", prose)

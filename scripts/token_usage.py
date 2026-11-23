@@ -2573,6 +2573,20 @@ def project_slug(path_str):
     return re.sub(r"[^A-Za-z0-9]", "-", path_str)
 
 
+def _resolve_recorded_path(value):
+    """A path string read from a transcript or ledger, resolved; None if unusable.
+
+    Recorded paths are untrusted text. pathlib raises ValueError for an
+    embedded NUL and RuntimeError for an unknown ~user, neither of which is
+    an OSError, and one bad record must not abort a whole corpus scan."""
+    if not isinstance(value, str) or not value or "\0" in value:
+        return None
+    try:
+        return Path(value).expanduser().resolve()
+    except (OSError, ValueError, RuntimeError):
+        return None
+
+
 def _newest(paths):
     paths = list(paths)
     return max(paths, key=lambda p: p.stat().st_mtime) if paths else None
@@ -2824,10 +2838,7 @@ def _cursor_folder_uri_to_path(folder_uri):
     path = urllib.parse.unquote(parsed.path)
     if sys.platform == "win32" and path.startswith("/") and len(path) > 2 and path[2] == ":":
         path = path[1:]
-    try:
-        return Path(path).expanduser().resolve()
-    except OSError:
-        return None
+    return _resolve_recorded_path(path)
 
 
 def _cursor_folder_for_workspace(cursor_root, workspace_id):
@@ -3038,10 +3049,9 @@ def _cursor_ledger_meta(path):
 def _cursor_project_path_from_roots(roots):
     """The workspace root a hook-captured conversation belongs to, or None."""
     for root in roots or []:
-        try:
-            return Path(root).expanduser().resolve()
-        except OSError:
-            continue
+        resolved = _resolve_recorded_path(root)
+        if resolved is not None:
+            return resolved
     return None
 
 
@@ -3122,7 +3132,8 @@ def _cursor_workspace_roots_from_payload(payload):
         roots = [roots]
     if not isinstance(roots, list):
         return None
-    cleaned = [r.strip() for r in roots if isinstance(r, str) and r.strip()]
+    cleaned = [r.strip() for r in roots
+               if isinstance(r, str) and r.strip() and "\0" not in r]
     return cleaned or None
 
 
@@ -3719,6 +3730,17 @@ def codex_metadata(path):
     return {}
 
 
+def codex_cwd_path(meta):
+    """Resolved rollout cwd, or None when the rollout's cwd is unusable.
+
+    The shared helper skips a non-string, an embedded NUL, an unknown ~user,
+    and a symlink loop (RuntimeError on Python < 3.13). expanduser() runs
+    first so a recorded ~/path matches the project filter the same way Cursor
+    and Antigravity do.
+    """
+    return _resolve_recorded_path(meta.get("cwd"))
+
+
 def is_codex_transcript(path):
     try:
         return bool(codex_metadata(path))
@@ -3744,8 +3766,7 @@ class CodexAdapter(RuntimeAdapter):
                 sid = meta.get("id") or meta.get("session_id")
                 if not sid or sid in seen:
                     continue
-                if target is not None and (
-                        not meta.get("cwd") or Path(meta["cwd"]).resolve() != target):
+                if target is not None and codex_cwd_path(meta) != target:
                     continue
                 seen.add(sid)
                 yield path
@@ -3777,7 +3798,8 @@ class CodexAdapter(RuntimeAdapter):
         return meta.get("id") or meta.get("session_id") or Path(source).stem
 
     def project(self, source):
-        return project_slug(codex_metadata(source).get("cwd") or "codex:unknown")
+        cwd = codex_metadata(source).get("cwd")
+        return project_slug(cwd if isinstance(cwd, str) and cwd else "codex:unknown")
 
     def describe(self, source):
         return str(source)
@@ -4061,12 +4083,13 @@ def gemini_metadata(path):
             sid = p.stem
         resolved_cwd = None
         project_hash = None
-        if cwd:
-            try:
-                resolved_cwd = str(Path(cwd).expanduser().resolve())
-                project_hash = hashlib.sha256(resolved_cwd.encode()).hexdigest()
-            except OSError:
-                resolved_cwd = cwd
+        resolved = _resolve_recorded_path(cwd)
+        if resolved is not None:
+            resolved_cwd = str(resolved)
+            project_hash = hashlib.sha256(
+                resolved_cwd.encode("utf-8", "surrogatepass")).hexdigest()
+        elif cwd and "\0" not in cwd:
+            resolved_cwd = cwd
         if parent_sid == sid:
             parent_sid = None
         return {
@@ -4685,8 +4708,21 @@ def _cursor_cloud_ms_to_iso(ms):
             .strftime("%Y-%m-%dT%H:%M:%S.") + f"{value % 1000:03d}Z")
 
 
+def _cursor_cloud_opener():
+    import urllib.request
+
+    class RefuseRedirects(urllib.request.HTTPRedirectHandler):
+        # urllib copies Authorization onto the redirected request, whatever
+        # its host. Declining makes every 3xx an HTTPError instead.
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None
+
+    return urllib.request.build_opener(RefuseRedirects)
+
+
 def _cursor_cloud_request(method, path, api_key, body=None, timeout=60):
-    """One Basic-auth call to the Cursor API. The key never leaves this frame."""
+    """One Basic-auth call to the Cursor API. The key never leaves this frame,
+    and the request never leaves CURSOR_API_BASE: redirects are refused."""
     import base64
     import urllib.error
     import urllib.request
@@ -4698,7 +4734,10 @@ def _cursor_cloud_request(method, path, api_key, body=None, timeout=60):
         req.add_header("Content-Type", "application/json")
     deadline = time.monotonic() + 2 * timeout
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:  # fixed https host
+        # The opener refuses redirects, so the key stays on CURSOR_API_BASE.
+        # The body read is capped in size and time; urlopen's socket timeout
+        # restarts on every chunk and would not.
+        with _cursor_cloud_opener().open(req, timeout=timeout) as resp:
             return json.loads(_cursor_cloud_read_body(resp, path, deadline))
     except urllib.error.HTTPError as exc:
         detail = exc.read(200).decode("utf-8", "replace")

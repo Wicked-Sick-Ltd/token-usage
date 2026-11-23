@@ -499,6 +499,47 @@ def test_ledger_session_takes_project_identity_from_workspace_roots(tu, tmp_path
     assert list(adapter.iter_sessions(project_dir=str(tmp_path / "elsewhere"))) == []
 
 
+@pytest.mark.parametrize("bad_root", ["/tmp/nul\x00root", "~no-such-user-token-usage/repo"])
+def test_unresolvable_workspace_root_does_not_abort_the_ledger_scan(tu, tmp_path, monkeypatch,
+                                                                    bad_root):
+    # The ledger directory is writable by anything running as the user, so a
+    # root pathlib refuses (ValueError for NUL, RuntimeError for an unknown
+    # ~user) must cost that root, not every Cursor session in the corpus.
+    monkeypatch.setenv("TOKEN_USAGE_LEDGER_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("TOKEN_USAGE_CURSOR_DIR", str(tmp_path / "cursor-user"))
+    project = tmp_path / "repo"
+    project.mkdir()
+    write_ledger(tu, tmp_path / "cache", "conv-bad", [
+        ledger_record("beforeSubmitPrompt", conversation_id="conv-bad",
+                      workspace_roots=[bad_root], prompt="poisoned"),
+    ])
+    write_ledger(tu, tmp_path / "cache", "conv-fallback", [
+        ledger_record("beforeSubmitPrompt", conversation_id="conv-fallback",
+                      workspace_roots=[bad_root, str(project)], prompt="work"),
+    ])
+    adapter = tu.get_runtime_adapter("cursor")
+    sessions = {s.composer_id: s for s in adapter.iter_sessions()}
+    assert set(sessions) == {"conv-bad", "conv-fallback"}
+    assert sessions["conv-bad"].project_path is None
+    assert sessions["conv-fallback"].project_path == project.resolve()
+    assert [s.composer_id for s in adapter.iter_sessions(project_dir=str(project))] \
+        == ["conv-fallback"]
+
+
+def test_nul_byte_in_workspace_folder_uri_does_not_abort_the_composer_scan(tu, tmp_path,
+                                                                          monkeypatch):
+    cursor_root = tmp_path / "cursor-user"
+    build_cursor_tree(cursor_root)
+    (cursor_root / "workspaceStorage" / "ws-project-alpha" / "workspace.json").write_text(
+        json.dumps({"folder": "file:///tmp/nul%00folder"}), encoding="utf-8")
+    monkeypatch.setenv("TOKEN_USAGE_CURSOR_DIR", str(cursor_root))
+    adapter = tu.get_runtime_adapter("cursor")
+    sessions = list(adapter.iter_sessions())
+    assert [s.composer_id for s in sessions] == ["comp-usage-001"]
+    assert sessions[0].project_path is None
+    assert list(adapter.iter_sessions(project_dir=str(tmp_path / "elsewhere"))) == []
+
+
 def test_ledger_without_workspace_roots_keeps_the_hooks_project(tu, tmp_path, monkeypatch):
     monkeypatch.setenv("TOKEN_USAGE_LEDGER_DIR", str(tmp_path / "cache"))
     monkeypatch.setenv("TOKEN_USAGE_CURSOR_DIR", str(tmp_path / "cursor-user"))
