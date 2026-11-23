@@ -55,6 +55,12 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **One bad Codex rollout no longer breaks Codex discovery.** A `session_meta`
+  `cwd` that is not a string, contains a NUL byte, or points at a symlink loop
+  made the default project-scoped `report`, `json`, `live`, `export` and MCP
+  `session_cost` lookup exit with a traceback. A non-string `cwd` did the same
+  to `history`. Such a rollout is now left out of project matches, and a
+  non-string `cwd` is reported under `codex:unknown`.
 - **Deeply nested JSON no longer stops a scan.** The activity bridge parses
   transcript lines, tool-argument strings and hook stdin with a 256-level
   nesting limit and treats anything deeper as malformed. `sync` skips a file
