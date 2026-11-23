@@ -75,6 +75,12 @@ adheres to [Semantic Versioning](https://semver.org/).
   roots, and the Codex project filter and Antigravity project hash get the
   same treatment. The Codex filter resolves through that helper, so `~/` paths
   match and a symlink-loop `cwd` is still skipped.
+- **Activity bridge turns with many tool calls.** Grouping a transcript into
+  turns now keeps the open turn's tool-call dedupe keys and result lookups as
+  calls are added. Before, every assistant record re-serialized every stored
+  call and every tool result rescanned the list, so one JSONL file with many
+  small tool-call lines held `sync` (and the live hook) on CPU and later files
+  in the walk were never published.
 - **Deeply nested JSON no longer stops a scan.** The activity bridge parses
   transcript lines, tool-argument strings and hook stdin with a 256-level
   nesting limit and treats anything deeper as malformed. `sync` skips a file
