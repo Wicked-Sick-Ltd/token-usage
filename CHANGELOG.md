@@ -23,6 +23,8 @@ adheres to [Semantic Versioning](https://semver.org/).
   report, history, top-consumers, insights, dashboard, export and MCP tool then
   reads them with `runtime: "cursor-cloud"`. Cost uses Cursor's `chargedCents`
   instead of the pricing table. Opt-in: no key, no network; `auto` never picks it.
+  Both Cursor API calls refuse redirects, so a key never follows a `Location`
+  header off `api.cursor.com`.
 - **Opt-in llm1 activity stream bridge** — `scripts/activity_bridge.py` and
   `bin/token-usage-activity-sync`. Cursor (`beforeSubmitPrompt`, `stop`,
   `subagentStop`), Claude Code and Codex hooks forward a turn when
@@ -55,13 +57,20 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **One bad Codex rollout no longer breaks Codex discovery.** A `session_meta`
+  `cwd` that is not a string, contains a NUL byte, or points at a symlink loop
+  made the default project-scoped `report`, `json`, `live`, `export` and MCP
+  `session_cost` lookup exit with a traceback. A non-string `cwd` did the same
+  to `history`. Such a rollout is now left out of project matches, and a
+  non-string `cwd` is reported under `codex:unknown`.
 - **An unresolvable recorded path no longer aborts a corpus scan.** A Cursor
   hook-ledger workspace root or `workspace.json` folder with an embedded NUL
   byte (or an unknown `~user`) made pathlib raise `ValueError`/`RuntimeError`
   instead of `OSError`, stopping every Cursor report, history, insights and
   dashboard run. Such paths are now skipped, the hook no longer records NUL
   roots, and the Codex project filter and Antigravity project hash get the
-  same treatment.
+  same treatment. The Codex filter resolves through that helper, so `~/` paths
+  match and a symlink-loop `cwd` is still skipped.
 - **Deeply nested JSON no longer stops a scan.** The activity bridge parses
   transcript lines, tool-argument strings and hook stdin with a 256-level
   nesting limit and treats anything deeper as malformed. `sync` skips a file

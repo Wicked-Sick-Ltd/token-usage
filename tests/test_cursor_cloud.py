@@ -6,6 +6,7 @@ import subprocess
 import sys
 import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
@@ -449,8 +450,18 @@ def test_sync_deadline_aborts_slow_endless_paging(tu, cloud_dir, monkeypatch):
     assert calls == [1]
 
 
+class _Opener:
+    """Stand-in for the redirect-refusing opener used by the real request."""
+
+    def __init__(self, resp):
+        self.resp = resp
+
+    def open(self, req, timeout=None):
+        return self.resp
+
+
 class _StreamingResponse:
-    """urlopen() stand-in that streams an endless JSON body in chunks."""
+    """Response stand-in that streams an endless JSON body in chunks."""
 
     def __init__(self, chunk=b" " * 65536):
         self.chunk = chunk
@@ -479,25 +490,22 @@ class _StreamingResponse:
 
 
 def test_request_bounds_the_response_body(tu, monkeypatch):
-    import urllib.request
     resp = _StreamingResponse()
-    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: resp)
+    monkeypatch.setattr(tu, "_cursor_cloud_opener", lambda: _Opener(resp))
     with pytest.raises(RuntimeError, match="larger than"):
         tu._cursor_cloud_request("POST", "/teams/filtered-usage-events", "test-admin-key", {})
     assert resp.sent <= tu.CURSOR_CLOUD_MAX_RESPONSE_BYTES + 65536
 
 
 def test_request_bounds_the_time_spent_reading_the_body(tu, monkeypatch):
-    import urllib.request
     resp = _StreamingResponse(chunk=b" ")
-    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: resp)
+    monkeypatch.setattr(tu, "_cursor_cloud_opener", lambda: _Opener(resp))
     with pytest.raises(RuntimeError, match="too long"):
         tu._cursor_cloud_request("POST", "/teams/filtered-usage-events", "test-admin-key", {},
                                  timeout=0)
 
 
 def test_request_still_parses_a_normal_body(tu, monkeypatch):
-    import urllib.request
     body = FIXTURE.read_bytes()
 
     class Once(_StreamingResponse):
@@ -508,7 +516,7 @@ def test_request_still_parses_a_normal_body(tu, monkeypatch):
         def read(self, amt=None):
             return self._next(len(self.chunk) if amt is None or amt < 0 else amt)
 
-    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: Once(body))
+    monkeypatch.setattr(tu, "_cursor_cloud_opener", lambda: _Opener(Once(body)))
     got = tu._cursor_cloud_request("POST", "/teams/filtered-usage-events", "test-admin-key", {})
     assert got == json.loads(body)
 
@@ -532,4 +540,125 @@ def test_cache_write_tokens_use_shared_write_buckets(tu, cloud_dir):
     assert usage["cache_5m"] == 39331
     assert usage["cache_1h"] == 0
     assert tu.aggregate(parsed["segments"], {})["total"]["cost_usd"] == pytest.approx(0.2168)
+
+
+class _Recorder(BaseHTTPRequestHandler):
+    """Another host: records whatever reaches it, answers like the API would."""
+    seen = None
+
+    def _answer(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        if length:
+            self.rfile.read(length)
+        self.seen.append((self.command, self.path, self.headers.get("Authorization")))
+        body = json.dumps({"usageEvents": [], "pagination": {"hasNextPage": False}}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    do_GET = do_POST = _answer
+
+    def log_message(self, fmt, *args):
+        return
+
+
+@contextlib.contextmanager
+def _serve(handler):
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server.server_address[1]
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def _loopback_redirect_location(port, path):
+    """Location for the stand-in API.
+
+    The request target is copied into a response header. Drop CR and LF first
+    so that target cannot split the response."""
+    return f"http://localhost:{port}{path}".replace("\n", "").replace("\r", "")
+
+
+@contextlib.contextmanager
+def _redirecting_api(tu, monkeypatch, code, redirect_paths=None):
+    """CURSOR_API_BASE pointed at a local stand-in whose answer is a `code`
+    redirect to a different host (localhost, not 127.0.0.1). Paths outside
+    `redirect_paths` get the fixture instead. Yields what that host received."""
+    seen = []
+    recorder = type("Recorder", (_Recorder,), {"seen": seen})
+    payload = FIXTURE.read_bytes()
+    with _serve(recorder) as other_port:
+        class Api(BaseHTTPRequestHandler):
+            def _answer(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                if length:
+                    self.rfile.read(length)
+                if redirect_paths is None or self.path in redirect_paths:
+                    self.send_response(code)
+                    self.send_header("Location", _loopback_redirect_location(other_port, self.path))
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            do_GET = do_POST = _answer
+
+            def log_message(self, fmt, *args):
+                return
+
+        with _serve(Api) as api_port:
+            for var in ("http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY",
+                        "all_proxy", "ALL_PROXY"):
+                monkeypatch.delenv(var, raising=False)
+            monkeypatch.setenv("no_proxy", "*")
+            monkeypatch.setattr(tu, "CURSOR_API_BASE", f"http://127.0.0.1:{api_port}")
+            yield seen
+
+
+REDIRECT_CODES = (301, 302, 303, 307, 308)
+
+
+def test_redirect_location_cannot_split_the_response():
+    plain = _loopback_redirect_location(9, "/teams/filtered-usage-events")
+    assert plain == "http://localhost:9/teams/filtered-usage-events"
+    injected = _loopback_redirect_location(9, "/v0/agents/bc\r\nX-Injected: 1\n")
+    assert injected == "http://localhost:9/v0/agents/bcX-Injected: 1"
+    assert "\r" not in injected and "\n" not in injected
+
+
+@pytest.mark.parametrize("code", REDIRECT_CODES)
+@pytest.mark.parametrize("method,path,body", [
+    ("POST", "/teams/filtered-usage-events", {"cloudAgentId": "*", "page": 1}),
+    ("GET", f"/v0/agents/{AGENT_A}", None),
+])
+def test_request_refuses_redirects_and_keeps_the_key_on_the_api_host(
+        tu, monkeypatch, code, method, path, body):
+    with _redirecting_api(tu, monkeypatch, code) as seen, \
+            pytest.raises(RuntimeError, match=f"HTTP {code}"):
+        tu._cursor_cloud_request(method, path, "placeholder-key", body=body, timeout=5)
+    assert seen == []
+
+
+@pytest.mark.parametrize("code", REDIRECT_CODES)
+def test_sync_never_sends_either_key_to_a_redirect_target(tu, cloud_dir, monkeypatch, code):
+    with _redirecting_api(tu, monkeypatch, code) as seen, \
+            pytest.raises(RuntimeError, match=f"HTTP {code}"):
+        tu.sync_cursor_cloud(since="2026-11-13", api_key="placeholder-admin-key",
+                             user_key="placeholder-user-key", now_ms=NOW_MS)
+    assert seen == []
+    agent_paths = {f"/v0/agents/{a}" for a in (AGENT_A, AGENT_B)}
+    with _redirecting_api(tu, monkeypatch, code, redirect_paths=agent_paths) as seen:
+        result = tu.sync_cursor_cloud(since="2026-11-13", api_key="placeholder-admin-key",
+                                      user_key="placeholder-user-key", now_ms=NOW_MS)
+    assert result["agents"] == [AGENT_A, AGENT_B]
+    assert seen == []
 
