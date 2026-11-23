@@ -67,6 +67,9 @@ ENV_NAMES = (
     "TOKEN_USAGE_LEDGER_DIR",
 )
 FIELD_LIMIT = 20000
+JSON_MAX_DEPTH = 256
+# A string token never fails to match, so the scan stays linear on unterminated input.
+_JSON_TOKEN = re.compile(r'"[^"\\]*(?:\\.[^"\\]*)*"?|[\[\]{}]', re.DOTALL)
 _GIT_CACHE = {}
 _DISABLED = {"0", "off", "false", "no"}
 _TRANSCRIPT_GENERATION = "__transcript__"
@@ -267,6 +270,33 @@ def _text(value):
     if value is None:
         return ""
     return str(value).strip()
+
+
+def _json_too_deep(text, limit=JSON_MAX_DEPTH):
+    if text.count("{") + text.count("[") <= limit:
+        return False
+    depth = 0
+    for match in _JSON_TOKEN.finditer(text):
+        char = text[match.start()]
+        if char == '"':
+            continue
+        if char in "[{":
+            depth += 1
+            if depth > limit:
+                return True
+        else:
+            depth -= 1
+    return False
+
+
+def load_json(text):
+    """json.loads for transcript and hook input. Too deep is malformed: ValueError."""
+    if _json_too_deep(text):
+        raise ValueError(f"JSON nested deeper than {JSON_MAX_DEPTH} levels")
+    try:
+        return json.loads(text)
+    except RecursionError as exc:
+        raise ValueError("JSON nested too deeply") from exc
 
 
 def _timeout(raw):
@@ -1839,7 +1869,7 @@ def _coerce_input(value):
         stripped = value.strip()
         if stripped[:1] in "{[":
             try:
-                return json.loads(stripped)
+                return load_json(stripped)
             except ValueError:
                 return value
         return value
@@ -2267,7 +2297,7 @@ def _iter_records(path):
                 if not line:
                     continue
                 try:
-                    rec = json.loads(line)
+                    rec = load_json(line)
                 except ValueError:
                     continue
                 if isinstance(rec, dict):
@@ -2970,7 +3000,12 @@ def sync_tree(root, config, poster=None, vendor="", surface="", flush_limit=50):
     try:
         bridge.flush(flush_limit)
         for path in iter_jsonl(root):
-            sync_file(bridge, path, config, vendor=vendor, surface=surface)
+            try:
+                sync_file(bridge, path, config, vendor=vendor, surface=surface)
+            except Exception as exc:  # noqa: BLE001 — one transcript must not stop the walk
+                if bridge.store.db.in_transaction:
+                    bridge.store.db.rollback()
+                _warn(f"activity-bridge: skipped {path}: {type(exc).__name__}: {exc}")
         return bridge.delivered, bridge.spooled
     finally:
         bridge.close()
@@ -3101,7 +3136,7 @@ def _read_payload():
     if not raw:
         return None
     try:
-        payload = json.loads(raw.decode("utf-8", "replace"))
+        payload = load_json(raw.decode("utf-8", "replace"))
     except ValueError:
         return None
     return payload if isinstance(payload, dict) else None

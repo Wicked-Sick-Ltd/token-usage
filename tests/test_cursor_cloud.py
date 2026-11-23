@@ -354,6 +354,165 @@ def test_concurrent_autosync_does_not_clobber_high_water(tu, cloud_dir, monkeypa
     assert "last_attempt_ms" in state
 
 
+RUNAWAY_GUARD = 2000  # far above any page cap; only reached if paging never stops
+
+
+def endless_api(page_for, calls):
+    """A usage API that sets hasNextPage on every page it ever serves."""
+    def request(method, path, key, body=None):
+        if path.startswith("/v0/agents/"):
+            return {}
+        calls.append(body["page"])
+        if len(calls) > RUNAWAY_GUARD:
+            raise AssertionError(f"still paging after {RUNAWAY_GUARD} requests")
+        return page_for(body["page"])
+    return request
+
+
+def usage_row(ts):
+    return {"timestamp": str(ts), "cloudAgentId": AGENT_A, "conversationId": "c",
+            "model": "m", "tokenUsage": {"inputTokens": 1, "outputTokens": 1},
+            "chargedCents": 1}
+
+
+def ledger_lines(cloud_dir):
+    return (cloud_dir / f"{AGENT_A}.jsonl").read_text().splitlines()
+
+
+def test_empty_page_ends_pagination_even_if_has_next_page(tu, cloud_dir):
+    calls = []
+    result = sync(tu, since="2026-11-13", request=endless_api(
+        lambda page: {"usageEvents": [], "pagination": {"hasNextPage": True}}, calls))
+    assert calls == [1]
+    assert result["events"] == 0
+
+
+def test_only_boolean_true_has_next_page_continues(tu, cloud_dir):
+    payload = json.loads(FIXTURE.read_text())
+    for flag in ("false", "yes", 1, [0], {"x": 1}):
+        calls = []
+        sync(tu, since="2026-11-13", request=endless_api(
+            lambda page, flag=flag: dict(payload, pagination={"hasNextPage": flag}), calls))
+        assert calls == [1], flag
+
+
+def test_repeated_page_aborts_without_touching_ledgers(tu, cloud_dir):
+    sync(tu, since="2026-11-13")
+    before = ledger_lines(cloud_dir)
+    state_before = (cloud_dir / ".sync-state.json").read_text()
+    calls = []
+    stuck = {"usageEvents": [usage_row(1794592800000)], "pagination": {"hasNextPage": True}}
+    with pytest.raises(RuntimeError, match="same page"):
+        sync(tu, since="2026-11-13", request=endless_api(lambda page: stuck, calls))
+    assert calls == [1, 2]
+    assert ledger_lines(cloud_dir) == before
+    assert (cloud_dir / ".sync-state.json").read_text() == state_before
+
+
+def test_page_cap_aborts_endless_distinct_pages_and_releases_the_lock(tu, cloud_dir):
+    sync(tu, since="2026-11-13")
+    before = ledger_lines(cloud_dir)
+    calls = []
+
+    def page_for(page):
+        return {"usageEvents": [usage_row(1794592800000 + page)],
+                "pagination": {"hasNextPage": True}}
+
+    with pytest.raises(RuntimeError, match="pages"):
+        sync(tu, since="2026-11-13", request=endless_api(page_for, calls))
+    assert len(calls) == tu.CURSOR_CLOUD_MAX_PAGES
+    assert ledger_lines(cloud_dir) == before
+    with tu._cursor_cloud_lock():  # a later sync is not blocked
+        pass
+
+
+def test_page_cap_counts_across_windows(tu, cloud_dir, monkeypatch):
+    monkeypatch.setattr(tu, "CURSOR_CLOUD_MAX_PAGES", 5, raising=False)
+    calls = []
+    one_page = {"usageEvents": [usage_row(1794592800000)], "pagination": {"hasNextPage": False}}
+    with pytest.raises(RuntimeError, match="pages"):
+        # ~13 thirty-day windows, one page each
+        sync(tu, since="2025-11-13", request=endless_api(lambda page: one_page, calls))
+    assert len(calls) == 5
+
+
+def test_sync_deadline_aborts_slow_endless_paging(tu, cloud_dir, monkeypatch):
+    monkeypatch.setattr(tu, "CURSOR_CLOUD_SYNC_DEADLINE_S", 0, raising=False)
+    calls = []
+
+    def page_for(page):
+        return {"usageEvents": [usage_row(1794592800000 + page)],
+                "pagination": {"hasNextPage": True}}
+
+    with pytest.raises(RuntimeError, match="deadline"):
+        sync(tu, since="2026-11-13", request=endless_api(page_for, calls))
+    assert calls == [1]
+
+
+class _StreamingResponse:
+    """urlopen() stand-in that streams an endless JSON body in chunks."""
+
+    def __init__(self, chunk=b" " * 65536):
+        self.chunk = chunk
+        self.sent = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def _next(self, amt):
+        if self.sent > 4 * (1 << 30):
+            raise AssertionError("client kept reading an endless body")
+        data = self.chunk[:amt] if amt and amt > 0 else self.chunk
+        self.sent += len(data)
+        return data
+
+    def read(self, amt=None):
+        if amt is None or amt < 0:
+            raise AssertionError("unbounded read of the response body")
+        return self._next(amt)
+
+    def read1(self, amt=-1):
+        return self._next(amt)
+
+
+def test_request_bounds_the_response_body(tu, monkeypatch):
+    import urllib.request
+    resp = _StreamingResponse()
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: resp)
+    with pytest.raises(RuntimeError, match="larger than"):
+        tu._cursor_cloud_request("POST", "/teams/filtered-usage-events", "test-admin-key", {})
+    assert resp.sent <= tu.CURSOR_CLOUD_MAX_RESPONSE_BYTES + 65536
+
+
+def test_request_bounds_the_time_spent_reading_the_body(tu, monkeypatch):
+    import urllib.request
+    resp = _StreamingResponse(chunk=b" ")
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: resp)
+    with pytest.raises(RuntimeError, match="too long"):
+        tu._cursor_cloud_request("POST", "/teams/filtered-usage-events", "test-admin-key", {},
+                                 timeout=0)
+
+
+def test_request_still_parses_a_normal_body(tu, monkeypatch):
+    import urllib.request
+    body = FIXTURE.read_bytes()
+
+    class Once(_StreamingResponse):
+        def _next(self, amt):
+            data, self.chunk = self.chunk[:amt], self.chunk[amt:]
+            return data
+
+        def read(self, amt=None):
+            return self._next(len(self.chunk) if amt is None or amt < 0 else amt)
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: Once(body))
+    got = tu._cursor_cloud_request("POST", "/teams/filtered-usage-events", "test-admin-key", {})
+    assert got == json.loads(body)
+
+
 def test_cache_write_tokens_use_shared_write_buckets(tu, cloud_dir):
     # Admin API cacheWriteTokens have no TTL. Other runtimes put the same
     # kind of counter in cache_5m (Codex cache_write_input_tokens, Cursor
