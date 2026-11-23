@@ -28,7 +28,7 @@ Every listing is manually reviewed and must be open source.
 |---|---|
 | Name | `token-usage` |
 | Display name | Token Usage Profiler |
-| Description | AI agent plugin. Attribute Cursor, Claude Code, Cowork, Codex, Google Antigravity, Gemini CLI, and Copilot CLI token usage to the work that consumed it — per-activity breakdowns, subagent rollups, cross-session history, live session ledger, cache-aware API-price estimates, and a bundled MCP server with optional Cursor hook attribution |
+| Description | AI agent plugin that works with any AI agent. Attributes token usage to the work that consumed it — per-activity breakdowns, subagent rollups, cross-session history, live session ledger, cache-aware API-price estimates, and a bundled MCP server with optional Cursor hook attribution |
 | Category | Developer Tools |
 | Homepage and documentation | https://github.com/Wicked-Sick-Ltd/token-usage#readme |
 | Support | https://github.com/Wicked-Sick-Ltd/token-usage/issues (email: hello@wickedsick.com) |

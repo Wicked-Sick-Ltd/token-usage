@@ -6,6 +6,14 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`cursor-cloud-sync` can no longer page forever** — a usage response that
+  keeps `hasNextPage` set used to keep the sync, and its exclusive lock, going
+  indefinitely. Paging now needs a boolean `true` and a non-empty page. A
+  repeated page, more than 500 pages, a 10-minute sync, or an oversized or
+  trickled response body aborts the sync before any ledger is rewritten.
+
 ### Added
 
 - **`cursor-cloud` runtime for Cursor Cloud Agents** — attributes tokens and
@@ -53,6 +61,11 @@ adheres to [Semantic Versioning](https://semver.org/).
   `session_cost` lookup exit with a traceback. A non-string `cwd` did the same
   to `history`. Such a rollout is now left out of project matches, and a
   non-string `cwd` is reported under `codex:unknown`.
+- **Deeply nested JSON no longer stops a scan.** The activity bridge parses
+  transcript lines, tool-argument strings and hook stdin with a 256-level
+  nesting limit and treats anything deeper as malformed. `sync` skips a file
+  that still fails and goes on to the next one. The analyser and MCP server
+  skip a line or file too deep for `json` instead of crashing.
 - **Activity bridge usage accounting.** A trailing prompt no longer marks a
   generation included when the transcript has no counters for that turn. Turn
   allocation holds the high-water read, insert, and update in one immediate

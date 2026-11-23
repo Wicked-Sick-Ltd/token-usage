@@ -7,7 +7,9 @@ permissions:
   contents: read
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # ubuntu-24.04: actions/setup-python has no Python 3.9 build for the
+    # current ubuntu-latest image, and this job is the 3.9 floor.
+    runs-on: ubuntu-24.04
     strategy:
       matrix:
         python-version: ["3.9", "3.12"]
