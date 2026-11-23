@@ -25,6 +25,9 @@ adheres to [Semantic Versioning](https://semver.org/).
   instead of the pricing table. Opt-in: no key, no network; `auto` never picks it.
   Both Cursor API calls refuse redirects, so a key never follows a `Location`
   header off `api.cursor.com`.
+  A stray `bc-*.jsonl` entry (a name that is not an agent id, or a directory,
+  symlink or FIFO) is skipped with a warning instead of aborting every sync,
+  and one agent's unwritable ledger no longer stops the others.
 - **Opt-in llm1 activity stream bridge** — `scripts/activity_bridge.py` and
   `bin/token-usage-activity-sync`. Cursor (`beforeSubmitPrompt`, `stop`,
   `subagentStop`), Claude Code and Codex hooks forward a turn when
@@ -81,6 +84,8 @@ adheres to [Semantic Versioning](https://semver.org/).
   call and every tool result rescanned the list, so one JSONL file with many
   small tool-call lines held `sync` (and the live hook) on CPU and later files
   in the walk were never published.
+- **Cursor cloud session lookup.** A symlink or other non-regular file at a
+  ledger path is reported as not found. Lookup no longer opens it and aborts.
 - **Deeply nested JSON no longer stops a scan.** The activity bridge parses
   transcript lines, tool-argument strings and hook stdin with a 256-level
   nesting limit and treats anything deeper as malformed. `sync` skips a file

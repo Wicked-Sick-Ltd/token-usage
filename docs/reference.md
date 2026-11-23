@@ -146,6 +146,8 @@ Pulls Cursor Cloud Agent usage events from the Cursor Admin API (`POST /teams/fi
 
 Exits non-zero with a message when the key is missing or the API rejects it. The key is never printed or stored.
 
+A `bc-*.jsonl` entry whose name is not a Cloud Agent id, or that is not a regular file (a directory, symlink, FIFO or socket), is skipped with a warning naming it. An agent whose ledger cannot be read or written is skipped with a warning while every other agent still syncs. If that agent had new rows, the incremental cursor does not move, so the next sync fetches them again. An explicit lookup of that entry, by agent id or by a `.jsonl` path (`json`, `report`, and the MCP session tools), reports the session as not found. It does not open the entry.
+
 Paging continues only while a page has rows and `pagination.hasNextPage` is the JSON boolean `true`. A sync stops with an error, leaving the ledgers and the incremental cursor unchanged, when the API returns the same page twice, after 500 pages (1000 events each), after 10 minutes, or when a response body is larger than 32 MiB or takes more than twice the 60-second request timeout to arrive. Narrow `--since` or use `--agent` to resume.
 
 ### Hook commands

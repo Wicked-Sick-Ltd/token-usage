@@ -163,6 +163,157 @@ def test_rejects_non_agent_ids(tu, cloud_dir):
     assert tu.get_runtime_adapter("cursor-cloud").locate("not-an-agent") is None
 
 
+@pytest.mark.parametrize("odd", ["bc-x.jsonl", "bc-not_an_id!.jsonl"])
+def test_sync_skips_ledger_names_that_are_not_agent_ids(tu, cloud_dir, odd):
+    cloud_dir.mkdir(parents=True)
+    (cloud_dir / odd).write_text("")
+    warnings = []
+    result = sync(tu, warnings=warnings, now_ms=NOW_MS)
+    assert result["agents"] == [AGENT_A, AGENT_B]
+    assert (cloud_dir / f"{AGENT_A}.jsonl").is_file()
+    state = json.loads((cloud_dir / ".sync-state.json").read_text())
+    assert state["high_water_ms"] == NOW_MS
+    assert any(repr(odd) in w for w in warnings)
+    adapter = tu.get_runtime_adapter("cursor-cloud")
+    assert sorted(p.name for p in adapter.iter_sessions()) == [f"{AGENT_A}.jsonl", f"{AGENT_B}.jsonl"]
+
+
+def test_sync_skips_a_ledger_name_that_is_not_a_regular_file(tu, cloud_dir):
+    stray = "bc-00000000-0000-4000-8000-00000000cccc"
+    (cloud_dir / f"{stray}.jsonl").mkdir(parents=True)
+    warnings = []
+    result = sync(tu, warnings=warnings, now_ms=NOW_MS)
+    assert result["agents"] == [AGENT_A, AGENT_B]
+    assert (cloud_dir / f"{AGENT_B}.jsonl").is_file()
+    state = json.loads((cloud_dir / ".sync-state.json").read_text())
+    assert state["high_water_ms"] == NOW_MS
+    assert any(f"{stray}.jsonl" in w for w in warnings)
+
+
+def test_one_unwritable_fetched_ledger_does_not_stop_the_others(tu, cloud_dir):
+    # A non-file squatting on a real agent's ledger name: that agent is
+    # skipped, every other agent still refreshes, and the cursor holds so
+    # the skipped agent's events are fetched again next time.
+    (cloud_dir / f"{AGENT_A}.jsonl").mkdir(parents=True)
+    warnings = []
+    result = sync(tu, warnings=warnings, since="2026-11-13", now_ms=NOW_MS)
+    assert (cloud_dir / f"{AGENT_B}.jsonl").is_file()
+    assert result["events"] == 1
+    state = json.loads((cloud_dir / ".sync-state.json").read_text())
+    assert "high_water_ms" not in state and state["last_sync_ms"] == NOW_MS
+    assert any(AGENT_A in w for w in warnings)
+    (cloud_dir / f"{AGENT_A}.jsonl").rmdir()
+    sync(tu, since="2026-11-13", now_ms=NOW_MS + 1)
+    assert (cloud_dir / f"{AGENT_A}.jsonl").is_file()
+    state = json.loads((cloud_dir / ".sync-state.json").read_text())
+    assert state["high_water_ms"] == NOW_MS + 1
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs mkfifo")
+def test_a_fifo_at_a_ledger_name_does_not_hang_the_sync(tu, cloud_dir):
+    sync(tu, since="2026-11-13")
+    fifo = cloud_dir / f"{AGENT_A}.jsonl"
+    fifo.unlink()
+    os.mkfifo(fifo)
+    warnings, done = [], []
+    worker = threading.Thread(daemon=True, target=lambda: done.append(
+        sync(tu, warnings=warnings, since="2026-11-13", now_ms=NOW_MS + 1)))
+    worker.start()
+    worker.join(timeout=5)
+    if worker.is_alive():
+        # Release the blocked reader so the thread can finish.
+        os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
+        worker.join(timeout=5)
+        pytest.fail("sync blocked opening a FIFO named like a ledger")
+    assert done and (cloud_dir / f"{AGENT_B}.jsonl").is_file()
+    assert any(f"{AGENT_A}.jsonl" in w for w in warnings)
+    assert tu.get_runtime_adapter("cursor-cloud").locate(AGENT_A) is None
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs mkfifo")
+def test_a_fifo_at_the_ledger_temp_name_does_not_hang_the_sync(tu, cloud_dir):
+    cloud_dir.mkdir(parents=True)
+    fifo = cloud_dir / f"{AGENT_A}.jsonl.{os.getpid()}.tmp"
+    os.mkfifo(fifo)
+    warnings, done = [], []
+    worker = threading.Thread(daemon=True, target=lambda: done.append(
+        sync(tu, warnings=warnings, since="2026-11-13")))
+    worker.start()
+    worker.join(timeout=5)
+    if worker.is_alive():
+        os.close(os.open(fifo, os.O_RDONLY | os.O_NONBLOCK))
+        worker.join(timeout=5)
+        pytest.fail("sync blocked writing through a FIFO at the temp name")
+    assert done and (cloud_dir / f"{AGENT_B}.jsonl").is_file()
+    assert not fifo.exists()
+    assert any(f"{AGENT_A}.jsonl" in w for w in warnings)
+    sync(tu, since="2026-11-13", now_ms=NOW_MS + 1)
+    assert (cloud_dir / f"{AGENT_A}.jsonl").is_file()
+
+
+def _open_fd_count():
+    return len(list(Path("/proc/self/fd").iterdir()))
+
+
+@pytest.mark.skipif(not Path("/proc/self/fd").is_dir(), reason="needs /proc/self/fd")
+def test_ledger_helpers_release_descriptors(tu, tmp_path, monkeypatch):
+    path = tmp_path / "ledger.jsonl"
+    before = _open_fd_count()
+    tu._write_regular_file(path, "alpha\n")
+    assert tu._cursor_cloud_read_ledger(path) == (None, [])
+    assert path.read_text(encoding="utf-8") == "alpha\n"
+    assert _open_fd_count() == before
+
+    def fdopen_fails(*_a, **_k):
+        raise OSError("fdopen failed")
+
+    monkeypatch.setattr(os, "fdopen", fdopen_fails)
+    with pytest.raises(OSError, match="fdopen failed"):
+        tu._write_regular_file(path, "beta\n")
+    with pytest.raises(OSError, match="fdopen failed"):
+        tu._cursor_cloud_read_ledger(path)
+    assert _open_fd_count() == before
+
+
+def test_symlink_ledger_lookup_reports_not_found(tu, mcp, cloud_dir, tmp_path):
+    cloud_dir.mkdir(parents=True)
+    target = tmp_path / "real.jsonl"
+    target.write_text(json.dumps({
+        "type": "usage", "timestamp": "1794592800000", "cloudAgentId": AGENT_A,
+        "model": "m", "chargedCents": 1,
+    }) + "\n")
+    link = cloud_dir / f"{AGENT_A}.jsonl"
+    link.symlink_to(target)
+    assert link.is_file()
+    adapter = tu.get_runtime_adapter("cursor-cloud")
+    assert adapter.locate(AGENT_A) is None
+    assert adapter.locate(str(link)) is None
+    with pytest.raises(mcp.ToolError, match="session found"):
+        mcp.tool_session_cost({"runtime": "cursor-cloud", "session_id": AGENT_A})
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPT), "json", "--runtime", "cursor-cloud", AGENT_A],
+        capture_output=True, text=True, env=dict(os.environ), check=False)
+    assert proc.returncode != 0
+    assert "Traceback" not in proc.stderr
+    assert "session found" in proc.stderr
+    # A real ledger at the same name is still found.
+    link.unlink()
+    target.replace(link)
+    assert adapter.locate(AGENT_A) == link
+
+
+def test_cli_sync_survives_an_odd_ledger_name(tu, cloud_dir, monkeypatch, capsys):
+    cloud_dir.mkdir(parents=True)
+    (cloud_dir / "bc-x.jsonl").write_text("")
+    monkeypatch.setenv("CURSOR_ADMIN_API_KEY", "test-admin-key")
+    monkeypatch.setattr(tu, "_cursor_cloud_request", fake_api())
+    monkeypatch.setattr(sys, "argv", ["token_usage.py", "cursor-cloud-sync", "--json"])
+    tu.main()
+    out = json.loads(capsys.readouterr().out)
+    assert out["agents"] == [AGENT_A, AGENT_B]
+    assert any("bc-x.jsonl" in w for w in out["warnings"])
+
+
 def test_cli_sync_without_key_fails_cleanly(cloud_dir):
     env = {k: v for k, v in os.environ.items() if k != "CURSOR_ADMIN_API_KEY"}
     proc = subprocess.run([sys.executable, str(SCRIPT), "cursor-cloud-sync", "--since", "1d"],
