@@ -73,6 +73,65 @@ def test_discovery_is_authoritative_and_archives_deduplicate(tu, tmp_path, monke
     assert adapter.locate() == p
 
 
+def add_rollout_with_cwd(tu, tmp_path, monkeypatch, cwd):
+    bad = make_rollout(tmp_path, monkeypatch, sid="zz-bad-cwd")
+    rows = list(tu.iter_jsonl(bad))
+    rows[0]["payload"]["cwd"] = cwd
+    write_jsonl(bad, rows)
+    return bad
+
+
+@pytest.mark.parametrize("bad_cwd", ["/tmp/nul\x00cwd", 7])
+def test_unresolvable_cwd_does_not_abort_project_discovery(tu, tmp_path, monkeypatch, bad_cwd):
+    p = make_rollout(tmp_path, monkeypatch)
+    write_jsonl(tu.codex_home() / "sessions/2026/10/02/rollout-bad.jsonl",
+                [event("session_meta", {"id": "thread-bad", "cwd": bad_cwd})])
+    adapter = tu.get_runtime_adapter("codex")
+    assert list(adapter.all_sessions(project_dir=tmp_path / "project")) == [p]
+    assert adapter.locate(project_dir=tmp_path / "project") == p
+
+
+@pytest.mark.parametrize("cwd", ["\x00", "/tmp/project\x00evil", 5, ["/tmp/project"]])
+def test_project_scoped_discovery_skips_unusable_cwd(tu, tmp_path, monkeypatch, cwd):
+    good = make_rollout(tmp_path, monkeypatch)
+    add_rollout_with_cwd(tu, tmp_path, monkeypatch, cwd)
+    adapter = tu.get_runtime_adapter("codex")
+    project = tmp_path / "project"
+    assert list(adapter.all_sessions(project_dir=project)) == [good]
+    assert adapter.locate(project_dir=project) == good
+
+
+def test_project_scoped_discovery_skips_symlink_loop_cwd(tu, tmp_path, monkeypatch):
+    good = make_rollout(tmp_path, monkeypatch)
+    loop = tmp_path / "loop"
+    loop.symlink_to(loop)
+    add_rollout_with_cwd(tu, tmp_path, monkeypatch, str(loop))
+    adapter = tu.get_runtime_adapter("codex")
+    assert list(adapter.all_sessions(project_dir=tmp_path / "project")) == [good]
+
+
+@pytest.mark.parametrize("cwd", ["/tmp/project\x00evil", 5, ["/tmp/project"]])
+def test_history_survives_unusable_cwd(tu, tmp_path, monkeypatch, cwd):
+    make_rollout(tmp_path, monkeypatch)
+    bad = add_rollout_with_cwd(tu, tmp_path, monkeypatch, cwd)
+    history = tu.run_history(runtime="codex")
+    assert len(history["rows"]) == 2
+    if not isinstance(cwd, str):
+        assert tu.get_runtime_adapter("codex").project(bad) == "codex-unknown"
+
+
+def test_default_report_survives_nul_cwd_rollout(tu, tmp_path, monkeypatch):
+    make_rollout(tmp_path, monkeypatch)
+    add_rollout_with_cwd(tu, tmp_path, monkeypatch, "/tmp/project\x00evil")
+    project = tmp_path / "project"
+    project.mkdir()
+    proc = subprocess.run([sys.executable, str(SCRIPT), "report", "--runtime", "codex"],
+                          cwd=project, capture_output=True, text=True, check=False,
+                          env=dict(os.environ, PYTHONUTF8="1"), encoding="utf-8")
+    assert proc.returncode == 0, proc.stderr
+    assert "$review" in proc.stdout
+
+
 def test_auto_detects_content_not_jsonl_suffix(tu, tmp_path, monkeypatch):
     p = make_rollout(tmp_path, monkeypatch)
     assert tu.resolve_runtime("auto", str(p))[1] == "codex"

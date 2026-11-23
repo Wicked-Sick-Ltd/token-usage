@@ -31,7 +31,9 @@ exceeds its input can be reported as `partial` instead of silently clamped.
 Ledger records also carry the workspace roots, which give a hook-captured
 session its project identity (`history --by project`, `--project`, and
 `project_dir` discovery); a session whose payloads carried none falls back to
-the `cursor-hooks` project.
+the `cursor-hooks` project. The hook drops a root that contains a NUL byte, and
+discovery skips any recorded root or workspace folder that cannot be resolved
+(NUL byte, unknown `~user`), so one bad ledger line cannot abort a scan.
 
 The hook command is **fail-open**: it appends to a local ledger and never blocks
 the agent. Prompt text in the ledger is truncated to the same 120-character
@@ -257,7 +259,7 @@ The `cursor` runtime reads local Cursor data. Cloud Agent runs (`bc-…` ids) wr
 
 Mapping: `inputTokens` → input, `outputTokens` → output, `cacheReadTokens` → cache_read, `cacheWriteTokens` → the shared cache-write bucket (`cache_5m`; `cache_1h` stays 0 because the Admin API does not expose a cache TTL). This matches Codex (`cache_write_input_tokens`) and the Cursor IDE adapter (`cacheWriteTokens`). It is a cache write, not a claim that the write used a 5-minute TTL. Cost per model is the sum of `chargedCents` / 100, which carries through `session_cost`, `history` (all `--by` modes), `top_consumers`, `insights`, `dashboard` and `export` in place of the pricing-table estimate. A row without `chargedCents` falls back to `tokenUsage.totalCents`; a row with neither marks the session `partial`.
 
-Keys: `CURSOR_ADMIN_API_KEY` must be a **Team Admin API key** (Basic auth, `read:*` scope or higher), created by a team admin in the Cursor dashboard. A user API key returns `401 Invalid Team API Key` on this endpoint. `CURSOR_API_KEY` (a user key) is optional and only adds names and repositories. Neither key is written to disk or logged.
+Keys: `CURSOR_ADMIN_API_KEY` must be a **Team Admin API key** (Basic auth, `read:*` scope or higher), created by a team admin in the Cursor dashboard. A user API key returns `401 Invalid Team API Key` on this endpoint. `CURSOR_API_KEY` (a user key) is optional and only adds names and repositories. Neither key is written to disk or logged. Both requests refuse redirects: a 3xx answer fails the call (`Cursor API … returned HTTP 302`) instead of resending the Authorization header to the `Location` URL.
 
 Rate limits: the endpoint allows 60 requests per minute per team and aggregates hourly. Automatic syncs run at most every 15 minutes and fetch up to 1000 rows per page in windows of at most 30 days.
 
