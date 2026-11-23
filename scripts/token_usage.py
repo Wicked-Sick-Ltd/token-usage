@@ -2541,6 +2541,20 @@ def project_slug(path_str):
     return re.sub(r"[^A-Za-z0-9]", "-", path_str)
 
 
+def _resolve_recorded_path(value):
+    """A path string read from a transcript or ledger, resolved; None if unusable.
+
+    Recorded paths are untrusted text. pathlib raises ValueError for an
+    embedded NUL and RuntimeError for an unknown ~user, neither of which is
+    an OSError, and one bad record must not abort a whole corpus scan."""
+    if not isinstance(value, str) or not value or "\0" in value:
+        return None
+    try:
+        return Path(value).expanduser().resolve()
+    except (OSError, ValueError, RuntimeError):
+        return None
+
+
 def _newest(paths):
     paths = list(paths)
     return max(paths, key=lambda p: p.stat().st_mtime) if paths else None
@@ -2792,10 +2806,7 @@ def _cursor_folder_uri_to_path(folder_uri):
     path = urllib.parse.unquote(parsed.path)
     if sys.platform == "win32" and path.startswith("/") and len(path) > 2 and path[2] == ":":
         path = path[1:]
-    try:
-        return Path(path).expanduser().resolve()
-    except OSError:
-        return None
+    return _resolve_recorded_path(path)
 
 
 def _cursor_folder_for_workspace(cursor_root, workspace_id):
@@ -3006,10 +3017,9 @@ def _cursor_ledger_meta(path):
 def _cursor_project_path_from_roots(roots):
     """The workspace root a hook-captured conversation belongs to, or None."""
     for root in roots or []:
-        try:
-            return Path(root).expanduser().resolve()
-        except OSError:
-            continue
+        resolved = _resolve_recorded_path(root)
+        if resolved is not None:
+            return resolved
     return None
 
 
@@ -3090,7 +3100,8 @@ def _cursor_workspace_roots_from_payload(payload):
         roots = [roots]
     if not isinstance(roots, list):
         return None
-    cleaned = [r.strip() for r in roots if isinstance(r, str) and r.strip()]
+    cleaned = [r.strip() for r in roots
+               if isinstance(r, str) and r.strip() and "\0" not in r]
     return cleaned or None
 
 
@@ -3688,15 +3699,14 @@ def codex_metadata(path):
 
 
 def codex_cwd_path(meta):
-    """Resolved rollout cwd, or None when the rollout's cwd is unusable."""
-    cwd = meta.get("cwd")
-    if not isinstance(cwd, str) or not cwd or "\x00" in cwd:
-        return None
-    try:
-        return Path(cwd).resolve()
-    except (OSError, ValueError, RuntimeError):
-        # RuntimeError is how Python < 3.13 reports a symlink loop.
-        return None
+    """Resolved rollout cwd, or None when the rollout's cwd is unusable.
+
+    The shared helper skips a non-string, an embedded NUL, an unknown ~user,
+    and a symlink loop (RuntimeError on Python < 3.13). expanduser() runs
+    first so a recorded ~/path matches the project filter the same way Cursor
+    and Antigravity do.
+    """
+    return _resolve_recorded_path(meta.get("cwd"))
 
 
 def is_codex_transcript(path):
@@ -4041,12 +4051,13 @@ def gemini_metadata(path):
             sid = p.stem
         resolved_cwd = None
         project_hash = None
-        if cwd:
-            try:
-                resolved_cwd = str(Path(cwd).expanduser().resolve())
-                project_hash = hashlib.sha256(resolved_cwd.encode()).hexdigest()
-            except OSError:
-                resolved_cwd = cwd
+        resolved = _resolve_recorded_path(cwd)
+        if resolved is not None:
+            resolved_cwd = str(resolved)
+            project_hash = hashlib.sha256(
+                resolved_cwd.encode("utf-8", "surrogatepass")).hexdigest()
+        elif cwd and "\0" not in cwd:
+            resolved_cwd = cwd
         if parent_sid == sid:
             parent_sid = None
         return {

@@ -81,6 +81,16 @@ def add_rollout_with_cwd(tu, tmp_path, monkeypatch, cwd):
     return bad
 
 
+@pytest.mark.parametrize("bad_cwd", ["/tmp/nul\x00cwd", 7])
+def test_unresolvable_cwd_does_not_abort_project_discovery(tu, tmp_path, monkeypatch, bad_cwd):
+    p = make_rollout(tmp_path, monkeypatch)
+    write_jsonl(tu.codex_home() / "sessions/2026/10/02/rollout-bad.jsonl",
+                [event("session_meta", {"id": "thread-bad", "cwd": bad_cwd})])
+    adapter = tu.get_runtime_adapter("codex")
+    assert list(adapter.all_sessions(project_dir=tmp_path / "project")) == [p]
+    assert adapter.locate(project_dir=tmp_path / "project") == p
+
+
 @pytest.mark.parametrize("cwd", ["\x00", "/tmp/project\x00evil", 5, ["/tmp/project"]])
 def test_project_scoped_discovery_skips_unusable_cwd(tu, tmp_path, monkeypatch, cwd):
     good = make_rollout(tmp_path, monkeypatch)

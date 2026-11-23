@@ -464,6 +464,27 @@ def hook_ledger_corpus(tu, tmp_path, monkeypatch, project=None):
     ])
 
 
+def test_nul_byte_workspace_root_does_not_abort_cursor_commands(tu, tmp_path, monkeypatch):
+    from test_cursor_adapter import ledger_record, write_ledger
+
+    hook_ledger_corpus(tu, tmp_path, monkeypatch)
+    poisoned = write_ledger(tu, tmp_path / "cache", "conv-poisoned", [
+        ledger_record("beforeSubmitPrompt", conversation_id="conv-poisoned",
+                      workspace_roots=["/tmp/nul\x00root"], prompt="poisoned"),
+    ])
+    os.utime(poisoned, (2_000_000_000, 2_000_000_000))
+    env = _env(tmp_path, tmp_path / "cursor-user")
+    for args in (["history", "--runtime", "cursor", "--json"],
+                 ["insights", "--runtime", "cursor", "--json"],
+                 ["report", "--runtime", "cursor"]):
+        r = subprocess.run([sys.executable, str(SCRIPT), *args],
+                           capture_output=True, text=True, env=env, check=False)
+        assert r.returncode == 0, (args, r.stderr)
+        assert "Traceback" not in r.stderr, args
+    history = tu.run_history(by="day", since="2026-01-01", runtime="cursor")
+    assert [r["usage"]["output"] for r in history["rows"]] == [100]
+
+
 def test_hook_ledger_session_respects_since_and_day_windows(tu, tmp_path, monkeypatch):
     hook_ledger_corpus(tu, tmp_path, monkeypatch)
     inside = tu.run_history(by="day", since="2026-01-01", runtime="cursor")

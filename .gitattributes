@@ -1,0 +1,4 @@
+# Check text out as LF. core.autocrlf on Windows otherwise adds a CR per
+# line, and scripts/token_usage.py then crosses the directory's 256 KiB hold
+# even though the committed blob is under it.
+* text=auto eol=lf

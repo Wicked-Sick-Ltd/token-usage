@@ -219,6 +219,25 @@ def test_antigravity_accounting_discovery_skills_and_children(tu, mcp, tmp_path,
     assert with_child["segments"][-1]["subagents"][0]["output_tokens"] == 12
 
 
+@pytest.mark.parametrize("bad_cwd", ["/tmp/nul\x00cwd", "/tmp/lone-\udc80-surrogate"])
+def test_antigravity_unusable_cwd_does_not_abort_discovery_or_parse(tu, tmp_path, monkeypatch,
+                                                                    bad_cwd):
+    path = antigravity_recording(tmp_path, monkeypatch)
+    sibling = path.parents[3] / "ag-poisoned" / ".system_generated" / "logs" / "transcript.jsonl"
+    write_jsonl(sibling, [{"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT",
+                           "status": "DONE", "created_at": "2026-10-18T10:00:06Z",
+                           "cwd": bad_cwd, "content": "poisoned"}])
+    adapter = tu.get_runtime_adapter("gemini")
+    meta = tu.gemini_metadata(sibling)
+    assert meta["sessionId"] == "ag-poisoned"
+    if "\x00" in bad_cwd:
+        assert meta["projectHash"] is None
+        assert meta["project"] is None
+    assert list(adapter.iter_sessions(tmp_path / "project")) == [path]
+    parsed = adapter.parse(path)
+    assert tu.aggregate(parsed["segments"], {})["total"]["usage"]["output"] == 40
+
+
 def test_antigravity_stop_hook_and_native_plugin_manifests(tmp_path, monkeypatch):
     path = antigravity_recording(tmp_path, monkeypatch)
     ledger_dir = tmp_path / "ledger"

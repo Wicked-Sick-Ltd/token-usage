@@ -63,6 +63,18 @@ adheres to [Semantic Versioning](https://semver.org/).
   `session_cost` lookup exit with a traceback. A non-string `cwd` did the same
   to `history`. Such a rollout is now left out of project matches, and a
   non-string `cwd` is reported under `codex:unknown`.
+- **Text files check out as LF.** `.gitattributes` sets `eol=lf`. A Windows
+  checkout was adding a CR per line, which pushed `scripts/token_usage.py`
+  over the directory's 256 KiB review hold even though the committed blob
+  is under it.
+- **An unresolvable recorded path no longer aborts a corpus scan.** A Cursor
+  hook-ledger workspace root or `workspace.json` folder with an embedded NUL
+  byte (or an unknown `~user`) made pathlib raise `ValueError`/`RuntimeError`
+  instead of `OSError`, stopping every Cursor report, history, insights and
+  dashboard run. Such paths are now skipped, the hook no longer records NUL
+  roots, and the Codex project filter and Antigravity project hash get the
+  same treatment. The Codex filter resolves through that helper, so `~/` paths
+  match and a symlink-loop `cwd` is still skipped.
 - **Deeply nested JSON no longer stops a scan.** The activity bridge parses
   transcript lines, tool-argument strings and hook stdin with a 256-level
   nesting limit and treats anything deeper as malformed. `sync` skips a file
