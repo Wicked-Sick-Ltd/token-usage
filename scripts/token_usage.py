@@ -460,7 +460,7 @@ def iter_jsonl(path):
                 continue
             try:
                 yield json.loads(line)
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, RecursionError):
                 continue
     # Once per file: summarize_transcript alone makes two passes, and a
     # long-lived MCP server re-reads the same transcript on every query.
@@ -574,7 +574,9 @@ def _resolve_agent_ts(path, ts=None, meta=None):
                             from datetime import datetime, timezone
                             return datetime.fromtimestamp(v, tz=timezone.utc).isoformat()
                         return str(v)
-        except (ValueError, OSError):
+        except (ValueError, OSError, RecursionError):
+            # Malformed, unreadable, or too-deep meta is optional.
+            # Fall through to journal.jsonl.
             pass
     journal_path = path.parent / "journal.jsonl"
     if journal_path.is_file():
@@ -670,7 +672,7 @@ def parse_session(transcript_path):
                 try:
                     meta = json.loads(meta_path.read_text(encoding="utf-8",
                                                           errors="replace"))
-                except (ValueError, OSError):   # ValueError: malformed JSON
+                except (ValueError, OSError, RecursionError):   # ValueError: malformed JSON
                     pass
             a_ts = _resolve_agent_ts(agent_file, a_ts, meta)
             idx = None
@@ -987,7 +989,7 @@ def summarize_transcript(path, pricing, st=None):
         "mtime_ns": st.st_mtime_ns, "size": st.st_size,
         "pricing": pricing_fingerprint(pricing),
         "project": path.parent.name,
-        "first_ts": next((s["start_ts"] for s in segs if s["start_ts"]), None),
+        "first_ts": _session_timestamp(next((s["start_ts"] for s in segs if s["start_ts"]), None)),
         # "unpriced": this label used at least one model with no rates, so
         # its cost_usd covers only part of its usage (v4 of the index; a
         # per-session cost is not enough to spot mixing inside one label).
@@ -1111,6 +1113,26 @@ def _local_day(ts):
         return ts[:10]
 
 
+def _session_timestamp(ts):
+    """An ISO timestamp, or None when the value cannot be ordered as one.
+
+    The opening user turn is stored as first_ts. A number or a boolean there
+    is not a start time: comparing it with an ISO cutoff raises TypeError
+    outside the per-file handler and aborts the corpus scan.
+    """
+    if isinstance(ts, str) and ts:
+        return ts
+    return None
+
+
+def _before_cutoff(ts, cutoff):
+    """True when a session starts before an ISO cutoff, or has no ISO start."""
+    start = _session_timestamp(ts)
+    if start is None:
+        return True
+    return start < cutoff
+
+
 def iter_summaries(pricing, cutoff=None, project=None, exclude=None, progress=False,
                    skipped=None, warnings=None):
     """Yield cached_summary() results for every transcript under projects_dir(),
@@ -1137,7 +1159,7 @@ def iter_summaries(pricing, cutoff=None, project=None, exclude=None, progress=Fa
     for f in sorted(projects_dir().glob("*/*.jsonl")):
         try:
             s, hit = cached_summary(f, pricing, warnings)
-        except (OSError, ValueError, AttributeError) as e:
+        except (OSError, ValueError, AttributeError, RecursionError) as e:
             # OSError: unreadable/a directory. ValueError: UnreadableTranscript
             # (a transcript that parsed to nothing) and a corrupt cache entry's
             # own json.loads. AttributeError: a cache entry of the wrong shape.
@@ -1151,7 +1173,7 @@ def iter_summaries(pricing, cutoff=None, project=None, exclude=None, progress=Fa
                 print(f"token-usage: parsed {parsed} transcripts…", file=sys.stderr)
         if exclude and s["path"] == exclude:
             continue
-        if cutoff and (s["first_ts"] or "") < cutoff:
+        if cutoff and _before_cutoff(s["first_ts"], cutoff):
             continue
         if project and project not in s["project"]:
             continue
@@ -2043,7 +2065,8 @@ def render_top_consumers(data):
                  "|---|---|---|---:|---:|---:|---:|---:|"]
         for r in data["rows"]:
             u = r["usage"]
-            lines.append(f"| {r['session_id']} | {r['project']} | {(r['first_ts'] or '')[:10]} "
+            started = _session_timestamp(r.get("first_ts")) or ""
+            lines.append(f"| {r['session_id']} | {r['project']} | {started[:10]} "
                          + _usage_cells(u, r["cost_usd"], r.get("partial")))
     else:
         lines = ["| Command | Sessions | Calls | Output | Input | Cache read | Cache write | Est. cost |",
@@ -2247,7 +2270,7 @@ def window_halves(summaries, cutoff, now=None):
 
     now_dt = _dt(now) if now else datetime.now(timezone.utc)
     mid = (_dt(cutoff) + (now_dt - _dt(cutoff)) / 2).strftime("%Y-%m-%dT%H:%M:%SZ")
-    placed = [s for s in summaries if s["first_ts"]]
+    placed = [s for s in summaries if _session_timestamp(s.get("first_ts"))]
     return ([s for s in placed if s["first_ts"] < mid],
             [s for s in placed if s["first_ts"] >= mid])
 
@@ -2729,7 +2752,7 @@ def _cursor_decode_kv(raw):
     text = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else str(raw)
     try:
         return json.loads(text)
-    except ValueError:
+    except (ValueError, RecursionError):
         return None
 
 
@@ -2795,7 +2818,7 @@ def _cursor_folder_for_workspace(cursor_root, workspace_id):
         return None
     try:
         data = json.loads(ws_json.read_text(encoding="utf-8", errors="replace"))
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         return None
     folder = data.get("folder") or data.get("configuration", {}).get("folder")
     return _cursor_folder_uri_to_path(folder)
@@ -2837,7 +2860,7 @@ def _cursor_workspace_ids_for_project(cursor_root, project_dir):
     for ws_json in ws_root.glob("*/workspace.json"):
         try:
             data = json.loads(ws_json.read_text(encoding="utf-8", errors="replace"))
-        except (OSError, ValueError):
+        except (OSError, ValueError, RecursionError):
             continue
         folder = data.get("folder") or data.get("configuration", {}).get("folder")
         ws_path = _cursor_folder_uri_to_path(folder)
@@ -2969,7 +2992,7 @@ def _cursor_ledger_meta(path):
                     continue
                 try:
                     ev = json.loads(line)
-                except ValueError:
+                except (ValueError, RecursionError):
                     continue
                 if not isinstance(ev, dict):
                     continue
@@ -3241,7 +3264,7 @@ def _cursor_parse_hook_ledger(session, warnings):
             continue
         try:
             ev = json.loads(line)
-        except ValueError:
+        except (ValueError, RecursionError):
             continue
         if isinstance(ev, dict) and ev.get("generation_id"):
             events.append(ev)
@@ -3476,7 +3499,7 @@ def _cursor_parse_cloud_export(session, warnings):
     try:
         data = json.loads(session.export_path.read_text(encoding="utf-8",
                                                         errors="replace"))
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, RecursionError) as exc:
         warn(f"cannot read Cursor cloud export: {exc}", warnings)
         return segments, saw_tokens
     title = data.get("title") or data.get("name") or ""
@@ -3541,7 +3564,7 @@ class CursorAdapter(RuntimeAdapter):
             try:
                 data = json.loads(path.read_text(encoding="utf-8",
                                                  errors="replace"))
-            except (OSError, ValueError):
+            except (OSError, ValueError, RecursionError):
                 _cursor_fail_explicit_selector(
                     f"Cursor export is not readable JSON: {path}"
                 )
@@ -3984,7 +4007,7 @@ def _antigravity_cwd_from_record(record):
         if isinstance(args, str) and "Cwd" in args:
             try:
                 args = json.loads(args)
-            except ValueError:
+            except (ValueError, RecursionError):
                 args = None
         if isinstance(args, dict) and isinstance(args.get("Cwd"), str):
             cwd = _unquote_arg(args["Cwd"]).strip()
@@ -4092,7 +4115,17 @@ class GeminiAdapter(RuntimeAdapter):
 
     def project(self, source):
         meta = gemini_metadata(source)
-        return meta.get("project") or meta.get("projectHash") or "gemini:unknown"
+        # Grouping and `project in name` both require a string. A legacy
+        # snapshot can store project as a list, object, or number; that value
+        # is not a name. Keep the session under its hash instead of aborting
+        # the corpus scan that groups or filters on the name.
+        name = meta.get("project")
+        if isinstance(name, str) and name:
+            return name
+        project_hash = meta.get("projectHash")
+        if isinstance(project_hash, str) and project_hash:
+            return project_hash
+        return "gemini:unknown"
 
     def describe(self, source):
         return str(source)
@@ -4158,6 +4191,28 @@ class GeminiAdapter(RuntimeAdapter):
         return parsed
 
 
+def _antigravity_user_prompt(content):
+    """Prompt text for one Antigravity USER_INPUT, and whether it may be stripped.
+
+    A closed USER_REQUEST contributes its inner text. An unclosed tag keeps the
+    raw record, including the spaces after the tag: stripping those would turn
+    the preview into the tag alone, and a regex with overlapping whitespace
+    quantifiers backtracks across that run and stalls every scan that shares
+    this parser. The close is a literal search, so a missing close cannot
+    invent one either.
+    """
+    open_tag = "<USER_REQUEST>"
+    close_tag = "</USER_REQUEST>"
+    start = content.find(open_tag)
+    if start < 0:
+        return content, True
+    body = start + len(open_tag)
+    end = content.find(close_tag, body)
+    if end < 0:
+        return content, False
+    return content[body:end], True
+
+
 def _parse_antigravity_session(records):
     segments, pending, users, warnings = [], {}, set(), []
     active = None
@@ -4184,13 +4239,13 @@ def _parse_antigravity_session(records):
             users.add(sid)
             if "<CONTEXT_SUMMARY>" in content and "<USER_REQUEST>" not in content:
                 continue
-            m_req = re.search(r"<USER_REQUEST>\s*(.*?)\s*</USER_REQUEST>", content, re.DOTALL)
-            prompt = m_req.group(1) if m_req else content
+            prompt, strip_prompt = _antigravity_user_prompt(content)
             match = re.match(r"\s*([$\/][A-Za-z0-9][A-Za-z0-9_:-]*)\b", prompt)
+            preview = prompt.strip()[:120] if strip_prompt else prompt[:120]
             active = {
                 "label": match.group(1) if match else OTHER_LABEL,
                 "start_ts": ts,
-                "prompt": prompt.strip()[:120],
+                "prompt": preview,
                 "by_model": {},
                 "subagents": [],
             }
@@ -4205,7 +4260,7 @@ def _parse_antigravity_session(records):
             if isinstance(args, str) and "SKILL.md" in args:
                 try:
                     args = json.loads(args)
-                except ValueError:
+                except (ValueError, RecursionError):
                     args = {}
             if isinstance(args, dict):
                 for raw_val in args.values():
@@ -4535,6 +4590,12 @@ CURSOR_CLOUD_DEFAULT_SINCE_DAYS = 30
 CURSOR_CLOUD_OVERLAP_MS = 3 * 3600 * 1000   # events are aggregated hourly upstream
 CURSOR_CLOUD_WINDOW_MS = 30 * 86400 * 1000  # stay inside the API's 30-day range
 CURSOR_CLOUD_SYNC_INTERVAL_S = 900
+# A sync runs inside the exclusive sync lock, so every way it can keep going
+# is bounded: requests per sync (1000 events each), wall time between them,
+# and the size and read time of each response body.
+CURSOR_CLOUD_MAX_PAGES = 500
+CURSOR_CLOUD_SYNC_DEADLINE_S = 600
+CURSOR_CLOUD_MAX_RESPONSE_BYTES = 32 << 20
 _CURSOR_CLOUD_ID_RE = re.compile(r"bc-[A-Za-z0-9-]{8,80}")
 # Fields kept from each usage event. userEmail is deliberately dropped: the
 # ledger only needs to attribute spend to an agent run, not to a person.
@@ -4577,12 +4638,30 @@ def _cursor_cloud_request(method, path, api_key, body=None, timeout=60):
     req.add_header("Authorization", f"Basic {token}")
     if data is not None:
         req.add_header("Content-Type", "application/json")
+    deadline = time.monotonic() + 2 * timeout
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:  # fixed https host
-            return json.load(resp)
+            return json.loads(_cursor_cloud_read_body(resp, path, deadline))
     except urllib.error.HTTPError as exc:
-        detail = exc.read()[:200].decode("utf-8", "replace")
+        detail = exc.read(200).decode("utf-8", "replace")
         raise RuntimeError(f"Cursor API {path} returned HTTP {exc.code}: {detail}") from None
+
+
+def _cursor_cloud_read_body(resp, path, deadline):
+    """The socket timeout restarts on every chunk, so a body trickled slowly
+    enough would never time out on its own; cap both its size and read time."""
+    chunks, size = [], 0
+    while True:
+        chunk = resp.read1(65536)
+        if not chunk:
+            return b"".join(chunks)
+        size += len(chunk)
+        if size > CURSOR_CLOUD_MAX_RESPONSE_BYTES:
+            raise RuntimeError(f"Cursor API {path} response is larger than "
+                               f"{CURSOR_CLOUD_MAX_RESPONSE_BYTES} bytes")
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"Cursor API {path} took too long to send its response")
+        chunks.append(chunk)
 
 
 def _cursor_cloud_clean_event(ev):
@@ -4605,7 +4684,7 @@ def _cursor_cloud_read_ledger(path):
     for line in lines:
         try:
             rec = json.loads(line)
-        except ValueError:
+        except (ValueError, RecursionError):
             continue
         if not isinstance(rec, dict):
             continue
@@ -4724,22 +4803,44 @@ def _sync_cursor_cloud_locked(since, agent_id, api_key, user_key, warnings,
         start = now_ms - CURSOR_CLOUD_DEFAULT_SINCE_DAYS * 86400 * 1000
     fetched = {}
     windows = []
+    sent = 0
+    deadline = time.monotonic() + CURSOR_CLOUD_SYNC_DEADLINE_S
     lo = start
+    # Any abort below raises before a ledger is touched: a partial fetch would
+    # otherwise replace each agent's window with a truncated one.
     while lo <= now_ms:
         hi = min(lo + CURSOR_CLOUD_WINDOW_MS - 1, now_ms)
         windows.append((lo, hi))
-        page = 1
+        page, previous = 1, None
         while True:
+            if sent >= CURSOR_CLOUD_MAX_PAGES:
+                raise RuntimeError(
+                    f"Cursor API usage sync stopped after {sent} pages; "
+                    "use a narrower --since or --agent")
+            if sent and time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"Cursor API usage sync passed its {CURSOR_CLOUD_SYNC_DEADLINE_S}s "
+                    "deadline; use a narrower --since or --agent")
             body = {"startDate": lo, "endDate": hi, "page": page, "pageSize": 1000,
                     "cloudAgentId": agent_id or "*"}
             resp = request("POST", "/teams/filtered-usage-events", api_key, body)
-            for ev in (resp or {}).get("usageEvents") or []:
+            sent += 1
+            resp = resp if isinstance(resp, dict) else {}
+            events = resp.get("usageEvents")
+            events = events if isinstance(events, list) else []
+            for ev in events:
                 clean = _cursor_cloud_clean_event(ev)
                 if clean is not None and (agent_id is None or clean["cloudAgentId"] == agent_id):
                     fetched.setdefault(clean["cloudAgentId"], []).append(clean)
-            pagination = (resp or {}).get("pagination") or {}
-            if not pagination.get("hasNextPage"):
+            pagination = resp.get("pagination")
+            if (not isinstance(pagination, dict) or pagination.get("hasNextPage") is not True
+                    or not events):
                 break
+            if events == previous:
+                raise RuntimeError(
+                    f"Cursor API returned the same page twice (page {page}); "
+                    "not trusting its pagination")
+            previous = events
             page += 1
         lo = hi + 1
 
@@ -5182,7 +5283,7 @@ def iter_adapter_summaries(adapter, pricing, cutoff=None, project=None, exclude=
         saw_any = True
         try:
             s, hit = cached_adapter_summary(adapter, source, pricing, warnings)
-        except (OSError, ValueError, AttributeError) as e:
+        except (OSError, ValueError, AttributeError, RecursionError) as e:
             desc = adapter.describe(source)
             warn(f"skipping unreadable {adapter.name} session {desc}: {e}")
             if skipped is not None:
@@ -5194,7 +5295,7 @@ def iter_adapter_summaries(adapter, pricing, cutoff=None, project=None, exclude=
                 print(f"token-usage: parsed {parsed} sessions…", file=sys.stderr)
         if exclude and s["path"] == exclude:
             continue
-        if cutoff and (s["first_ts"] or "") < cutoff:
+        if cutoff and _before_cutoff(s["first_ts"], cutoff):
             continue
         if project and project not in s["project"]:
             continue
@@ -5370,7 +5471,7 @@ def _hook_payload():
             return None
     try:
         payload = json.loads(raw.decode("utf-8", "replace"))
-    except ValueError:  # malformed JSON — never block Claude Code on it
+    except (ValueError, RecursionError):  # malformed JSON — never block Claude Code on it
         return None
     return payload if isinstance(payload, dict) else None
 
