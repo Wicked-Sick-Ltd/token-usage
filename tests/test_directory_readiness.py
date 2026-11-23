@@ -55,15 +55,46 @@ def rel(path):
     return path.relative_to(PLUGIN_ROOT).as_posix()
 
 
+def size_as_submitted(data):
+    """Drop CR from CRLF pairs. A Windows checkout adds those; git does not store them."""
+    return len(data.replace(b"\r\n", b"\n"))
+
+
+def submitted_size(path):
+    """Bytes the directory would receive, not the checkout's working tree.
+
+    actions/checkout on Windows writes CRLF into the work tree. That adds one
+    byte per line and can push a source file over the 256 KiB hold even though
+    the git blob, which is what a directory install ships, is still under it.
+    """
+    try:
+        out = subprocess.run(
+            ["git", "cat-file", "-s", f"HEAD:{rel(path)}"],
+            cwd=PLUGIN_ROOT, capture_output=True, check=True, text=True)
+        return int(out.stdout.strip())
+    except (OSError, subprocess.CalledProcessError, ValueError):
+        return size_as_submitted(path.read_bytes())
+
+
 def test_file_count_within_directory_limit():
     assert len(shipped_files()) <= MAX_FILES
 
 
 def test_no_large_non_image_files():
-    big = [f"{rel(p)} ({p.stat().st_size} bytes)" for p in shipped_files()
+    big = [f"{rel(p)} ({submitted_size(p)} bytes)" for p in shipped_files()
            if p.is_file() and p.suffix.lower() not in IMAGE_OR_FONT
-           and p.stat().st_size >= MAX_FILE_BYTES]
+           and submitted_size(p) >= MAX_FILE_BYTES]
     assert not big, f"non-image files at or over 256 KiB are held for review: {big}"
+
+
+def test_directory_hold_uses_the_git_blob_not_crlf_checkout():
+    path = PLUGIN_ROOT / "scripts" / "token_usage.py"
+    blob = int(subprocess.check_output(
+        ["git", "cat-file", "-s", "HEAD:scripts/token_usage.py"], cwd=PLUGIN_ROOT))
+    assert submitted_size(path) == blob
+    assert blob < MAX_FILE_BYTES
+    # CRLF inflation is not part of the hold, on this file or any other.
+    assert size_as_submitted(b"a\r\nb\r\n") == size_as_submitted(b"a\nb\n") == 4
 
 
 def test_only_text_images_and_fonts():
