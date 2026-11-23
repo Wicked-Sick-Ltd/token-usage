@@ -4628,8 +4628,21 @@ def _cursor_cloud_ms_to_iso(ms):
             .strftime("%Y-%m-%dT%H:%M:%S.") + f"{value % 1000:03d}Z")
 
 
+def _cursor_cloud_opener():
+    import urllib.request
+
+    class RefuseRedirects(urllib.request.HTTPRedirectHandler):
+        # urllib copies Authorization onto the redirected request, whatever
+        # its host. Declining makes every 3xx an HTTPError instead.
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None
+
+    return urllib.request.build_opener(RefuseRedirects)
+
+
 def _cursor_cloud_request(method, path, api_key, body=None, timeout=60):
-    """One Basic-auth call to the Cursor API. The key never leaves this frame."""
+    """One Basic-auth call to the Cursor API. The key never leaves this frame,
+    and the request never leaves CURSOR_API_BASE: redirects are refused."""
     import base64
     import urllib.error
     import urllib.request
@@ -4641,7 +4654,10 @@ def _cursor_cloud_request(method, path, api_key, body=None, timeout=60):
         req.add_header("Content-Type", "application/json")
     deadline = time.monotonic() + 2 * timeout
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:  # fixed https host
+        # The opener refuses redirects, so the key stays on CURSOR_API_BASE.
+        # The body read is capped in size and time; urlopen's socket timeout
+        # restarts on every chunk and would not.
+        with _cursor_cloud_opener().open(req, timeout=timeout) as resp:
             return json.loads(_cursor_cloud_read_body(resp, path, deadline))
     except urllib.error.HTTPError as exc:
         detail = exc.read(200).decode("utf-8", "replace")

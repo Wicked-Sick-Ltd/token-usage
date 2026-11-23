@@ -7,9 +7,10 @@ permissions:
   contents: read
 jobs:
   test:
-    # ubuntu-24.04: actions/setup-python has no Python 3.9 build for the
-    # current ubuntu-latest image, and this job is the 3.9 floor.
-    runs-on: ubuntu-24.04
+    # actions/setup-python publishes no CPython 3.9 build for ubuntu-latest
+    # (currently 26.04). Pin that cell to 24.04 so a missing 3.9 does not
+    # cancel the matrix; 3.12 stays on ubuntu-latest.
+    runs-on: ${{ matrix.python-version == '3.9' && 'ubuntu-24.04' || 'ubuntu-latest' }}
     strategy:
       matrix:
         python-version: ["3.9", "3.12"]
