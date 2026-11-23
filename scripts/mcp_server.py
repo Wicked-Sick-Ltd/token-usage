@@ -284,7 +284,7 @@ def serve(stdin=None, stdout=None):
             continue
         try:
             msg = json.loads(line)
-        except ValueError:
+        except (ValueError, RecursionError):
             reply = _error(None, -32700, "parse error")
         else:
             try:

@@ -1,4 +1,19 @@
+import json
+
 from conftest import assistant, usage, user, write_jsonl
+
+
+def _json_too_deep_to_parse():
+    """A document this interpreter's json.loads rejects with RecursionError."""
+    depth = 1000
+    while depth <= 20000:
+        text = '{"a":[' * depth + "1" + "]}" * depth
+        try:
+            json.loads(text)
+        except RecursionError:
+            return text
+        depth += 500
+    raise AssertionError("json.loads accepted every nested document")
 
 
 def make_session_with_agents(tu, tmp_path):
@@ -106,6 +121,27 @@ def test_workflow_subagents_timestamp_fallback_from_journal_and_meta(tu, tmp_pat
                 [assistant(None, usage(out=50), request_id="wa1")])
     (wf_dir / "journal.jsonl").write_text('{"timestamp": "2026-06-12T10:05:00Z", "event": "start"}\n')
 
+    data = tu.aggregate(tu.parse_session(t), tu.load_pricing())
+    agg = data["by_label"]["/workflow-cmd"]
+    assert agg["usage"]["output"] == 60       # 10 main + 50 agent
+    assert agg["subagents"] == 1
+
+
+def test_too_deep_meta_json_falls_back_to_journal(tu, tmp_path):
+    t = write_jsonl(tmp_path / "sess.jsonl", [
+        user("2026-06-12T10:00:00Z", command="/workflow-cmd"),
+        assistant("2026-06-12T10:00:01Z", usage(out=10), request_id="r1"),
+        user("2026-06-12T10:10:00Z", command="/other"),
+        assistant("2026-06-12T10:10:01Z", usage(out=10), request_id="r2"),
+    ])
+    wf_dir = tmp_path / "sess" / "subagents" / "workflows" / "run-deep"
+    agent = write_jsonl(wf_dir / "agent-001.jsonl",
+                        [assistant(None, usage(out=50), request_id="wa1")])
+    (wf_dir / "agent-001.meta.json").write_text(_json_too_deep_to_parse())
+    (wf_dir / "journal.jsonl").write_text(
+        '{"timestamp": "2026-06-12T10:05:00Z", "event": "start"}\n')
+
+    assert tu._resolve_agent_ts(agent) == "2026-06-12T10:05:00Z"
     data = tu.aggregate(tu.parse_session(t), tu.load_pricing())
     agg = data["by_label"]["/workflow-cmd"]
     assert agg["usage"]["output"] == 60       # 10 main + 50 agent
